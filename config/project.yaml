@@ -1,0 +1,36 @@
+project:
+  name: songo-model-stockfish-for-google-collab
+  stage: implementation_bootstrap
+
+training:
+  model_type: policy_value
+  device: cuda
+  batch_size: 64
+  epochs: 5
+
+data:
+  format: npz
+  source_project: ../songo-ai
+  allowed_imports:
+    - engine
+    - benchmark
+    - minimax
+    - mcts
+  deprecated_from_source_project:
+    - old_model
+    - old_training_methods
+    - rl_pipeline
+    - teacher_loop
+
+evaluation:
+  benchmark_baseline:
+    - minimax:medium
+    - mcts:medium
+
+ops:
+  job_files:
+    - config.yaml
+    - run_status.json
+    - state.json
+    - events.jsonl
+    - metrics.jsonl

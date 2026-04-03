@@ -1,0 +1,26 @@
+project:
+  name: songo-model-stockfish-for-google-collab
+
+runtime:
+  seed: 42
+  num_workers: 1
+
+storage:
+  drive_root: /content/drive/MyDrive/songo-stockfish
+  repo_root: /content/songo-model-stockfish-for-google-collab
+
+job:
+  run_type: dataset_generation
+  job_id: auto
+  resume: true
+  save_every_minutes: 5
+
+dataset_generation:
+  matchups:
+    - minimax:medium vs minimax:hard
+    - minimax:medium vs mcts:medium
+  games: 10
+  sample_strategy: uniform_by_ply
+  sample_every_n_plies: 2
+  output_raw_dir: data/raw
+  output_sampled_dir: data/sampled

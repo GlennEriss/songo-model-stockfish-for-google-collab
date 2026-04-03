@@ -1,0 +1,303 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+import time
+
+import torch
+import torch.nn.functional as F
+from torch.amp import autocast
+
+from songo_model_stockfish.ops.job import JobContext
+from songo_model_stockfish.ops.logging import utc_now_iso
+from songo_model_stockfish.ops.model_registry import load_registry, promote_best_model, upsert_model_record
+from songo_model_stockfish.training.data import build_dataloader
+from songo_model_stockfish.training.model import PolicyValueMLP
+
+
+def _resolve_storage_path(base: Path, configured: str | None, fallback: Path) -> Path:
+    if not configured:
+        return fallback
+    path = Path(configured)
+    if path.is_absolute():
+        return path
+    return base / path
+
+
+def _write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+
+
+def _update_model_card_after_evaluation(models_root: Path, model_id: str, summary: dict[str, object]) -> None:
+    model_card_path = models_root / "final" / f"{model_id}.model_card.json"
+    if not model_card_path.exists():
+        return
+    payload = json.loads(model_card_path.read_text(encoding="utf-8"))
+    payload["evaluation_summary_path"] = str(summary["evaluation_summary_path"])
+    payload["evaluation_top1"] = float(summary["policy_accuracy_top1"])
+    payload["evaluation_top3"] = float(summary["policy_accuracy_top3"])
+    payload["evaluation_loss_total"] = float(summary["loss_total"])
+    model_card_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+
+
+def run_evaluation(job: JobContext) -> dict[str, object]:
+    cfg = job.config.get("evaluation", {})
+    runtime_cfg = job.config.get("runtime", {})
+    model_id = str(cfg.get("model_id", "songo_policy_value_v1"))
+    checkpoint_path = _resolve_storage_path(job.paths.drive_root, cfg.get("checkpoint_path"), job.job_dir / f"{model_id}.pt")
+    test_dataset_path = _resolve_storage_path(job.paths.drive_root, cfg.get("test_dataset_path"), job.job_dir / "test.npz")
+    output_dir = _resolve_storage_path(job.paths.drive_root, cfg.get("output_dir"), job.job_dir / "reports")
+    dataset_id = str(cfg.get("dataset_id", "dataset_v1"))
+    batch_size = int(cfg.get("batch_size", 128))
+    log_every_n_batches = max(1, int(cfg.get("log_every_n_batches", 1)))
+    requested_device = str(runtime_cfg.get("device", "cpu"))
+    device = torch.device(requested_device if requested_device == "cpu" or torch.cuda.is_available() else "cpu")
+    num_workers = int(runtime_cfg.get("num_workers", 0))
+    pin_memory = bool(runtime_cfg.get("pin_memory", device.type == "cuda"))
+    persistent_workers = bool(runtime_cfg.get("persistent_workers", num_workers > 0))
+    prefetch_factor = runtime_cfg.get("prefetch_factor")
+    amp_enabled = bool(runtime_cfg.get("mixed_precision", False) and device.type == "cuda")
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    model_config = checkpoint.get("model_config", {})
+    model = PolicyValueMLP(
+        input_dim=int(model_config.get("input_dim", 17)),
+        hidden_sizes=list(model_config.get("hidden_sizes", [256, 256, 128])),
+        policy_dim=int(model_config.get("policy_dim", 7)),
+    )
+    model.load_state_dict(checkpoint["model_state"])
+    model.to(device)
+    model.eval()
+
+    test_loader, _input_dim = build_dataloader(
+        test_dataset_path,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
+    )
+
+    state = job.read_state()
+    completed_batches = int(state.get("completed_batches", 0))
+    total_loss = float(state.get("total_loss", 0.0))
+    total_policy = float(state.get("total_policy", 0.0))
+    total_value = float(state.get("total_value", 0.0))
+    total_correct = int(state.get("total_correct", 0))
+    total_top3 = int(state.get("total_top3", 0))
+    total_examples = int(state.get("total_examples", 0))
+
+    if completed_batches > 0:
+        job.logger.info(
+            "evaluation resume detected | model=%s | dataset=%s | completed_batches=%s/%s | completed_examples=%s",
+            model_id,
+            dataset_id,
+            completed_batches,
+            len(test_loader),
+            total_examples,
+        )
+        job.write_event(
+            "evaluation_resume_detected",
+            model_id=model_id,
+            dataset_id=dataset_id,
+            completed_batches=completed_batches,
+            total_batches=len(test_loader),
+            completed_examples=total_examples,
+        )
+
+    job.logger.info(
+        "evaluation started | model=%s | dataset=%s | device=%s | mixed_precision=%s | batch_size=%s | examples=%s",
+        model_id,
+        dataset_id,
+        device,
+        amp_enabled,
+        batch_size,
+        len(test_loader.dataset),
+    )
+    job.set_phase("evaluation")
+    job.write_event(
+        "evaluation_started",
+        model_id=model_id,
+        dataset_id=dataset_id,
+        device=str(device),
+        mixed_precision=amp_enabled,
+        batch_size=batch_size,
+        total_examples=len(test_loader.dataset),
+        total_batches=len(test_loader),
+        resume_granularity="batch",
+    )
+    job.write_metric(
+        {
+            "metric_type": "evaluation_started",
+            "model_id": model_id,
+            "dataset_id": dataset_id,
+            "total_examples": len(test_loader.dataset),
+            "total_batches": len(test_loader),
+            "mixed_precision": amp_enabled,
+        }
+    )
+    job.write_status(
+        "running",
+        phase="evaluation",
+        extra={
+            "model_id": model_id,
+            "dataset_id": dataset_id,
+            "resume_granularity": "batch",
+            "batch_index": completed_batches,
+            "total_batches": len(test_loader),
+            "last_state_path": str(job.state_path),
+        },
+    )
+
+    with torch.no_grad():
+        for batch_index, (x, legal_mask, policy_index, value_target) in enumerate(test_loader, start=1):
+            if batch_index <= completed_batches:
+                continue
+
+            x = x.to(device)
+            legal_mask = legal_mask.to(device)
+            policy_index = policy_index.to(device)
+            value_target = value_target.to(device)
+
+            with autocast(device_type=device.type, enabled=amp_enabled):
+                policy_logits, value_pred = model(x)
+                masked_logits = policy_logits.masked_fill(legal_mask <= 0, -1e9)
+                loss_policy = F.cross_entropy(masked_logits, policy_index)
+                loss_value = F.mse_loss(value_pred, value_target)
+                loss_total = loss_policy + loss_value
+
+            preds = masked_logits.argmax(dim=1)
+            topk = min(3, masked_logits.shape[1])
+            top3 = masked_logits.topk(topk, dim=1).indices
+            total_correct += int((preds == policy_index).sum().item())
+            total_top3 += int((top3 == policy_index.unsqueeze(1)).any(dim=1).sum().item())
+
+            batch_count = int(x.shape[0])
+            total_examples += batch_count
+            total_loss += float(loss_total.item()) * batch_count
+            total_policy += float(loss_policy.item()) * batch_count
+            total_value += float(loss_value.item()) * batch_count
+            if batch_index == 1 or batch_index == len(test_loader) or batch_index % log_every_n_batches == 0:
+                job.logger.info(
+                    "evaluation batch | batch=%s/%s | examples=%s | loss=%.4f | policy=%.4f | value=%.4f | top1=%.4f | top3=%.4f",
+                    batch_index,
+                    len(test_loader),
+                    total_examples,
+                    float(loss_total.item()),
+                    float(loss_policy.item()),
+                    float(loss_value.item()),
+                    total_correct / max(1, total_examples),
+                    total_top3 / max(1, total_examples),
+                )
+                job.write_event(
+                    "evaluation_batch_completed",
+                    model_id=model_id,
+                    dataset_id=dataset_id,
+                    batch_index=batch_index,
+                    total_batches=len(test_loader),
+                    total_examples=total_examples,
+                    batch_examples=batch_count,
+                    loss_total=float(loss_total.item()),
+                    loss_policy=float(loss_policy.item()),
+                    loss_value=float(loss_value.item()),
+                    accuracy_top1=total_correct / max(1, total_examples),
+                    accuracy_top3=total_top3 / max(1, total_examples),
+                )
+            job.write_state(
+                {
+                    "completed_batches": batch_index,
+                    "total_batches": len(test_loader),
+                    "total_examples": total_examples,
+                    "total_loss": total_loss,
+                    "total_policy": total_policy,
+                    "total_value": total_value,
+                    "total_correct": total_correct,
+                    "total_top3": total_top3,
+                    "last_completed_phase": "evaluation_batch_completed",
+                    "checkpoint_path": str(checkpoint_path),
+                }
+            )
+            job.write_status(
+                "running",
+                phase="evaluation",
+                extra={
+                    "model_id": model_id,
+                    "dataset_id": dataset_id,
+                    "resume_granularity": "batch",
+                    "batch_index": batch_index,
+                    "total_batches": len(test_loader),
+                    "last_state_path": str(job.state_path),
+                },
+            )
+
+    denom = max(1, total_examples)
+    summary = {
+        "job_id": job.job_id,
+        "model_id": model_id,
+        "dataset_id": dataset_id,
+        "device": str(device),
+        "mixed_precision": amp_enabled,
+        "examples": total_examples,
+        "loss_total": total_loss / denom,
+        "loss_policy": total_policy / denom,
+        "loss_value": total_value / denom,
+        "policy_accuracy_top1": total_correct / denom,
+        "policy_accuracy_top3": total_top3 / denom,
+        "checkpoint_path": str(checkpoint_path),
+        "evaluated_at": utc_now_iso(),
+    }
+    output_dir.mkdir(parents=True, exist_ok=True)
+    report_path = output_dir / f"{model_id}_evaluation_summary.json"
+    _write_json(report_path, summary)
+    summary["evaluation_summary_path"] = str(report_path)
+    _write_json(job.job_dir / "evaluation_summary.json", summary)
+    _update_model_card_after_evaluation(job.paths.models_root, model_id, summary)
+    registry = load_registry(job.paths.models_root)
+    existing = next((item for item in registry.get("models", []) if str(item.get("model_id")) == model_id), {})
+    upsert_model_record(
+        job.paths.models_root,
+        {
+            "model_id": model_id,
+            "sort_ts": time.time(),
+            "dataset_id": dataset_id,
+            "checkpoint_path": str(checkpoint_path),
+            "training_job_id": existing.get("training_job_id", ""),
+            "best_validation_metric": existing.get("best_validation_metric", -1.0),
+            "evaluation_top1": float(summary["policy_accuracy_top1"]),
+            "evaluation_top3": float(summary["policy_accuracy_top3"]),
+            "evaluation_summary_path": str(report_path),
+            "benchmark_score": float(existing.get("benchmark_score", -1.0)),
+            "model_card_path": str(job.paths.models_root / "final" / f"{model_id}.model_card.json"),
+        },
+    )
+    promote_best_model(job.paths.models_root)
+    job.write_state(
+        {
+            "completed_batches": len(test_loader),
+            "total_batches": len(test_loader),
+            "total_examples": total_examples,
+            "total_loss": total_loss,
+            "total_policy": total_policy,
+            "total_value": total_value,
+            "total_correct": total_correct,
+            "total_top3": total_top3,
+            "last_completed_phase": "evaluation_completed",
+            "checkpoint_path": str(checkpoint_path),
+        }
+    )
+    job.write_metric({"metric_type": "evaluation_completed", **summary})
+    job.write_event("evaluation_completed", model_id=model_id)
+    job.logger.info(
+        "evaluation completed | model=%s | examples=%s | top1=%.4f | top3=%.4f | loss=%.4f",
+        model_id,
+        total_examples,
+        summary["policy_accuracy_top1"],
+        summary["policy_accuracy_top3"],
+        summary["loss_total"],
+    )
+    return summary

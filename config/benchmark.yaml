@@ -1,0 +1,27 @@
+project:
+  name: songo-model-stockfish-for-google-collab
+
+runtime:
+  seed: 42
+
+storage:
+  drive_root: /content/drive/MyDrive/songo-stockfish
+  repo_root: /content/songo-model-stockfish-for-google-collab
+
+job:
+  run_type: benchmark
+  job_id: auto
+  resume: true
+  save_every_minutes: 5
+
+benchmark:
+  target: engine_v1
+  matchups:
+    - minimax:medium
+    - minimax:hard
+    - mcts:medium
+    - mcts:hard
+  games_per_matchup: 20
+  alternate_first_player: true
+  max_moves: 300
+  output_dir: reports/benchmarks

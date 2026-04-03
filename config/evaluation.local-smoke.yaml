@@ -1,0 +1,25 @@
+project:
+  name: songo-model-stockfish-for-google-collab
+
+runtime:
+  device: cpu
+  seed: 42
+
+storage:
+  drive_root: /content/drive/MyDrive/songo-stockfish
+  repo_root: /content/songo-model-stockfish-for-google-collab
+
+job:
+  run_type: evaluation
+  job_id: auto
+  resume: true
+  save_every_minutes: 5
+
+evaluation:
+  model_id: songo_policy_value_local_smoke_v1
+  checkpoint_path: models/final/songo_policy_value_local_smoke_v1.pt
+  dataset_id: dataset_v1_smoke_10
+  test_dataset_path: data/datasets/dataset_v1_smoke_10/test.npz
+  batch_size: 2
+  log_every_n_batches: 1
+  output_dir: reports/evaluations

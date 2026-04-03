@@ -1,0 +1,42 @@
+project:
+  name: songo-model-stockfish-for-google-collab
+
+runtime:
+  seed: 42
+  num_workers: 4
+
+storage:
+  drive_root: /content/drive/MyDrive/songo-stockfish
+  repo_root: /content/songo-model-stockfish-for-google-collab
+
+job:
+  run_type: dataset_generation
+  job_id: auto
+  resume: true
+  save_every_minutes: 5
+
+dataset_generation:
+  matchups:
+    - minimax:medium vs minimax:medium
+    - minimax:medium vs minimax:hard
+    - minimax:hard vs minimax:medium
+    - minimax:hard vs minimax:hard
+    - mcts:medium vs mcts:medium
+    - mcts:medium vs mcts:hard
+    - mcts:hard vs mcts:medium
+    - mcts:hard vs mcts:hard
+    - minimax:medium vs mcts:medium
+    - minimax:medium vs mcts:hard
+    - minimax:hard vs mcts:medium
+    - minimax:hard vs mcts:hard
+    - mcts:medium vs minimax:medium
+    - mcts:medium vs minimax:hard
+    - mcts:hard vs minimax:medium
+    - mcts:hard vs minimax:hard
+  games: 200
+  sample_strategy: uniform_by_ply
+  sample_every_n_plies: 2
+  max_moves: 400
+  max_pending_futures: 8
+  output_raw_dir: data/raw_full_matrix_colab_pro
+  output_sampled_dir: data/sampled_full_matrix_colab_pro

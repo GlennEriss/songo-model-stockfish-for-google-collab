@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Artefacts
+outputs/
+logs/
+data/generated/
+checkpoints/
