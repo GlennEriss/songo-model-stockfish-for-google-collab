@@ -132,6 +132,12 @@ Le projet contient maintenant une couche Colab dediee pour mettre a jour le code
 - `notebooks/colab_all_in_one.ipynb`
   Notebook unique pour monter Drive, mettre a jour le code, lancer dataset-generate, dataset-build, train, evaluate et benchmark avec des `job_id` resumables.
 
+Important pour Colab:
+
+- le notebook installe les dependances directement dans le runtime Colab
+- il ne cree pas de `.venv`
+- toutes les commandes du notebook s'executent donc directement avec `python`
+
 Scripts utiles:
 
 - `scripts/colab/init_drive_layout.sh`
