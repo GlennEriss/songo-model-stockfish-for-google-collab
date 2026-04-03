@@ -1,1 +1,1 @@
-"""Adapters toward external projects such as `songo-ai`."""
+"""Adapters toward reference Songo game implementations."""

@@ -52,10 +52,7 @@ def _count_jsonl_lines(path: Path) -> int:
 
 
 def _build_external_agent(spec: str):
-    from songo_model_stockfish.adapters.songo_ai_game import _ensure_songo_ai_importable
-
-    _ensure_songo_ai_importable()
-    from src.ai.agent import MCTSAgent, MinimaxAgent
+    from songo_model_stockfish.reference_songo.agents import MCTSAgent, MinimaxAgent
 
     kind, level = spec.split(":", 1)
     if kind == "minimax":
@@ -66,17 +63,14 @@ def _build_external_agent(spec: str):
 
 
 def _teacher_choose(state: Any, *, engine: str, level: str) -> tuple[int, dict[str, Any]]:
-    from songo_model_stockfish.adapters.songo_ai_game import _ensure_songo_ai_importable
-
-    _ensure_songo_ai_importable()
     if engine == "minimax":
-        from src.ai.levels import get_config
-        from src.ai.minimax import choose_move
+        from songo_model_stockfish.reference_songo.levels import get_config
+        from songo_model_stockfish.reference_songo.minimax import choose_move
 
         return choose_move(songo_ai_game.clone_state(state), get_config(level))
     if engine == "mcts":
-        from src.ai.levels import get_mcts_config
-        from src.ai.mcts import choose_move
+        from songo_model_stockfish.reference_songo.levels import get_mcts_config
+        from songo_model_stockfish.reference_songo.mcts import choose_move
 
         return choose_move(songo_ai_game.clone_state(state), get_mcts_config(level))
     raise ValueError(f"Unsupported teacher engine: {engine}")

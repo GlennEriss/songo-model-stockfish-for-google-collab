@@ -137,6 +137,8 @@ Important pour Colab:
 - le notebook installe les dependances directement dans le runtime Colab
 - il ne cree pas de `.venv`
 - toutes les commandes du notebook s'executent donc directement avec `python`
+- il n'a plus besoin de cloner `songo-ai`
+- le moteur de reference, `minimax` et `mcts` necessaires au dataset et au benchmark sont maintenant embarques dans ce repo
 
 Scripts utiles:
 

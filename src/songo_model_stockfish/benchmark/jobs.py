@@ -28,10 +28,7 @@ class EngineAgent:
 
 
 def _build_external_agent(spec: str) -> AgentLike:
-    from songo_model_stockfish.adapters.songo_ai_game import _ensure_songo_ai_importable
-
-    _ensure_songo_ai_importable()
-    from src.ai.agent import MCTSAgent, MinimaxAgent
+    from songo_model_stockfish.reference_songo.agents import MCTSAgent, MinimaxAgent
 
     kind, level = spec.split(":", 1)
     if kind == "minimax":
