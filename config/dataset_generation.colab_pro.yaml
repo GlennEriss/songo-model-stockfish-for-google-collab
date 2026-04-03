@@ -4,6 +4,8 @@ project:
 runtime:
   seed: 42
   num_workers: 4
+  multiprocessing_start_method: spawn
+  max_tasks_per_child: 25
 
 storage:
   drive_root: /content/drive/MyDrive/songo-stockfish

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+import multiprocessing
 from pathlib import Path
 from typing import Any
 
@@ -305,6 +306,103 @@ def _play_and_sample_game_from_specs(
     )
 
 
+def _materialize_completed_game(
+    job: JobContext,
+    *,
+    pending: dict[str, Any],
+    raw_payload: dict[str, Any],
+    samples: list[dict[str, Any]],
+    matchup_id: str,
+    games: int,
+    execution_mode: str,
+) -> tuple[int, int]:
+    _write_json(Path(pending["raw_game_path"]), raw_payload)
+    sampled_game_path = Path(pending["sampled_game_path"])
+    sampled_game_path.parent.mkdir(parents=True, exist_ok=True)
+    with sampled_game_path.open("w", encoding="utf-8") as handle:
+        for sample in samples:
+            handle.write(json.dumps(sample, ensure_ascii=True) + "\n")
+
+    sample_count = len(samples)
+    job.logger.info(
+        "dataset game completed | matchup=%s | game=%s/%s | moves=%s | samples=%s | winner=%s | mode=%s",
+        matchup_id,
+        pending["game_no"],
+        games,
+        raw_payload["ply_count"],
+        sample_count,
+        raw_payload["winner"],
+        execution_mode,
+    )
+    job.write_event(
+        "dataset_game_completed",
+        matchup=matchup_id,
+        game_id=pending["game_id"],
+        game_index=pending["game_no"],
+        samples=sample_count,
+        winner=raw_payload["winner"],
+        execution_mode=execution_mode,
+    )
+    job.write_metric(
+        {
+            "metric_type": "dataset_game_completed",
+            "matchup_id": matchup_id,
+            "game_id": pending["game_id"],
+            "samples": sample_count,
+            "moves": raw_payload["ply_count"],
+        }
+    )
+    return 1, sample_count
+
+
+def _run_pending_games_sequential(
+    job: JobContext,
+    *,
+    pending_games: list[dict[str, Any]],
+    matchup_a: str,
+    matchup_b: str,
+    matchup_id: str,
+    games: int,
+    sample_every_n_plies: int,
+    max_moves: int,
+) -> tuple[int, int, str]:
+    agent_a = _build_external_agent(matchup_a)
+    agent_b = _build_external_agent(matchup_b)
+    completed_games = 0
+    completed_samples = 0
+    for pending in pending_games:
+        job.logger.info(
+            "dataset game running | matchup=%s | game=%s/%s | seed=%s | starter=%s | mode=sequential",
+            matchup_id,
+            pending["game_no"],
+            games,
+            pending["seed"],
+            pending["starter"],
+        )
+        raw_payload, samples = _play_and_sample_game(
+            agent_a,
+            agent_b,
+            matchup_id=matchup_id,
+            game_id=str(pending["game_id"]),
+            seed=int(pending["seed"]),
+            starter=int(pending["starter"]),
+            sample_every_n_plies=sample_every_n_plies,
+            max_moves=max_moves,
+        )
+        games_inc, samples_inc = _materialize_completed_game(
+            job,
+            pending=pending,
+            raw_payload=raw_payload,
+            samples=samples,
+            matchup_id=matchup_id,
+            games=games,
+            execution_mode="sequential",
+        )
+        completed_games += games_inc
+        completed_samples += samples_inc
+    return completed_games, completed_samples, "sequential"
+
+
 def run_dataset_generation(job: JobContext) -> dict[str, object]:
     cfg = job.config.get("dataset_generation", {})
     runtime_cfg = job.config.get("runtime", {})
@@ -317,6 +415,8 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
     max_moves = int(cfg.get("max_moves", 300))
     num_workers = max(1, int(runtime_cfg.get("num_workers", 1)))
     max_pending_futures = max(1, int(cfg.get("max_pending_futures", num_workers * 2)))
+    multiprocessing_start_method = str(runtime_cfg.get("multiprocessing_start_method", "spawn")).strip().lower() or "spawn"
+    max_tasks_per_child = int(runtime_cfg.get("max_tasks_per_child", 25))
 
     dataset_dir = job.job_dir / "dataset_generation"
     raw_dir = _resolve_storage_path(job.paths.drive_root, cfg.get("output_raw_dir"), dataset_dir / "raw_match_logs")
@@ -415,80 +515,38 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
         if not pending_games:
             job.logger.info("dataset matchup already fully materialized on disk | matchup=%s", matchup_id)
         elif num_workers <= 1:
-            agent_a = _build_external_agent(matchup_a)
-            agent_b = _build_external_agent(matchup_b)
-            for pending in pending_games:
-                job.logger.info(
-                    "dataset game running | matchup=%s | game=%s/%s | seed=%s | starter=%s | mode=sequential",
-                    matchup_id,
-                    pending["game_no"],
-                    games,
-                    pending["seed"],
-                    pending["starter"],
-                )
-                raw_payload, samples = _play_and_sample_game(
-                    agent_a,
-                    agent_b,
-                    matchup_id=matchup_id,
-                    game_id=str(pending["game_id"]),
-                    seed=int(pending["seed"]),
-                    starter=int(pending["starter"]),
-                    sample_every_n_plies=sample_every_n_plies,
-                    max_moves=max_moves,
-                )
-                _write_json(Path(pending["raw_game_path"]), raw_payload)
-                sampled_game_path = Path(pending["sampled_game_path"])
-                sampled_game_path.parent.mkdir(parents=True, exist_ok=True)
-                with sampled_game_path.open("w", encoding="utf-8") as handle:
-                    for sample in samples:
-                        handle.write(json.dumps(sample, ensure_ascii=True) + "\n")
-                sample_count = len(samples)
-                job.logger.info(
-                    "dataset game completed | matchup=%s | game=%s/%s | moves=%s | samples=%s | winner=%s",
-                    matchup_id,
-                    pending["game_no"],
-                    games,
-                    raw_payload["ply_count"],
-                    sample_count,
-                    raw_payload["winner"],
-                )
-                job.write_event(
-                    "dataset_game_completed",
-                    matchup=matchup_id,
-                    game_id=pending["game_id"],
-                    game_index=pending["game_no"],
-                    samples=sample_count,
-                    winner=raw_payload["winner"],
-                    execution_mode="sequential",
-                )
-                job.write_metric(
-                    {
-                        "metric_type": "dataset_game_completed",
-                        "matchup_id": matchup_id,
-                        "game_id": pending["game_id"],
-                        "samples": sample_count,
-                        "moves": raw_payload["ply_count"],
-                    }
-                )
-                matchup_game_count += 1
-                matchup_sample_count += sample_count
+            completed_games, completed_samples, _execution_mode = _run_pending_games_sequential(
+                job,
+                pending_games=pending_games,
+                matchup_a=matchup_a,
+                matchup_b=matchup_b,
+                matchup_id=matchup_id,
+                games=games,
+                sample_every_n_plies=sample_every_n_plies,
+                max_moves=max_moves,
+            )
+            matchup_game_count += completed_games
+            matchup_sample_count += completed_samples
+            if pending_games:
                 job.write_state(
                     {
                         "completed_matchups": sorted(completed_matchups),
                         "current_matchup": matchup_id,
                         "completed_games": matchup_game_count,
                         "remaining_games": games - matchup_game_count,
-                        "last_completed_game_id": pending["game_id"],
+                        "last_completed_game_id": pending_games[-1]["game_id"],
                         "sample_count": matchup_sample_count,
                     }
                 )
         else:
             job.logger.info(
-                "dataset matchup parallel execution | matchup=%s | workers=%s | pending_games=%s | max_pending=%s",
+                "dataset matchup parallel execution | matchup=%s | workers=%s | pending_games=%s | max_pending=%s | start_method=%s | max_tasks_per_child=%s",
                 matchup_id,
                 num_workers,
                 len(pending_games),
                 max_pending_futures,
+                multiprocessing_start_method,
+                max_tasks_per_child,
             )
             job.write_event(
                 "dataset_parallel_execution_started",
@@ -496,88 +554,110 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
                 workers=num_workers,
                 pending_games=len(pending_games),
                 max_pending_futures=max_pending_futures,
+                multiprocessing_start_method=multiprocessing_start_method,
+                max_tasks_per_child=max_tasks_per_child,
             )
 
             future_map: dict[concurrent.futures.Future, dict[str, Any]] = {}
             pending_queue = list(pending_games)
-            with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
-                while pending_queue or future_map:
-                    while pending_queue and len(future_map) < max_pending_futures:
-                        pending = pending_queue.pop(0)
-                        job.logger.info(
-                            "dataset game scheduled | matchup=%s | game=%s/%s | seed=%s | starter=%s | mode=parallel",
-                            matchup_id,
-                            pending["game_no"],
-                            games,
-                            pending["seed"],
-                            pending["starter"],
-                        )
-                        future = executor.submit(
-                            _play_and_sample_game_from_specs,
-                            matchup_a,
-                            matchup_b,
-                            matchup_id=matchup_id,
-                            game_id=str(pending["game_id"]),
-                            seed=int(pending["seed"]),
-                            starter=int(pending["starter"]),
-                            sample_every_n_plies=sample_every_n_plies,
-                            max_moves=max_moves,
-                        )
-                        future_map[future] = pending
+            try:
+                mp_context = multiprocessing.get_context(multiprocessing_start_method)
+                with concurrent.futures.ProcessPoolExecutor(
+                    max_workers=num_workers,
+                    mp_context=mp_context,
+                    max_tasks_per_child=max_tasks_per_child,
+                ) as executor:
+                    while pending_queue or future_map:
+                        while pending_queue and len(future_map) < max_pending_futures:
+                            pending = pending_queue.pop(0)
+                            job.logger.info(
+                                "dataset game scheduled | matchup=%s | game=%s/%s | seed=%s | starter=%s | mode=parallel",
+                                matchup_id,
+                                pending["game_no"],
+                                games,
+                                pending["seed"],
+                                pending["starter"],
+                            )
+                            future = executor.submit(
+                                _play_and_sample_game_from_specs,
+                                matchup_a,
+                                matchup_b,
+                                matchup_id=matchup_id,
+                                game_id=str(pending["game_id"]),
+                                seed=int(pending["seed"]),
+                                starter=int(pending["starter"]),
+                                sample_every_n_plies=sample_every_n_plies,
+                                max_moves=max_moves,
+                            )
+                            future_map[future] = pending
 
-                    done, _not_done = concurrent.futures.wait(
-                        future_map.keys(),
-                        return_when=concurrent.futures.FIRST_COMPLETED,
+                        done, _not_done = concurrent.futures.wait(
+                            future_map.keys(),
+                            return_when=concurrent.futures.FIRST_COMPLETED,
+                        )
+                        for future in done:
+                            pending = future_map.pop(future)
+                            raw_payload, samples = future.result()
+                            games_inc, samples_inc = _materialize_completed_game(
+                                job,
+                                pending=pending,
+                                raw_payload=raw_payload,
+                                samples=samples,
+                                matchup_id=matchup_id,
+                                games=games,
+                                execution_mode="parallel",
+                            )
+                            matchup_game_count += games_inc
+                            matchup_sample_count += samples_inc
+                            job.write_state(
+                                {
+                                    "completed_matchups": sorted(completed_matchups),
+                                    "current_matchup": matchup_id,
+                                    "completed_games": matchup_game_count,
+                                    "remaining_games": games - matchup_game_count,
+                                    "last_completed_game_id": pending["game_id"],
+                                    "sample_count": matchup_sample_count,
+                                }
+                            )
+            except concurrent.futures.process.BrokenProcessPool as exc:
+                failed_pending = list(future_map.values()) + list(pending_queue)
+                job.logger.warning(
+                    "dataset parallel pool broken | matchup=%s | completed_games=%s | remaining_fallback=%s | error=%s",
+                    matchup_id,
+                    matchup_game_count,
+                    len(failed_pending),
+                    exc,
+                )
+                job.write_event(
+                    "dataset_parallel_execution_broken",
+                    matchup=matchup_id,
+                    completed_games=matchup_game_count,
+                    remaining_fallback=len(failed_pending),
+                    error=str(exc),
+                )
+                completed_games, completed_samples, _execution_mode = _run_pending_games_sequential(
+                    job,
+                    pending_games=failed_pending,
+                    matchup_a=matchup_a,
+                    matchup_b=matchup_b,
+                    matchup_id=matchup_id,
+                    games=games,
+                    sample_every_n_plies=sample_every_n_plies,
+                    max_moves=max_moves,
+                )
+                matchup_game_count += completed_games
+                matchup_sample_count += completed_samples
+                if failed_pending:
+                    job.write_state(
+                        {
+                            "completed_matchups": sorted(completed_matchups),
+                            "current_matchup": matchup_id,
+                            "completed_games": matchup_game_count,
+                            "remaining_games": games - matchup_game_count,
+                            "last_completed_game_id": failed_pending[-1]["game_id"],
+                            "sample_count": matchup_sample_count,
+                        }
                     )
-                    for future in done:
-                        pending = future_map.pop(future)
-                        raw_payload, samples = future.result()
-                        _write_json(Path(pending["raw_game_path"]), raw_payload)
-                        sampled_game_path = Path(pending["sampled_game_path"])
-                        sampled_game_path.parent.mkdir(parents=True, exist_ok=True)
-                        with sampled_game_path.open("w", encoding="utf-8") as handle:
-                            for sample in samples:
-                                handle.write(json.dumps(sample, ensure_ascii=True) + "\n")
-                        sample_count = len(samples)
-                        job.logger.info(
-                            "dataset game completed | matchup=%s | game=%s/%s | moves=%s | samples=%s | winner=%s | mode=parallel",
-                            matchup_id,
-                            pending["game_no"],
-                            games,
-                            raw_payload["ply_count"],
-                            sample_count,
-                            raw_payload["winner"],
-                        )
-                        job.write_event(
-                            "dataset_game_completed",
-                            matchup=matchup_id,
-                            game_id=pending["game_id"],
-                            game_index=pending["game_no"],
-                            samples=sample_count,
-                            winner=raw_payload["winner"],
-                            execution_mode="parallel",
-                        )
-                        job.write_metric(
-                            {
-                                "metric_type": "dataset_game_completed",
-                                "matchup_id": matchup_id,
-                                "game_id": pending["game_id"],
-                                "samples": sample_count,
-                                "moves": raw_payload["ply_count"],
-                            }
-                        )
-                        matchup_game_count += 1
-                        matchup_sample_count += sample_count
-                        job.write_state(
-                            {
-                                "completed_matchups": sorted(completed_matchups),
-                                "current_matchup": matchup_id,
-                                "completed_games": matchup_game_count,
-                                "remaining_games": games - matchup_game_count,
-                                "last_completed_game_id": pending["game_id"],
-                                "sample_count": matchup_sample_count,
-                            }
-                        )
 
         summary_payload = {
             "matchup_id": matchup_id,
