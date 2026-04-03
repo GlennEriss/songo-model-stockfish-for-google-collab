@@ -129,14 +129,8 @@ Important:
 
 Le projet contient maintenant une couche Colab dediee pour mettre a jour le code sans toucher aux artefacts persistants:
 
-- `notebooks/colab_setup_and_update.ipynb`
-  Monte Drive, prepare le layout persistant, clone ou met a jour le repo GitHub et installe les dependances.
-
-- `notebooks/colab_dataset_and_build.ipynb`
-  Lance la generation des parties puis construit le dataset final.
-
-- `notebooks/colab_train_evaluate_benchmark.ipynb`
-  Lance l'entrainement, l'evaluation et le benchmark avec des `job_id` resumables.
+- `notebooks/colab_all_in_one.ipynb`
+  Notebook unique pour monter Drive, mettre a jour le code, lancer dataset-generate, dataset-build, train, evaluate et benchmark avec des `job_id` resumables.
 
 Scripts utiles:
 
