@@ -1,0 +1,42 @@
+project:
+  name: songo-model-stockfish-for-google-collab
+
+runtime:
+  device: cuda
+  seed: 42
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 4
+  mixed_precision: true
+
+storage:
+  drive_root: /content/drive/MyDrive/songo-stockfish
+  repo_root: /content/songo-model-stockfish-for-google-collab
+
+job:
+  run_type: train
+  job_id: auto
+  resume: true
+  save_every_minutes: 5
+
+train:
+  dataset_id: dataset_v1_full_matrix_colab_pro
+  dataset_path: data/datasets/dataset_v1_full_matrix_colab_pro/train.npz
+  validation_path: data/datasets/dataset_v1_full_matrix_colab_pro/validation.npz
+  model_family: policy_value
+  backbone: mlp
+  hidden_sizes: [1024, 1024, 512, 256]
+  model_id: auto
+  model_id_prefix: songo_policy_value_colab_pro
+  init_checkpoint_path: ""
+  init_from_promoted_best: true
+  promoted_best_checkpoint_path: models/promoted/best/model.pt
+  lineage_dir: models/lineage
+  batch_size: 4096
+  epochs: 40
+  log_every_n_batches: 10
+  learning_rate: 0.0005
+  value_loss_weight: 1.0
+  checkpoint_dir: models/checkpoints
+  final_dir: models/final
