@@ -66,6 +66,14 @@ def _resolve_storage_path(base: Path, configured: str | None, fallback: Path) ->
     return base / path
 
 
+def _winner_label(winner: object, target_name: str, opponent_name: str) -> str:
+    if winner == 0:
+        return target_name
+    if winner == 1:
+        return opponent_name
+    return "draw"
+
+
 def _update_model_card_after_benchmark(models_root: Path, model_id: str, summary_payload: dict[str, object], benchmark_score: float, report_path: Path) -> None:
     model_card_path = models_root / "final" / f"{model_id}.model_card.json"
     if not model_card_path.exists():
@@ -175,6 +183,18 @@ def run_benchmark_job(job: JobContext) -> dict[str, object]:
             else:
                 draws += 1
             total_moves += int(game_payload["moves"])
+            winner_label = _winner_label(winner, target_agent.display_name, opponent.display_name)
+            job.logger.info(
+                "benchmark game completed | matchup=%s | game=%s/%s | winner=%s | score=%s-%s | moves=%s | reason=%s",
+                matchup_key,
+                game_index + 1,
+                games,
+                winner_label,
+                game_payload["scores"][0],
+                game_payload["scores"][1],
+                game_payload["moves"],
+                game_payload.get("reason", ""),
+            )
             job.write_state(
                 {
                     "completed_matchups": sorted(completed_matchups),
@@ -198,6 +218,16 @@ def run_benchmark_job(job: JobContext) -> dict[str, object]:
         _write_json(benchmark_dir / f"{matchup_key}_summary.json", payload)
         summaries.append(payload)
         completed_matchups.add(matchup_key)
+        job.logger.info(
+            "benchmark matchup completed | matchup=%s | target=%s | opponent=%s | wins=%s | losses=%s | draws=%s | winrate=%.4f",
+            matchup_key,
+            target_agent.display_name,
+            opponent.display_name,
+            wins_a,
+            wins_b,
+            draws,
+            payload["winrate"],
+        )
         job.write_state(
             {
                 "completed_matchups": sorted(completed_matchups),
