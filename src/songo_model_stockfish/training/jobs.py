@@ -26,8 +26,14 @@ def _resolve_storage_path(base: Path, configured: str | None, fallback: Path) ->
     return base / path
 
 
+def _masked_policy_logits(policy_logits: torch.Tensor, legal_mask: torch.Tensor) -> torch.Tensor:
+    # Mixed precision safe value for fp16/bf16/fp32.
+    mask_value = torch.finfo(policy_logits.dtype).min
+    return policy_logits.masked_fill(legal_mask <= 0, mask_value)
+
+
 def _masked_policy_loss(policy_logits: torch.Tensor, legal_mask: torch.Tensor, policy_index: torch.Tensor) -> torch.Tensor:
-    masked_logits = policy_logits.masked_fill(legal_mask <= 0, -1e9)
+    masked_logits = _masked_policy_logits(policy_logits, legal_mask)
     return F.cross_entropy(masked_logits, policy_index)
 
 
@@ -74,7 +80,7 @@ def _run_epoch(
                 loss_total.backward()
                 optimizer.step()
 
-        preds = policy_logits.masked_fill(legal_mask <= 0, -1e9).argmax(dim=1)
+        preds = _masked_policy_logits(policy_logits, legal_mask).argmax(dim=1)
         total_correct += int((preds == policy_index).sum().item())
         batch_count = int(x.shape[0])
         total_count += batch_count

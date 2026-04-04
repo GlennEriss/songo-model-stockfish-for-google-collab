@@ -13,6 +13,7 @@ from songo_model_stockfish.ops.job import JobContext
 from songo_model_stockfish.ops.logging import utc_now_iso
 from songo_model_stockfish.ops.model_registry import load_registry, promote_best_model, upsert_model_record
 from songo_model_stockfish.training.data import build_dataloader
+from songo_model_stockfish.training.jobs import _masked_policy_logits
 from songo_model_stockfish.training.model import PolicyValueMLP
 
 
@@ -166,7 +167,7 @@ def run_evaluation(job: JobContext) -> dict[str, object]:
 
             with autocast(device_type=device.type, enabled=amp_enabled):
                 policy_logits, value_pred = model(x)
-                masked_logits = policy_logits.masked_fill(legal_mask <= 0, -1e9)
+                masked_logits = _masked_policy_logits(policy_logits, legal_mask)
                 loss_policy = F.cross_entropy(masked_logits, policy_index)
                 loss_value = F.mse_loss(value_pred, value_target)
                 loss_total = loss_policy + loss_value

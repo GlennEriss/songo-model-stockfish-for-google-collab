@@ -6,6 +6,7 @@ import torch
 
 from songo_model_stockfish.adapters import songo_ai_game
 from songo_model_stockfish.training.features import encode_raw_state
+from songo_model_stockfish.training.jobs import _masked_policy_logits
 from songo_model_stockfish.training.model import PolicyValueMLP
 
 
@@ -39,7 +40,7 @@ class ModelAgent:
         mask = torch.from_numpy(legal_mask).unsqueeze(0).to(self._device)
         with torch.no_grad():
             policy_logits, value = self._model(x)
-            masked_logits = policy_logits.masked_fill(mask <= 0, -1e9)
+            masked_logits = _masked_policy_logits(policy_logits, mask)
             move_index = int(masked_logits.argmax(dim=1).item())
         move = move_index + 1
         if move not in legal_moves and legal_moves:
