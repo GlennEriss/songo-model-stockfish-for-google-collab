@@ -741,21 +741,51 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
     processed_count = 0
     skipped_terminal_samples = 0
     skipped_no_legal_samples = 0
+    log_every_n_files = max(1, int(cfg.get("log_every_n_files", 1)))
 
-    job.logger.info("dataset build started")
+    job.logger.info(
+        "dataset build started | dataset=%s | teacher=%s:%s | sampled_root=%s | files=%s",
+        dataset_id,
+        teacher_engine,
+        teacher_level,
+        sampled_root,
+        len(sampled_files),
+    )
     job.set_phase("dataset_build")
-    job.write_event("dataset_build_started", teacher_engine=teacher_engine, teacher_level=teacher_level)
+    job.write_event(
+        "dataset_build_started",
+        teacher_engine=teacher_engine,
+        teacher_level=teacher_level,
+        sampled_root=str(sampled_root),
+        sampled_files=len(sampled_files),
+    )
     job.write_metric({"metric_type": "dataset_build_started"})
 
-    for sampled_file in sampled_files:
+    for file_index, sampled_file in enumerate(sampled_files, start=1):
         relative_name = str(sampled_file.relative_to(sampled_root))
         output_labeled = labeled_root / relative_name
         output_labeled.parent.mkdir(parents=True, exist_ok=True)
 
         if relative_name in completed_files and output_labeled.exists():
             file_samples = list(_iter_jsonl(output_labeled))
+            source_count = len(file_samples)
+            job.logger.info(
+                "dataset build file reused | %s/%s | file=%s | labeled_samples=%s",
+                file_index,
+                len(sampled_files),
+                relative_name,
+                len(file_samples),
+            )
         else:
             source_samples = list(_iter_jsonl(sampled_file))
+            source_count = len(source_samples)
+            job.logger.info(
+                "dataset build file started | %s/%s | file=%s | source_samples=%s",
+                file_index,
+                len(sampled_files),
+                relative_name,
+                source_count,
+            )
             file_samples = []
             for sample in source_samples:
                 if bool(sample["state"].get("is_terminal", False)):
@@ -769,11 +799,30 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
                 for sample in file_samples:
                     handle.write(json.dumps(sample, ensure_ascii=True) + "\n")
             completed_files.add(relative_name)
+            job.logger.info(
+                "dataset build file completed | %s/%s | file=%s | source_samples=%s | labeled_samples=%s | skipped_terminal=%s | skipped_no_legal=%s",
+                file_index,
+                len(sampled_files),
+                relative_name,
+                source_count,
+                len(file_samples),
+                skipped_terminal_samples,
+                skipped_no_legal_samples,
+            )
             job.write_event("dataset_labeled_file_completed", file=relative_name, samples=len(file_samples))
             job.write_metric({"metric_type": "dataset_labeled_file_completed", "file": relative_name, "samples": len(file_samples)})
 
         labeled_samples.extend(file_samples)
         processed_count += 1
+        if processed_count % log_every_n_files == 0 or processed_count == len(sampled_files):
+            job.logger.info(
+                "dataset build progress | files=%s/%s | labeled_samples=%s | skipped_terminal=%s | skipped_no_legal=%s",
+                processed_count,
+                len(sampled_files),
+                len(labeled_samples),
+                skipped_terminal_samples,
+                skipped_no_legal_samples,
+            )
         job.write_state(
             {
                 "completed_files": sorted(completed_files),
@@ -804,6 +853,13 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         for game_id in sorted(selected_game_ids):
             split_samples.extend(grouped[game_id])
 
+        job.logger.info(
+            "dataset build split export started | split=%s | games=%s | samples=%s",
+            split_name,
+            len(selected_game_ids),
+            len(split_samples),
+        )
+
         features_list = []
         masks_list = []
         policy_list = []
@@ -833,6 +889,13 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
             game_ids=np.asarray(game_id_list, dtype=object),
         )
         split_summary[split_name] = {"games": len(selected_game_ids), "samples": len(split_samples)}
+        job.logger.info(
+            "dataset build split export completed | split=%s | games=%s | samples=%s | path=%s",
+            split_name,
+            len(selected_game_ids),
+            len(split_samples),
+            output_root / f"{split_name}.npz",
+        )
 
     summary = {
         "job_id": job.job_id,
@@ -845,6 +908,15 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         "skipped_no_legal_samples": skipped_no_legal_samples,
     }
     _write_json(dataset_dir / "dataset_build_summary.json", summary)
+    job.logger.info(
+        "dataset build completed | dataset=%s | train=%s | validation=%s | test=%s | skipped_terminal=%s | skipped_no_legal=%s",
+        dataset_id,
+        split_summary.get("train", {}).get("samples", 0),
+        split_summary.get("validation", {}).get("samples", 0),
+        split_summary.get("test", {}).get("samples", 0),
+        skipped_terminal_samples,
+        skipped_no_legal_samples,
+    )
     job.write_metric({"metric_type": "dataset_build_completed", "dataset_id": dataset_id})
     job.write_event("dataset_build_completed", dataset_id=dataset_id)
     return summary
