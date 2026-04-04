@@ -112,6 +112,7 @@ Le repo contient maintenant des configurations dediees a une machine Google Cola
 - `config/evaluation.colab_pro.yaml`
 - `config/dataset_generation.colab_pro.yaml`
 - `config/dataset_build.colab_pro.yaml`
+- `config/dataset_build.full_matrix.colab_pro.yaml`
 - `config/benchmark.colab_pro.yaml`
 
 L'intention est la suivante:
