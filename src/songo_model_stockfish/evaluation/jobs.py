@@ -11,7 +11,13 @@ from torch.amp import autocast
 
 from songo_model_stockfish.ops.job import JobContext
 from songo_model_stockfish.ops.logging import utc_now_iso
-from songo_model_stockfish.ops.model_registry import load_registry, promote_best_model, upsert_model_record
+from songo_model_stockfish.ops.model_registry import (
+    latest_model_record,
+    load_registry,
+    promote_best_model,
+    promoted_best_metadata,
+    upsert_model_record,
+)
 from songo_model_stockfish.training.data import build_dataloader
 from songo_model_stockfish.training.jobs import _masked_policy_logits
 from songo_model_stockfish.training.model import PolicyValueMLP
@@ -31,6 +37,30 @@ def _write_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
 
 
+def _resolve_evaluation_target(job: JobContext, cfg: dict[str, Any]) -> tuple[str, Path]:
+    requested_model_id = str(cfg.get("model_id", "auto_latest")).strip() or "auto_latest"
+    requested_checkpoint = str(cfg.get("checkpoint_path", "")).strip()
+
+    if requested_model_id in {"auto_best", "auto_promoted_best"} or requested_checkpoint in {"auto_best", "auto_promoted_best"}:
+        metadata = promoted_best_metadata(job.paths.models_root)
+        if not metadata:
+            raise FileNotFoundError("Aucun modele promu disponible pour l'evaluation auto_best.")
+        checkpoint_path = job.paths.models_root / "promoted" / "best" / "model.pt"
+        return str(metadata.get("model_id", "promoted_best")), checkpoint_path
+
+    if requested_model_id in {"auto", "auto_latest"} or requested_checkpoint in {"", "auto", "auto_latest"}:
+        latest = latest_model_record(job.paths.models_root)
+        if not latest:
+            raise FileNotFoundError("Aucun modele disponible dans le registre pour l'evaluation auto_latest.")
+        checkpoint_path = Path(str(latest.get("checkpoint_path", "")).strip())
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Checkpoint latest introuvable: {checkpoint_path}")
+        return str(latest.get("model_id", "")), checkpoint_path
+
+    checkpoint_path = _resolve_storage_path(job.paths.drive_root, cfg.get("checkpoint_path"), job.job_dir / f"{requested_model_id}.pt")
+    return requested_model_id, checkpoint_path
+
+
 def _update_model_card_after_evaluation(models_root: Path, model_id: str, summary: dict[str, object]) -> None:
     model_card_path = models_root / "final" / f"{model_id}.model_card.json"
     if not model_card_path.exists():
@@ -46,8 +76,7 @@ def _update_model_card_after_evaluation(models_root: Path, model_id: str, summar
 def run_evaluation(job: JobContext) -> dict[str, object]:
     cfg = job.config.get("evaluation", {})
     runtime_cfg = job.config.get("runtime", {})
-    model_id = str(cfg.get("model_id", "songo_policy_value_v1"))
-    checkpoint_path = _resolve_storage_path(job.paths.drive_root, cfg.get("checkpoint_path"), job.job_dir / f"{model_id}.pt")
+    model_id, checkpoint_path = _resolve_evaluation_target(job, cfg)
     test_dataset_path = _resolve_storage_path(job.paths.drive_root, cfg.get("test_dataset_path"), job.job_dir / "test.npz")
     output_dir = _resolve_storage_path(job.paths.drive_root, cfg.get("output_dir"), job.job_dir / "reports")
     dataset_id = str(cfg.get("dataset_id", "dataset_v1"))

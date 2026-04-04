@@ -21,8 +21,8 @@ job:
   save_every_minutes: 5
 
 evaluation:
-  model_id: songo_policy_value_colab_pro_v1
-  checkpoint_path: models/final/songo_policy_value_colab_pro_v1.pt
+  model_id: auto_latest
+  checkpoint_path: ""
   dataset_id: dataset_v1_full_matrix_colab_pro
   test_dataset_path: data/datasets/dataset_v1_full_matrix_colab_pro/test.npz
   batch_size: 8192

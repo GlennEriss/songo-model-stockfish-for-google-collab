@@ -17,6 +17,32 @@ def make_job_id(run_type: str) -> str:
     return f"{run_type}_{stamp}_{suffix}"
 
 
+def _next_cycle_job_id(requested_job_id: str, jobs_root: Path) -> str:
+    stem = requested_job_id
+    if stem.endswith("_") and len(stem) > 1:
+        stem = stem[:-1]
+
+    import re
+
+    match = re.search(r"^(.*?)(\d+)$", stem)
+    if match:
+        prefix = match.group(1)
+        width = len(match.group(2))
+        candidate = int(match.group(2))
+        while True:
+            candidate += 1
+            next_job_id = f"{prefix}{candidate:0{width}d}"
+            if not (jobs_root / next_job_id).exists():
+                return next_job_id
+
+    index = 2
+    while True:
+        next_job_id = f"{requested_job_id}_{index:03d}"
+        if not (jobs_root / next_job_id).exists():
+            return next_job_id
+        index += 1
+
+
 @dataclass
 class JobContext:
     config: dict[str, Any]
@@ -99,6 +125,13 @@ def create_job_context(config: dict[str, Any], *, override_job_id: str | None = 
     run_type = str(job_cfg.get("run_type", "job"))
     requested_job_id = override_job_id or str(job_cfg.get("job_id", "auto"))
     job_id = make_job_id(run_type) if requested_job_id in {"", "auto"} else requested_job_id
+    auto_rollover_completed = bool(job_cfg.get("auto_rollover_completed_job", True))
+    if requested_job_id not in {"", "auto"} and auto_rollover_completed and run_type in {"train", "evaluation", "benchmark"}:
+        existing_status_path = paths.jobs_root / job_id / "run_status.json"
+        if existing_status_path.exists():
+            existing_status = json.loads(existing_status_path.read_text(encoding="utf-8"))
+            if str(existing_status.get("status", "")).lower() == "completed":
+                job_id = _next_cycle_job_id(requested_job_id, paths.jobs_root)
     job_dir = paths.jobs_root / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
 
@@ -126,6 +159,18 @@ def create_job_context(config: dict[str, Any], *, override_job_id: str | None = 
         context.write_status("pending")
     if not state_path.exists():
         context.write_state({"last_completed_phase": "none"})
+    if job_id != requested_job_id and requested_job_id not in {"", "auto"}:
+        context.logger.info(
+            "completed job id rolled over automatically | previous_job_id=%s | new_job_id=%s | run_type=%s",
+            requested_job_id,
+            job_id,
+            run_type,
+        )
+        context.write_event(
+            "job_id_rollover_completed_job",
+            previous_job_id=requested_job_id,
+            new_job_id=job_id,
+        )
     return context
 
 

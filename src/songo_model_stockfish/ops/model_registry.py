@@ -28,6 +28,27 @@ def promoted_best_dir(models_root: Path) -> Path:
     return models_root / "promoted" / "best"
 
 
+def best_model_record(models_root: Path) -> dict[str, Any] | None:
+    registry = load_registry(models_root)
+    models = list(registry.get("models", []))
+    return models[0] if models else None
+
+
+def latest_model_record(models_root: Path) -> dict[str, Any] | None:
+    registry = load_registry(models_root)
+    models = list(registry.get("models", []))
+    if not models:
+        return None
+    return max(models, key=lambda item: float(item.get("sort_ts", 0.0)))
+
+
+def promoted_best_metadata(models_root: Path) -> dict[str, Any] | None:
+    path = promoted_best_dir(models_root) / "metadata.json"
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def next_model_version(models_root: Path, prefix: str) -> int:
     registry = load_registry(models_root)
     versions: list[int] = []

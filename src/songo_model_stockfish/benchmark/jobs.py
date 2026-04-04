@@ -10,7 +10,13 @@ from songo_model_stockfish.benchmark.model_agent import ModelAgent
 from songo_model_stockfish.engine.config import EngineConfig
 from songo_model_stockfish.engine.search import choose_move
 from songo_model_stockfish.ops.job import JobContext
-from songo_model_stockfish.ops.model_registry import load_registry, promote_best_model, upsert_model_record
+from songo_model_stockfish.ops.model_registry import (
+    latest_model_record,
+    load_registry,
+    promote_best_model,
+    promoted_best_metadata,
+    upsert_model_record,
+)
 
 
 class EngineAgent:
@@ -77,7 +83,21 @@ def _build_target_agent(job: JobContext) -> AgentLike:
     if target == "engine_v1":
         return EngineAgent()
 
-    checkpoint_path = _resolve_storage_path(job.paths.drive_root, benchmark_cfg.get("checkpoint_path"), job.job_dir / "model.pt")
+    checkpoint_cfg = str(benchmark_cfg.get("checkpoint_path", "")).strip()
+    if target in {"auto_best", "auto_promoted_best"} or checkpoint_cfg in {"auto_best", "auto_promoted_best"}:
+        metadata = promoted_best_metadata(job.paths.models_root)
+        if not metadata:
+            raise FileNotFoundError("Aucun modele promu disponible pour le benchmark auto_best.")
+        target = str(metadata.get("model_id", "promoted_best"))
+        checkpoint_path = job.paths.models_root / "promoted" / "best" / "model.pt"
+    elif target in {"auto", "auto_latest"} or checkpoint_cfg in {"", "auto", "auto_latest"}:
+        latest = latest_model_record(job.paths.models_root)
+        if not latest:
+            raise FileNotFoundError("Aucun modele disponible dans le registre pour le benchmark auto_latest.")
+        target = str(latest.get("model_id", ""))
+        checkpoint_path = Path(str(latest.get("checkpoint_path", "")).strip())
+    else:
+        checkpoint_path = _resolve_storage_path(job.paths.drive_root, benchmark_cfg.get("checkpoint_path"), job.job_dir / "model.pt")
     device = str(job.config.get("runtime", {}).get("device", "cpu"))
     return ModelAgent(str(checkpoint_path), display_name=target, device=device)
 
