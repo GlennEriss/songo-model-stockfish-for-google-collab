@@ -10,14 +10,18 @@ job:
   job_id: auto
   resume: true
   save_every_minutes: 5
+  auto_rollover_completed_job: true
 
 dataset_build:
   input_sampled_dir: data/sampled_full_matrix_colab_pro
-  dataset_id: dataset_v1_full_matrix_colab_pro
-  output_dir: data/datasets/dataset_v1_full_matrix_colab_pro
+  dataset_id: dataset_v2_full_matrix_colab_pro_insane_1m
+  output_dir: data/datasets/dataset_v2_full_matrix_colab_pro_insane_1m
+  label_cache_dir: data/label_cache/dataset_v2_full_matrix_colab_pro_insane_1m
+  target_labeled_samples: 1000000
   teacher:
     engine: minimax
-    level: hard
+    level: insane
+  log_every_n_files: 25
   split:
     train: 0.8
     validation: 0.1

@@ -126,7 +126,13 @@ def create_job_context(config: dict[str, Any], *, override_job_id: str | None = 
     requested_job_id = override_job_id or str(job_cfg.get("job_id", "auto"))
     job_id = make_job_id(run_type) if requested_job_id in {"", "auto"} else requested_job_id
     auto_rollover_completed = bool(job_cfg.get("auto_rollover_completed_job", True))
-    if requested_job_id not in {"", "auto"} and auto_rollover_completed and run_type in {"train", "evaluation", "benchmark"}:
+    if requested_job_id not in {"", "auto"} and auto_rollover_completed and run_type in {
+        "train",
+        "evaluation",
+        "benchmark",
+        "dataset_generation",
+        "dataset_build",
+    }:
         existing_status_path = paths.jobs_root / job_id / "run_status.json"
         if existing_status_path.exists():
             existing_status = json.loads(existing_status_path.read_text(encoding="utf-8"))

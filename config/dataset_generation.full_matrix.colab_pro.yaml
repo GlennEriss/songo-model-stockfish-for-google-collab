@@ -16,6 +16,7 @@ job:
   job_id: auto
   resume: true
   save_every_minutes: 5
+  auto_rollover_completed_job: true
 
 dataset_generation:
   matchups:
@@ -35,7 +36,8 @@ dataset_generation:
     - mcts:medium vs minimax:hard
     - mcts:hard vs minimax:medium
     - mcts:hard vs minimax:hard
-  games: 200
+  games: 400
+  target_samples: 1000000
   sample_strategy: uniform_by_ply
   sample_every_n_plies: 2
   max_moves: 400

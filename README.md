@@ -128,6 +128,28 @@ Important:
 - `dataset_generation` via `minimax` / `mcts` n'utilise pas le GPU comme levier principal, mais exploite mieux CPU + RAM en parallele
 - l'optimisation GPU est aujourd'hui principalement effective sur `train`, `evaluate` et `benchmark` quand la cible est un checkpoint neuronal
 
+## Pipeline Incremental Vers 1M
+
+Le pipeline dataset full matrix est maintenant pense pour l'accumulation incrementale:
+
+- `dataset-generate` n'est plus traite comme une production "une fois pour toutes"
+- a chaque relance, il ajoute de nouvelles parties dans `data/raw_full_matrix_colab_pro` et `data/sampled_full_matrix_colab_pro`
+- la config full matrix fixe maintenant un objectif `target_samples: 1000000`
+- les jobs `dataset_generation` et `dataset_build` font eux aussi un rollover automatique de `job_id` quand un cycle precedent est deja termine
+
+Pour la construction du dataset final:
+
+- `dataset-build` utilise maintenant un cache de labels partage sur Drive
+- ce cache est separe par teacher, donc passer de `hard` a `insane` ne reutilise pas les anciens labels faibles
+- la config full matrix vise maintenant un dataset final `insane` dedie:
+  - `dataset_v2_full_matrix_colab_pro_insane_1m`
+
+Donc:
+
+- on conserve les positions deja generees
+- on ne repart pas de zero sur le corpus brut
+- mais on reconstruit les labels finaux avec un teacher plus fort et un objectif de plus grande echelle
+
 ## Workflow Colab
 
 Le projet contient maintenant une couche Colab dediee pour mettre a jour le code sans toucher aux artefacts persistants:

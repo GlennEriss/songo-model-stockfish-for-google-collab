@@ -52,6 +52,60 @@ def _count_jsonl_lines(path: Path) -> int:
         return sum(1 for _ in handle)
 
 
+def _count_total_jsonl_lines(root: Path) -> int:
+    total = 0
+    for path in sorted(root.rglob("*.jsonl")):
+        total += _count_jsonl_lines(path)
+    return total
+
+
+def _existing_game_numbers(raw_dir: Path, sampled_dir: Path, matchup_id: str) -> set[int]:
+    raw_matchup_dir = raw_dir / matchup_id
+    sampled_matchup_dir = sampled_dir / matchup_id
+    raw_stems = {path.stem for path in raw_matchup_dir.glob("*.json")} if raw_matchup_dir.exists() else set()
+    sampled_stems = {path.stem for path in sampled_matchup_dir.glob("*.jsonl")} if sampled_matchup_dir.exists() else set()
+    completed = raw_stems & sampled_stems
+    game_numbers: set[int] = set()
+    prefix = f"{matchup_id}_game_"
+    for stem in completed:
+        if stem.startswith(prefix):
+            suffix = stem[len(prefix) :]
+            if suffix.isdigit():
+                game_numbers.add(int(suffix))
+    return game_numbers
+
+
+def _build_pending_incremental_games(
+    *,
+    raw_dir: Path,
+    sampled_dir: Path,
+    matchup_id: str,
+    games_to_add: int,
+    seed_base: int,
+) -> list[dict[str, Any]]:
+    existing_numbers = _existing_game_numbers(raw_dir, sampled_dir, matchup_id)
+    pending: list[dict[str, Any]] = []
+    candidate = 1
+    while len(pending) < games_to_add:
+        game_id = f"{matchup_id}_game_{candidate:06d}"
+        raw_game_path = raw_dir / matchup_id / f"{game_id}.json"
+        sampled_game_path = sampled_dir / matchup_id / f"{game_id}.jsonl"
+        if candidate not in existing_numbers or not (raw_game_path.exists() and sampled_game_path.exists()):
+            pending.append(
+                {
+                    "game_index": candidate - 1,
+                    "game_no": candidate,
+                    "starter": (candidate - 1) % 2,
+                    "seed": seed_base + (candidate - 1),
+                    "game_id": game_id,
+                    "raw_game_path": raw_game_path,
+                    "sampled_game_path": sampled_game_path,
+                }
+            )
+        candidate += 1
+    return pending
+
+
 def _build_external_agent(spec: str):
     from songo_model_stockfish.reference_songo.agents import MCTSAgent, MinimaxAgent
 
@@ -417,6 +471,7 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
     max_pending_futures = max(1, int(cfg.get("max_pending_futures", num_workers * 2)))
     multiprocessing_start_method = str(runtime_cfg.get("multiprocessing_start_method", "spawn")).strip().lower() or "spawn"
     max_tasks_per_child = int(runtime_cfg.get("max_tasks_per_child", 25))
+    target_samples = int(cfg.get("target_samples", 0))
 
     dataset_dir = job.job_dir / "dataset_generation"
     raw_dir = _resolve_storage_path(job.paths.drive_root, cfg.get("output_raw_dir"), dataset_dir / "raw_match_logs")
@@ -425,35 +480,80 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
     sampled_dir.mkdir(parents=True, exist_ok=True)
 
     state = job.read_state()
-    completed_matchups = set(state.get("completed_matchups", []))
     summaries: list[dict[str, Any]] = []
+    initial_total_samples = _count_total_jsonl_lines(sampled_dir)
+    total_samples_after_run = initial_total_samples
 
     job.logger.info("dataset generation started")
     job.set_phase("dataset_generation")
-    job.write_event("dataset_generation_started")
-    job.write_metric({"metric_type": "dataset_generation_started"})
+    job.write_event(
+        "dataset_generation_started",
+        existing_samples=initial_total_samples,
+        target_samples=target_samples,
+    )
+    job.write_metric(
+        {
+            "metric_type": "dataset_generation_started",
+            "existing_samples": initial_total_samples,
+            "target_samples": target_samples,
+        }
+    )
+
+    if target_samples > 0 and initial_total_samples >= target_samples:
+        summary = {
+            "job_id": job.job_id,
+            "matchups": [],
+            "existing_samples": initial_total_samples,
+            "added_samples": 0,
+            "total_samples": initial_total_samples,
+            "target_samples": target_samples,
+        }
+        _write_json(dataset_dir / "dataset_generation_summary.json", summary)
+        job.logger.info(
+            "dataset generation skipped | target already reached | existing_samples=%s | target_samples=%s",
+            initial_total_samples,
+            target_samples,
+        )
+        job.write_state(
+            {
+                "current_matchup": None,
+                "completed_games": 0,
+                "remaining_games": 0,
+                "last_completed_game_id": state.get("last_completed_game_id"),
+                "sample_count": initial_total_samples,
+                "target_samples": target_samples,
+            }
+        )
+        return summary
 
     for matchup_index, matchup_spec in enumerate(matchups):
         matchup_a, matchup_b = _parse_matchup(str(matchup_spec))
         matchup_id = _slugify_matchup(str(matchup_spec))
         job.set_phase(f"dataset_generation:{matchup_id}")
         summary_path = dataset_dir / f"{matchup_id}_summary.json"
-        if matchup_id in completed_matchups and summary_path.exists():
-            summaries.append(json.loads(summary_path.read_text(encoding="utf-8")))
-            job.logger.info("dataset matchup skipped (already completed): %s", matchup_spec)
-            continue
+        if target_samples > 0 and total_samples_after_run >= target_samples:
+            job.logger.info(
+                "dataset generation target reached during run | current_samples=%s | target_samples=%s",
+                total_samples_after_run,
+                target_samples,
+            )
+            break
 
         matchup_game_count = 0
         matchup_sample_count = 0
+        existing_numbers = _existing_game_numbers(raw_dir, sampled_dir, matchup_id)
+        existing_game_count = len(existing_numbers)
         job.logger.info(
-            "dataset matchup started | %s/%s | %s vs %s | games=%s | sample_every=%s | workers=%s",
+            "dataset matchup started | %s/%s | %s vs %s | add_games=%s | existing_games=%s | sample_every=%s | workers=%s | target_samples=%s",
             matchup_index + 1,
             len(matchups),
             matchup_a,
             matchup_b,
             games,
+            existing_game_count,
             sample_every_n_plies,
             num_workers,
+            target_samples,
         )
         job.write_event(
             "dataset_matchup_started",
@@ -462,59 +562,21 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
             total_matchups=len(matchups),
             player_a=matchup_a,
             player_b=matchup_b,
-            games=games,
+            add_games=games,
+            existing_games=existing_game_count,
             sample_every_n_plies=sample_every_n_plies,
             num_workers=num_workers,
         )
 
-        pending_games: list[dict[str, Any]] = []
-        for game_index in range(games):
-            starter = game_index % 2
-            seed = base_seed + (matchup_index * 1_000_000) + game_index
-            game_id = f"{matchup_id}_game_{game_index + 1:06d}"
-            raw_game_path = raw_dir / matchup_id / f"{game_id}.json"
-            sampled_game_path = sampled_dir / matchup_id / f"{game_id}.jsonl"
-            if raw_game_path.exists() and sampled_game_path.exists():
-                raw_payload = json.loads(raw_game_path.read_text(encoding="utf-8"))
-                sample_count = _count_jsonl_lines(sampled_game_path)
-                job.logger.info(
-                    "dataset game reused | matchup=%s | game=%s/%s | moves=%s | samples=%s | winner=%s",
-                    matchup_id,
-                    game_index + 1,
-                    games,
-                    raw_payload["ply_count"],
-                    sample_count,
-                    raw_payload["winner"],
-                )
-                matchup_game_count += 1
-                matchup_sample_count += sample_count
-                job.write_state(
-                    {
-                        "completed_matchups": sorted(completed_matchups),
-                        "current_matchup": matchup_id,
-                        "completed_games": matchup_game_count,
-                        "remaining_games": games - matchup_game_count,
-                        "last_completed_game_id": game_id,
-                        "sample_count": matchup_sample_count,
-                    }
-                )
-                continue
+        pending_games = _build_pending_incremental_games(
+            raw_dir=raw_dir,
+            sampled_dir=sampled_dir,
+            matchup_id=matchup_id,
+            games_to_add=games,
+            seed_base=base_seed + (matchup_index * 1_000_000),
+        )
 
-            pending_games.append(
-                {
-                    "game_index": game_index,
-                    "game_no": game_index + 1,
-                    "starter": starter,
-                    "seed": seed,
-                    "game_id": game_id,
-                    "raw_game_path": raw_game_path,
-                    "sampled_game_path": sampled_game_path,
-                }
-            )
-
-        if not pending_games:
-            job.logger.info("dataset matchup already fully materialized on disk | matchup=%s", matchup_id)
-        elif num_workers <= 1:
+        if num_workers <= 1:
             completed_games, completed_samples, _execution_mode = _run_pending_games_sequential(
                 job,
                 pending_games=pending_games,
@@ -530,12 +592,12 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
             if pending_games:
                 job.write_state(
                     {
-                        "completed_matchups": sorted(completed_matchups),
                         "current_matchup": matchup_id,
                         "completed_games": matchup_game_count,
                         "remaining_games": games - matchup_game_count,
                         "last_completed_game_id": pending_games[-1]["game_id"],
-                        "sample_count": matchup_sample_count,
+                        "sample_count": total_samples_after_run + matchup_sample_count,
+                        "target_samples": target_samples,
                     }
                 )
         else:
@@ -609,14 +671,15 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
                             )
                             matchup_game_count += games_inc
                             matchup_sample_count += samples_inc
+                            total_samples_after_run += samples_inc
                             job.write_state(
                                 {
-                                    "completed_matchups": sorted(completed_matchups),
                                     "current_matchup": matchup_id,
                                     "completed_games": matchup_game_count,
                                     "remaining_games": games - matchup_game_count,
                                     "last_completed_game_id": pending["game_id"],
-                                    "sample_count": matchup_sample_count,
+                                    "sample_count": total_samples_after_run,
+                                    "target_samples": target_samples,
                                 }
                             )
             except concurrent.futures.process.BrokenProcessPool as exc:
@@ -647,68 +710,83 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
                 )
                 matchup_game_count += completed_games
                 matchup_sample_count += completed_samples
+                total_samples_after_run += completed_samples
                 if failed_pending:
                     job.write_state(
                         {
-                            "completed_matchups": sorted(completed_matchups),
                             "current_matchup": matchup_id,
                             "completed_games": matchup_game_count,
                             "remaining_games": games - matchup_game_count,
                             "last_completed_game_id": failed_pending[-1]["game_id"],
-                            "sample_count": matchup_sample_count,
+                            "sample_count": total_samples_after_run,
+                            "target_samples": target_samples,
                         }
                     )
+
+        if num_workers <= 1 and pending_games:
+            total_samples_after_run += matchup_sample_count
 
         summary_payload = {
             "matchup_id": matchup_id,
             "player_a": matchup_a,
             "player_b": matchup_b,
-            "games": matchup_game_count,
-            "samples": matchup_sample_count,
+            "existing_games": existing_game_count,
+            "games_added": matchup_game_count,
+            "samples_added": matchup_sample_count,
             "sample_every_n_plies": sample_every_n_plies,
             "num_workers": num_workers,
         }
         _write_json(summary_path, summary_payload)
         summaries.append(summary_payload)
-        completed_matchups.add(matchup_id)
         job.logger.info(
-            "dataset matchup completed | %s vs %s | games=%s | samples=%s",
+            "dataset matchup completed | %s vs %s | games_added=%s | samples_added=%s | total_samples=%s",
             matchup_a,
             matchup_b,
             matchup_game_count,
             matchup_sample_count,
+            total_samples_after_run,
         )
         job.write_state(
             {
-                "completed_matchups": sorted(completed_matchups),
                 "current_matchup": matchup_id,
                 "completed_games": matchup_game_count,
                 "remaining_games": 0,
-                "last_completed_game_id": f"{matchup_id}_game_{matchup_game_count:06d}",
-                "sample_count": matchup_sample_count,
+                "last_completed_game_id": pending_games[-1]["game_id"] if pending_games else state.get("last_completed_game_id"),
+                "sample_count": total_samples_after_run,
+                "target_samples": target_samples,
             }
         )
         job.write_metric({"metric_type": "dataset_matchup_completed", **summary_payload})
         job.write_event("dataset_matchup_completed", matchup=matchup_id, samples=matchup_sample_count)
 
-    summary = {"job_id": job.job_id, "matchups": summaries}
+    added_games = sum(int(item["games_added"]) for item in summaries)
+    added_samples = sum(int(item["samples_added"]) for item in summaries)
+    summary = {
+        "job_id": job.job_id,
+        "matchups": summaries,
+        "existing_samples": initial_total_samples,
+        "added_games": added_games,
+        "added_samples": added_samples,
+        "total_samples": initial_total_samples + added_samples,
+        "target_samples": target_samples,
+    }
     _write_json(dataset_dir / "dataset_generation_summary.json", summary)
-    total_games = sum(int(item["games"]) for item in summaries)
-    total_samples = sum(int(item["samples"]) for item in summaries)
     job.logger.info(
-        "dataset generation completed | matchups=%s | games=%s | samples=%s",
+        "dataset generation completed | matchups=%s | added_games=%s | added_samples=%s | total_samples=%s | target_samples=%s",
         len(summaries),
-        total_games,
-        total_samples,
+        added_games,
+        added_samples,
+        initial_total_samples + added_samples,
+        target_samples,
     )
     job.write_state(
         {
-            "completed_matchups": sorted(completed_matchups),
             "current_matchup": None,
-            "completed_games": total_games,
+            "completed_games": added_games,
             "remaining_games": 0,
             "last_completed_game_id": state.get("last_completed_game_id"),
-            "sample_count": total_samples,
+            "sample_count": initial_total_samples + added_samples,
+            "target_samples": target_samples,
         }
     )
     return summary
@@ -726,10 +804,26 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
 
     dataset_dir = job.job_dir / "dataset_build"
     sampled_root = _resolve_storage_path(job.paths.drive_root, cfg.get("input_sampled_dir"), dataset_dir.parent / "dataset_generation" / "sampled_positions")
-    labeled_root = dataset_dir / "labeled_positions"
+    label_cache_dir = _resolve_storage_path(
+        job.paths.drive_root,
+        cfg.get("label_cache_dir"),
+        job.paths.data_root / "label_cache" / dataset_id / f"{teacher_engine}_{teacher_level}",
+    )
+    labeled_root = label_cache_dir / "labeled_positions"
     output_root = _resolve_storage_path(job.paths.drive_root, cfg.get("output_dir"), dataset_dir / "datasets" / dataset_id)
     labeled_root.mkdir(parents=True, exist_ok=True)
     output_root.mkdir(parents=True, exist_ok=True)
+    target_labeled_samples = int(cfg.get("target_labeled_samples", 0))
+    label_cache_metadata_path = label_cache_dir / "metadata.json"
+    _write_json(
+        label_cache_metadata_path,
+        {
+            "dataset_id": dataset_id,
+            "teacher_engine": teacher_engine,
+            "teacher_level": teacher_level,
+            "label_cache_dir": str(label_cache_dir),
+        },
+    )
 
     sampled_files = sorted(sampled_root.rglob("*.jsonl"))
     if not sampled_files:
@@ -737,19 +831,21 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
 
     state = job.read_state()
     completed_files = set(state.get("completed_files", []))
-    labeled_samples: list[dict[str, Any]] = []
+    file_sample_counts: dict[str, int] = {}
     processed_count = 0
     skipped_terminal_samples = 0
     skipped_no_legal_samples = 0
     log_every_n_files = max(1, int(cfg.get("log_every_n_files", 1)))
 
     job.logger.info(
-        "dataset build started | dataset=%s | teacher=%s:%s | sampled_root=%s | files=%s",
+        "dataset build started | dataset=%s | teacher=%s:%s | sampled_root=%s | label_cache=%s | files=%s | target_labeled_samples=%s",
         dataset_id,
         teacher_engine,
         teacher_level,
         sampled_root,
+        label_cache_dir,
         len(sampled_files),
+        target_labeled_samples,
     )
     job.set_phase("dataset_build")
     job.write_event(
@@ -757,7 +853,9 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         teacher_engine=teacher_engine,
         teacher_level=teacher_level,
         sampled_root=str(sampled_root),
+        label_cache_dir=str(label_cache_dir),
         sampled_files=len(sampled_files),
+        target_labeled_samples=target_labeled_samples,
     )
     job.write_metric({"metric_type": "dataset_build_started"})
 
@@ -766,7 +864,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         output_labeled = labeled_root / relative_name
         output_labeled.parent.mkdir(parents=True, exist_ok=True)
 
-        if relative_name in completed_files and output_labeled.exists():
+        if output_labeled.exists():
             file_samples = list(_iter_jsonl(output_labeled))
             source_count = len(file_samples)
             job.logger.info(
@@ -812,14 +910,14 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
             job.write_event("dataset_labeled_file_completed", file=relative_name, samples=len(file_samples))
             job.write_metric({"metric_type": "dataset_labeled_file_completed", "file": relative_name, "samples": len(file_samples)})
 
-        labeled_samples.extend(file_samples)
+        file_sample_counts[relative_name] = len(file_samples)
         processed_count += 1
         if processed_count % log_every_n_files == 0 or processed_count == len(sampled_files):
             job.logger.info(
                 "dataset build progress | files=%s/%s | labeled_samples=%s | skipped_terminal=%s | skipped_no_legal=%s",
                 processed_count,
                 len(sampled_files),
-                len(labeled_samples),
+                sum(file_sample_counts.values()),
                 skipped_terminal_samples,
                 skipped_no_legal_samples,
             )
@@ -828,36 +926,30 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
                 "completed_files": sorted(completed_files),
                 "processed_files": processed_count,
                 "remaining_files": len(sampled_files) - processed_count,
-                "labeled_samples": len(labeled_samples),
+                "labeled_samples": sum(file_sample_counts.values()),
                 "skipped_terminal_samples": skipped_terminal_samples,
                 "skipped_no_legal_samples": skipped_no_legal_samples,
+                "target_labeled_samples": target_labeled_samples,
             }
         )
 
-    grouped: dict[str, list[dict[str, Any]]] = {}
-    for sample in labeled_samples:
-        grouped.setdefault(str(sample["game_id"]), []).append(sample)
-
-    game_ids = sorted(grouped)
-    split_train_end = int(len(game_ids) * train_ratio)
-    split_validation_end = split_train_end + int(len(game_ids) * validation_ratio)
-    split_game_ids = {
-        "train": set(game_ids[:split_train_end]),
-        "validation": set(game_ids[split_train_end:split_validation_end]),
-        "test": set(game_ids[split_validation_end:]),
+    game_files = [str(path.relative_to(sampled_root)) for path in sampled_files]
+    split_train_end = int(len(game_files) * train_ratio)
+    split_validation_end = split_train_end + int(len(game_files) * validation_ratio)
+    split_files = {
+        "train": game_files[:split_train_end],
+        "validation": game_files[split_train_end:split_validation_end],
+        "test": game_files[split_validation_end:],
     }
 
     split_summary: dict[str, dict[str, int]] = {}
-    for split_name, selected_game_ids in split_game_ids.items():
-        split_samples: list[dict[str, Any]] = []
-        for game_id in sorted(selected_game_ids):
-            split_samples.extend(grouped[game_id])
-
+    for split_name, selected_files in split_files.items():
+        selected_sample_count = sum(file_sample_counts.get(relative_name, 0) for relative_name in selected_files)
         job.logger.info(
             "dataset build split export started | split=%s | games=%s | samples=%s",
             split_name,
-            len(selected_game_ids),
-            len(split_samples),
+            len(selected_files),
+            selected_sample_count,
         )
 
         features_list = []
@@ -866,14 +958,16 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         value_list = []
         sample_ids = []
         game_id_list = []
-        for sample in split_samples:
-            features, legal_mask, policy_index, value = _encode_features(sample)
-            features_list.append(features)
-            masks_list.append(legal_mask)
-            policy_list.append(policy_index)
-            value_list.append(value)
-            sample_ids.append(str(sample["sample_id"]))
-            game_id_list.append(str(sample["game_id"]))
+        for relative_name in selected_files:
+            labeled_path = labeled_root / relative_name
+            for sample in _iter_jsonl(labeled_path):
+                features, legal_mask, policy_index, value = _encode_features(sample)
+                features_list.append(features)
+                masks_list.append(legal_mask)
+                policy_list.append(policy_index)
+                value_list.append(value)
+                sample_ids.append(str(sample["sample_id"]))
+                game_id_list.append(str(sample["game_id"]))
 
         x = np.asarray(features_list, dtype=np.float32) if features_list else np.zeros((0, 17), dtype=np.float32)
         legal_mask = np.asarray(masks_list, dtype=np.float32) if masks_list else np.zeros((0, 7), dtype=np.float32)
@@ -888,12 +982,12 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
             sample_ids=np.asarray(sample_ids, dtype=object),
             game_ids=np.asarray(game_id_list, dtype=object),
         )
-        split_summary[split_name] = {"games": len(selected_game_ids), "samples": len(split_samples)}
+        split_summary[split_name] = {"games": len(selected_files), "samples": selected_sample_count}
         job.logger.info(
             "dataset build split export completed | split=%s | games=%s | samples=%s | path=%s",
             split_name,
-            len(selected_game_ids),
-            len(split_samples),
+            len(selected_files),
+            selected_sample_count,
             output_root / f"{split_name}.npz",
         )
 
@@ -902,8 +996,11 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         "dataset_id": dataset_id,
         "teacher_engine": teacher_engine,
         "teacher_level": teacher_level,
+        "label_cache_dir": str(label_cache_dir),
         "splits": split_summary,
         "output_dir": str(output_root),
+        "labeled_samples": sum(file_sample_counts.values()),
+        "target_labeled_samples": target_labeled_samples,
         "skipped_terminal_samples": skipped_terminal_samples,
         "skipped_no_legal_samples": skipped_no_legal_samples,
     }
