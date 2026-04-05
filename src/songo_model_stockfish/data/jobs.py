@@ -863,6 +863,36 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
     skipped_terminal_samples = 0
     skipped_no_legal_samples = 0
     log_every_n_files = max(1, int(cfg.get("log_every_n_files", 1)))
+    last_logged_progress_count = -1
+
+    def _write_build_state() -> None:
+        job.write_state(
+            {
+                "completed_files": sorted(completed_files),
+                "processed_files": processed_count,
+                "remaining_files": len(sampled_files) - processed_count,
+                "labeled_samples": sum(file_sample_counts.values()),
+                "skipped_terminal_samples": skipped_terminal_samples,
+                "skipped_no_legal_samples": skipped_no_legal_samples,
+                "target_labeled_samples": target_labeled_samples,
+            }
+        )
+
+    def _log_build_progress_if_needed() -> None:
+        nonlocal last_logged_progress_count
+        if processed_count == last_logged_progress_count:
+            return
+        if processed_count % log_every_n_files != 0 and processed_count != len(sampled_files):
+            return
+        job.logger.info(
+            "dataset build progress | files=%s/%s | labeled_samples=%s | skipped_terminal=%s | skipped_no_legal=%s",
+            processed_count,
+            len(sampled_files),
+            sum(file_sample_counts.values()),
+            skipped_terminal_samples,
+            skipped_no_legal_samples,
+        )
+        last_logged_progress_count = processed_count
 
     job.logger.info(
         "dataset build started | dataset=%s | teacher=%s:%s | sampled_root=%s | label_cache=%s | files=%s | target_labeled_samples=%s | workers=%s",
@@ -917,26 +947,8 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
                 }
             )
 
-        if processed_count % log_every_n_files == 0 or processed_count == len(sampled_files):
-            job.logger.info(
-                "dataset build progress | files=%s/%s | labeled_samples=%s | skipped_terminal=%s | skipped_no_legal=%s",
-                processed_count,
-                len(sampled_files),
-                sum(file_sample_counts.values()),
-                skipped_terminal_samples,
-                skipped_no_legal_samples,
-            )
-        job.write_state(
-            {
-                "completed_files": sorted(completed_files),
-                "processed_files": processed_count,
-                "remaining_files": len(sampled_files) - processed_count,
-                "labeled_samples": sum(file_sample_counts.values()),
-                "skipped_terminal_samples": skipped_terminal_samples,
-                "skipped_no_legal_samples": skipped_no_legal_samples,
-                "target_labeled_samples": target_labeled_samples,
-            }
-        )
+        _log_build_progress_if_needed()
+        _write_build_state()
 
     def _materialize_labeled_file(file_item: dict[str, Any], source_count: int, file_samples: list[dict[str, Any]], skipped_terminal: int, skipped_no_legal: int) -> None:
         nonlocal processed_count, skipped_terminal_samples, skipped_no_legal_samples
@@ -963,26 +975,8 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         )
         job.write_event("dataset_labeled_file_completed", file=str(file_item["relative_name"]), samples=len(file_samples))
         job.write_metric({"metric_type": "dataset_labeled_file_completed", "file": str(file_item["relative_name"]), "samples": len(file_samples)})
-        if processed_count % log_every_n_files == 0 or processed_count == len(sampled_files):
-            job.logger.info(
-                "dataset build progress | files=%s/%s | labeled_samples=%s | skipped_terminal=%s | skipped_no_legal=%s",
-                processed_count,
-                len(sampled_files),
-                sum(file_sample_counts.values()),
-                skipped_terminal_samples,
-                skipped_no_legal_samples,
-            )
-        job.write_state(
-            {
-                "completed_files": sorted(completed_files),
-                "processed_files": processed_count,
-                "remaining_files": len(sampled_files) - processed_count,
-                "labeled_samples": sum(file_sample_counts.values()),
-                "skipped_terminal_samples": skipped_terminal_samples,
-                "skipped_no_legal_samples": skipped_no_legal_samples,
-                "target_labeled_samples": target_labeled_samples,
-            }
-        )
+        _log_build_progress_if_needed()
+        _write_build_state()
 
     if pending_files:
         if num_workers <= 1:
