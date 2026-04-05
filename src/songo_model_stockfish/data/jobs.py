@@ -242,6 +242,28 @@ def _encode_features(sample: dict[str, Any]) -> tuple[np.ndarray, np.ndarray, in
     return features, legal_mask, policy_index, value
 
 
+def _label_samples_from_file(
+    sampled_file_path: str,
+    *,
+    teacher_engine: str,
+    teacher_level: str,
+) -> tuple[int, list[dict[str, Any]], int, int]:
+    source_samples = list(_iter_jsonl(Path(sampled_file_path)))
+    source_count = len(source_samples)
+    labeled_samples: list[dict[str, Any]] = []
+    skipped_terminal = 0
+    skipped_no_legal = 0
+    for sample in source_samples:
+        if bool(sample["state"].get("is_terminal", False)):
+            skipped_terminal += 1
+            continue
+        if not sample["legal_moves"]:
+            skipped_no_legal += 1
+            continue
+        labeled_samples.append(_label_sample(sample, teacher_engine=teacher_engine, teacher_level=teacher_level))
+    return source_count, labeled_samples, skipped_terminal, skipped_no_legal
+
+
 def _play_and_sample_game(
     agent_a,
     agent_b,
@@ -794,6 +816,7 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
 
 def run_dataset_build(job: JobContext) -> dict[str, object]:
     cfg = job.config.get("dataset_build", {})
+    runtime_cfg = job.config.get("runtime", {})
     teacher_cfg = cfg.get("teacher", {})
     teacher_engine = str(teacher_cfg.get("engine", "minimax"))
     teacher_level = str(teacher_cfg.get("level", "hard"))
@@ -801,6 +824,10 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
     split_cfg = cfg.get("split", {})
     train_ratio = float(split_cfg.get("train", 0.8))
     validation_ratio = float(split_cfg.get("validation", 0.1))
+    num_workers = max(1, int(cfg.get("num_workers", runtime_cfg.get("num_workers", 1))))
+    max_pending_futures = max(1, int(cfg.get("max_pending_futures", num_workers * 2)))
+    multiprocessing_start_method = str(runtime_cfg.get("multiprocessing_start_method", "spawn")).strip().lower() or "spawn"
+    max_tasks_per_child = int(runtime_cfg.get("max_tasks_per_child", 25))
 
     dataset_dir = job.job_dir / "dataset_build"
     sampled_root = _resolve_storage_path(job.paths.drive_root, cfg.get("input_sampled_dir"), dataset_dir.parent / "dataset_generation" / "sampled_positions")
@@ -838,7 +865,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
     log_every_n_files = max(1, int(cfg.get("log_every_n_files", 1)))
 
     job.logger.info(
-        "dataset build started | dataset=%s | teacher=%s:%s | sampled_root=%s | label_cache=%s | files=%s | target_labeled_samples=%s",
+        "dataset build started | dataset=%s | teacher=%s:%s | sampled_root=%s | label_cache=%s | files=%s | target_labeled_samples=%s | workers=%s",
         dataset_id,
         teacher_engine,
         teacher_level,
@@ -846,6 +873,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         label_cache_dir,
         len(sampled_files),
         target_labeled_samples,
+        num_workers,
     )
     job.set_phase("dataset_build")
     job.write_event(
@@ -856,9 +884,11 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         label_cache_dir=str(label_cache_dir),
         sampled_files=len(sampled_files),
         target_labeled_samples=target_labeled_samples,
+        num_workers=num_workers,
     )
     job.write_metric({"metric_type": "dataset_build_started"})
 
+    pending_files: list[dict[str, Any]] = []
     for file_index, sampled_file in enumerate(sampled_files, start=1):
         relative_name = str(sampled_file.relative_to(sampled_root))
         output_labeled = labeled_root / relative_name
@@ -874,44 +904,19 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
                 relative_name,
                 len(file_samples),
             )
-        else:
-            source_samples = list(_iter_jsonl(sampled_file))
-            source_count = len(source_samples)
-            job.logger.info(
-                "dataset build file started | %s/%s | file=%s | source_samples=%s",
-                file_index,
-                len(sampled_files),
-                relative_name,
-                source_count,
-            )
-            file_samples = []
-            for sample in source_samples:
-                if bool(sample["state"].get("is_terminal", False)):
-                    skipped_terminal_samples += 1
-                    continue
-                if not sample["legal_moves"]:
-                    skipped_no_legal_samples += 1
-                    continue
-                file_samples.append(_label_sample(sample, teacher_engine=teacher_engine, teacher_level=teacher_level))
-            with output_labeled.open("w", encoding="utf-8") as handle:
-                for sample in file_samples:
-                    handle.write(json.dumps(sample, ensure_ascii=True) + "\n")
             completed_files.add(relative_name)
-            job.logger.info(
-                "dataset build file completed | %s/%s | file=%s | source_samples=%s | labeled_samples=%s | skipped_terminal=%s | skipped_no_legal=%s",
-                file_index,
-                len(sampled_files),
-                relative_name,
-                source_count,
-                len(file_samples),
-                skipped_terminal_samples,
-                skipped_no_legal_samples,
+            file_sample_counts[relative_name] = len(file_samples)
+            processed_count += 1
+        else:
+            pending_files.append(
+                {
+                    "file_index": file_index,
+                    "relative_name": relative_name,
+                    "sampled_file": sampled_file,
+                    "output_labeled": output_labeled,
+                }
             )
-            job.write_event("dataset_labeled_file_completed", file=relative_name, samples=len(file_samples))
-            job.write_metric({"metric_type": "dataset_labeled_file_completed", "file": relative_name, "samples": len(file_samples)})
 
-        file_sample_counts[relative_name] = len(file_samples)
-        processed_count += 1
         if processed_count % log_every_n_files == 0 or processed_count == len(sampled_files):
             job.logger.info(
                 "dataset build progress | files=%s/%s | labeled_samples=%s | skipped_terminal=%s | skipped_no_legal=%s",
@@ -932,6 +937,146 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
                 "target_labeled_samples": target_labeled_samples,
             }
         )
+
+    def _materialize_labeled_file(file_item: dict[str, Any], source_count: int, file_samples: list[dict[str, Any]], skipped_terminal: int, skipped_no_legal: int) -> None:
+        nonlocal processed_count, skipped_terminal_samples, skipped_no_legal_samples
+        output_labeled = Path(file_item["output_labeled"])
+        output_labeled.parent.mkdir(parents=True, exist_ok=True)
+        with output_labeled.open("w", encoding="utf-8") as handle:
+            for sample in file_samples:
+                handle.write(json.dumps(sample, ensure_ascii=True) + "\n")
+
+        skipped_terminal_samples += skipped_terminal
+        skipped_no_legal_samples += skipped_no_legal
+        completed_files.add(str(file_item["relative_name"]))
+        file_sample_counts[str(file_item["relative_name"])] = len(file_samples)
+        processed_count += 1
+        job.logger.info(
+            "dataset build file completed | %s/%s | file=%s | source_samples=%s | labeled_samples=%s | skipped_terminal=%s | skipped_no_legal=%s",
+            file_item["file_index"],
+            len(sampled_files),
+            file_item["relative_name"],
+            source_count,
+            len(file_samples),
+            skipped_terminal_samples,
+            skipped_no_legal_samples,
+        )
+        job.write_event("dataset_labeled_file_completed", file=str(file_item["relative_name"]), samples=len(file_samples))
+        job.write_metric({"metric_type": "dataset_labeled_file_completed", "file": str(file_item["relative_name"]), "samples": len(file_samples)})
+        if processed_count % log_every_n_files == 0 or processed_count == len(sampled_files):
+            job.logger.info(
+                "dataset build progress | files=%s/%s | labeled_samples=%s | skipped_terminal=%s | skipped_no_legal=%s",
+                processed_count,
+                len(sampled_files),
+                sum(file_sample_counts.values()),
+                skipped_terminal_samples,
+                skipped_no_legal_samples,
+            )
+        job.write_state(
+            {
+                "completed_files": sorted(completed_files),
+                "processed_files": processed_count,
+                "remaining_files": len(sampled_files) - processed_count,
+                "labeled_samples": sum(file_sample_counts.values()),
+                "skipped_terminal_samples": skipped_terminal_samples,
+                "skipped_no_legal_samples": skipped_no_legal_samples,
+                "target_labeled_samples": target_labeled_samples,
+            }
+        )
+
+    if pending_files:
+        if num_workers <= 1:
+            for file_item in pending_files:
+                job.logger.info(
+                    "dataset build file started | %s/%s | file=%s | mode=sequential",
+                    file_item["file_index"],
+                    len(sampled_files),
+                    file_item["relative_name"],
+                )
+                source_count, file_samples, skipped_terminal, skipped_no_legal = _label_samples_from_file(
+                    str(file_item["sampled_file"]),
+                    teacher_engine=teacher_engine,
+                    teacher_level=teacher_level,
+                )
+                _materialize_labeled_file(file_item, source_count, file_samples, skipped_terminal, skipped_no_legal)
+        else:
+            job.logger.info(
+                "dataset build parallel execution | workers=%s | pending_files=%s | max_pending=%s | start_method=%s | max_tasks_per_child=%s",
+                num_workers,
+                len(pending_files),
+                max_pending_futures,
+                multiprocessing_start_method,
+                max_tasks_per_child,
+            )
+            job.write_event(
+                "dataset_build_parallel_execution_started",
+                workers=num_workers,
+                pending_files=len(pending_files),
+                max_pending_futures=max_pending_futures,
+                multiprocessing_start_method=multiprocessing_start_method,
+                max_tasks_per_child=max_tasks_per_child,
+            )
+            future_map: dict[concurrent.futures.Future, dict[str, Any]] = {}
+            pending_queue = list(pending_files)
+            try:
+                mp_context = multiprocessing.get_context(multiprocessing_start_method)
+                with concurrent.futures.ProcessPoolExecutor(
+                    max_workers=num_workers,
+                    mp_context=mp_context,
+                    max_tasks_per_child=max_tasks_per_child,
+                ) as executor:
+                    while pending_queue or future_map:
+                        while pending_queue and len(future_map) < max_pending_futures:
+                            file_item = pending_queue.pop(0)
+                            job.logger.info(
+                                "dataset build file started | %s/%s | file=%s | mode=parallel",
+                                file_item["file_index"],
+                                len(sampled_files),
+                                file_item["relative_name"],
+                            )
+                            future = executor.submit(
+                                _label_samples_from_file,
+                                str(file_item["sampled_file"]),
+                                teacher_engine=teacher_engine,
+                                teacher_level=teacher_level,
+                            )
+                            future_map[future] = file_item
+
+                        done, _not_done = concurrent.futures.wait(
+                            future_map.keys(),
+                            return_when=concurrent.futures.FIRST_COMPLETED,
+                        )
+                        for future in done:
+                            file_item = future_map.pop(future)
+                            source_count, file_samples, skipped_terminal, skipped_no_legal = future.result()
+                            _materialize_labeled_file(file_item, source_count, file_samples, skipped_terminal, skipped_no_legal)
+            except concurrent.futures.process.BrokenProcessPool as exc:
+                failed_pending = list(future_map.values()) + list(pending_queue)
+                job.logger.warning(
+                    "dataset build parallel pool broken | completed_files=%s | remaining_fallback=%s | error=%s",
+                    processed_count,
+                    len(failed_pending),
+                    exc,
+                )
+                job.write_event(
+                    "dataset_build_parallel_execution_broken",
+                    completed_files=processed_count,
+                    remaining_fallback=len(failed_pending),
+                    error=str(exc),
+                )
+                for file_item in failed_pending:
+                    job.logger.info(
+                        "dataset build file started | %s/%s | file=%s | mode=sequential_fallback",
+                        file_item["file_index"],
+                        len(sampled_files),
+                        file_item["relative_name"],
+                    )
+                    source_count, file_samples, skipped_terminal, skipped_no_legal = _label_samples_from_file(
+                        str(file_item["sampled_file"]),
+                        teacher_engine=teacher_engine,
+                        teacher_level=teacher_level,
+                    )
+                    _materialize_labeled_file(file_item, source_count, file_samples, skipped_terminal, skipped_no_legal)
 
     game_files = [str(path.relative_to(sampled_root)) for path in sampled_files]
     split_train_end = int(len(game_files) * train_ratio)

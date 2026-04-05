@@ -18,6 +18,8 @@ dataset_build:
   output_dir: data/datasets/dataset_v2_full_matrix_colab_pro_insane_1m
   label_cache_dir: data/label_cache/dataset_v2_full_matrix_colab_pro_insane_1m
   target_labeled_samples: 1000000
+  num_workers: 8
+  max_pending_futures: 16
   teacher:
     engine: minimax
     level: insane
