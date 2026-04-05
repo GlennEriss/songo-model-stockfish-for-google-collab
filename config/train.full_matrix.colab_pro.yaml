@@ -21,9 +21,9 @@ job:
   save_every_minutes: 5
 
 train:
-  dataset_id: dataset_v1_full_matrix_colab_pro
-  dataset_path: data/datasets/dataset_v1_full_matrix_colab_pro/train.npz
-  validation_path: data/datasets/dataset_v1_full_matrix_colab_pro/validation.npz
+  dataset_id: dataset_v2_full_matrix_colab_pro_insane_1m
+  dataset_path: data/datasets/dataset_v2_full_matrix_colab_pro_insane_1m/train.npz
+  validation_path: data/datasets/dataset_v2_full_matrix_colab_pro_insane_1m/validation.npz
   model_family: policy_value
   backbone: mlp
   hidden_sizes: [1024, 1024, 512, 256]

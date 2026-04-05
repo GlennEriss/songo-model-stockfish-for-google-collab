@@ -23,8 +23,8 @@ job:
 evaluation:
   model_id: auto_latest
   checkpoint_path: ""
-  dataset_id: dataset_v1_full_matrix_colab_pro
-  test_dataset_path: data/datasets/dataset_v1_full_matrix_colab_pro/test.npz
+  dataset_id: dataset_v2_full_matrix_colab_pro_insane_1m
+  test_dataset_path: data/datasets/dataset_v2_full_matrix_colab_pro_insane_1m/test.npz
   batch_size: 8192
   log_every_n_batches: 5
   output_dir: reports/evaluations
