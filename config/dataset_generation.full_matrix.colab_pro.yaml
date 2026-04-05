@@ -3,7 +3,7 @@ project:
 
 runtime:
   seed: 42
-  num_workers: 4
+  num_workers: 8
   multiprocessing_start_method: spawn
   max_tasks_per_child: 25
 
@@ -41,6 +41,6 @@ dataset_generation:
   sample_strategy: uniform_by_ply
   sample_every_n_plies: 2
   max_moves: 400
-  max_pending_futures: 8
+  max_pending_futures: 16
   output_raw_dir: data/raw_full_matrix_colab_pro
   output_sampled_dir: data/sampled_full_matrix_colab_pro
