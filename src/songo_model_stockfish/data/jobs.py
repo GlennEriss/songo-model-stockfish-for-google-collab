@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import multiprocessing
+import time
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +58,19 @@ def _count_total_jsonl_lines(root: Path) -> int:
     for path in sorted(root.rglob("*.jsonl")):
         total += _count_jsonl_lines(path)
     return total
+
+
+def _format_eta_seconds(total_seconds: float | None) -> str:
+    if total_seconds is None:
+        return "unknown"
+    remaining = max(0, int(round(total_seconds)))
+    hours, remainder = divmod(remaining, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours > 0:
+        return f"{hours}h{minutes:02d}m{seconds:02d}s"
+    if minutes > 0:
+        return f"{minutes}m{seconds:02d}s"
+    return f"{seconds}s"
 
 
 def _existing_game_numbers(raw_dir: Path, sampled_dir: Path, matchup_id: str) -> set[int]:
@@ -864,6 +878,25 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
     skipped_no_legal_samples = 0
     log_every_n_files = max(1, int(cfg.get("log_every_n_files", 1)))
     last_logged_progress_count = -1
+    build_started_monotonic = time.monotonic()
+
+    def _estimate_remaining_seconds() -> float | None:
+        if processed_count <= 0:
+            return None
+        elapsed = max(0.001, time.monotonic() - build_started_monotonic)
+        files_per_second = processed_count / elapsed
+        if files_per_second <= 0:
+            return None
+        remaining_files = len(sampled_files) - processed_count
+        return remaining_files / files_per_second
+
+    def _throughput_metrics() -> tuple[float | None, float | None]:
+        if processed_count <= 0:
+            return None, None
+        elapsed = max(0.001, time.monotonic() - build_started_monotonic)
+        files_per_second = processed_count / elapsed
+        samples_per_second = sum(file_sample_counts.values()) / elapsed
+        return files_per_second, samples_per_second
 
     def _write_build_state() -> None:
         job.write_state(
@@ -884,13 +917,17 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
             return
         if processed_count % log_every_n_files != 0 and processed_count != len(sampled_files):
             return
+        files_per_second, samples_per_second = _throughput_metrics()
         job.logger.info(
-            "dataset build progress | files=%s/%s | labeled_samples=%s | skipped_terminal=%s | skipped_no_legal=%s",
+            "dataset build progress | files=%s/%s | labeled_samples=%s | skipped_terminal=%s | skipped_no_legal=%s | files_per_sec=%.2f | samples_per_sec=%.2f | eta=%s",
             processed_count,
             len(sampled_files),
             sum(file_sample_counts.values()),
             skipped_terminal_samples,
             skipped_no_legal_samples,
+            files_per_second or 0.0,
+            samples_per_second or 0.0,
+            _format_eta_seconds(_estimate_remaining_seconds()),
         )
         last_logged_progress_count = processed_count
 
@@ -952,12 +989,16 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
 
     reused_count = processed_count
     pending_count = len(pending_files)
+    files_per_second, samples_per_second = _throughput_metrics()
     job.logger.info(
-        "dataset build scan completed | reused_files=%s | pending_files=%s | total_files=%s | labeled_samples=%s",
+        "dataset build scan completed | reused_files=%s | pending_files=%s | total_files=%s | labeled_samples=%s | files_per_sec=%.2f | samples_per_sec=%.2f | eta=%s",
         reused_count,
         pending_count,
         len(sampled_files),
         sum(file_sample_counts.values()),
+        files_per_second or 0.0,
+        samples_per_second or 0.0,
+        _format_eta_seconds(_estimate_remaining_seconds()),
     )
     job.write_event(
         "dataset_build_scan_completed",
