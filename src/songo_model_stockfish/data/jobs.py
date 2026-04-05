@@ -950,7 +950,32 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         _log_build_progress_if_needed()
         _write_build_state()
 
-    def _materialize_labeled_file(file_item: dict[str, Any], source_count: int, file_samples: list[dict[str, Any]], skipped_terminal: int, skipped_no_legal: int) -> None:
+    reused_count = processed_count
+    pending_count = len(pending_files)
+    job.logger.info(
+        "dataset build scan completed | reused_files=%s | pending_files=%s | total_files=%s | labeled_samples=%s",
+        reused_count,
+        pending_count,
+        len(sampled_files),
+        sum(file_sample_counts.values()),
+    )
+    job.write_event(
+        "dataset_build_scan_completed",
+        reused_files=reused_count,
+        pending_files=pending_count,
+        total_files=len(sampled_files),
+        labeled_samples=sum(file_sample_counts.values()),
+    )
+
+    def _materialize_labeled_file(
+        file_item: dict[str, Any],
+        source_count: int,
+        file_samples: list[dict[str, Any]],
+        skipped_terminal: int,
+        skipped_no_legal: int,
+        *,
+        mode: str,
+    ) -> None:
         nonlocal processed_count, skipped_terminal_samples, skipped_no_legal_samples
         output_labeled = Path(file_item["output_labeled"])
         output_labeled.parent.mkdir(parents=True, exist_ok=True)
@@ -964,10 +989,11 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         file_sample_counts[str(file_item["relative_name"])] = len(file_samples)
         processed_count += 1
         job.logger.info(
-            "dataset build file completed | %s/%s | file=%s | source_samples=%s | labeled_samples=%s | skipped_terminal=%s | skipped_no_legal=%s",
+            "dataset build file completed | %s/%s | file=%s | mode=%s | source_samples=%s | labeled_samples=%s | skipped_terminal=%s | skipped_no_legal=%s",
             file_item["file_index"],
             len(sampled_files),
             file_item["relative_name"],
+            mode,
             source_count,
             len(file_samples),
             skipped_terminal_samples,
@@ -992,7 +1018,14 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
                     teacher_engine=teacher_engine,
                     teacher_level=teacher_level,
                 )
-                _materialize_labeled_file(file_item, source_count, file_samples, skipped_terminal, skipped_no_legal)
+                _materialize_labeled_file(
+                    file_item,
+                    source_count,
+                    file_samples,
+                    skipped_terminal,
+                    skipped_no_legal,
+                    mode="sequential",
+                )
         else:
             job.logger.info(
                 "dataset build parallel execution | workers=%s | pending_files=%s | max_pending=%s | start_method=%s | max_tasks_per_child=%s",
@@ -1043,7 +1076,14 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
                         for future in done:
                             file_item = future_map.pop(future)
                             source_count, file_samples, skipped_terminal, skipped_no_legal = future.result()
-                            _materialize_labeled_file(file_item, source_count, file_samples, skipped_terminal, skipped_no_legal)
+                            _materialize_labeled_file(
+                                file_item,
+                                source_count,
+                                file_samples,
+                                skipped_terminal,
+                                skipped_no_legal,
+                                mode="parallel",
+                            )
             except concurrent.futures.process.BrokenProcessPool as exc:
                 failed_pending = list(future_map.values()) + list(pending_queue)
                 job.logger.warning(
@@ -1070,7 +1110,14 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
                         teacher_engine=teacher_engine,
                         teacher_level=teacher_level,
                     )
-                    _materialize_labeled_file(file_item, source_count, file_samples, skipped_terminal, skipped_no_legal)
+                    _materialize_labeled_file(
+                        file_item,
+                        source_count,
+                        file_samples,
+                        skipped_terminal,
+                        skipped_no_legal,
+                        mode="sequential_fallback",
+                    )
 
     game_files = [str(path.relative_to(sampled_root)) for path in sampled_files]
     split_train_end = int(len(game_files) * train_ratio)
