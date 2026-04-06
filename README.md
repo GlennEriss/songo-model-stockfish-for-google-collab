@@ -273,6 +273,12 @@ Ce document centralise:
 Sur le lot actuel, les evolutions concretes ajoutees sont:
 
 - `dataset-build` plus lisible avec scan resume, debit et ETA
+- `dataset-generate` peut maintenant fonctionner en:
+  - `benchmatch`
+  - `clone_existing`
+  - `derive_existing`
+- `dataset-build` peut maintenant choisir explicitement quelle source de dataset il enrichit
+- debut de versionning dataset via `data/dataset_registry.json`
 - `train` avec `gradient clipping`, scheduler `cosine` et `early stopping`
 - export du meilleur checkpoint comme modele final
 - `evaluation` enrichie avec `value_mae`

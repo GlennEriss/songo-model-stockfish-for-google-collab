@@ -41,6 +41,10 @@ Le teacher principal pour la construction du dataset est:
   - distinction `reused` / `pending`
   - mode `parallel`, `sequential`, `sequential_fallback`
   - `files_per_sec`, `samples_per_sec` et `eta`
+- debut de gestion explicite du versionning dataset:
+  - registre central `data/dataset_registry.json`
+  - sources de datasets enregistrees separement des datasets construits
+  - selection explicite de la source pour `dataset-build`
 
 ### Train, evaluation et benchmark
 
@@ -278,6 +282,155 @@ Tableau minimal recommande:
 - sur-echantillonner les positions tactiques, retournements et fins de partie
 - ajouter des stats de composition du dataset par matchup et par phase de jeu
 
+### Priorite 1 bis - Versionning dataset
+
+- garder `benchmatch` comme source longue et sure
+- permettre aussi la creation d'une nouvelle source a partir d'un corpus existant
+- versionner les sources et les datasets construits separement
+- conserver les originaux intacts lors des enrichissements
+
+Etat:
+
+- `dataset-generate` supporte maintenant:
+  - `--generation-mode benchmatch`
+  - `--generation-mode clone_existing`
+  - `--generation-mode derive_existing`
+  - `--dataset-source-id`
+  - `--source-dataset-id`
+  - `--derivation-strategy`
+- `dataset-build` supporte maintenant:
+  - `--source-dataset-id`
+  - `--dataset-id-override`
+- les metadonnees sont enregistrees dans:
+  - `data/dataset_registry.json`
+
+Strategies de derivation deja disponibles:
+
+- `unique_positions`
+  - deduplication globale des positions equivalentes
+- `endgame_focus`
+  - conserve surtout les positions de fin de partie
+- `high_branching`
+  - conserve surtout les positions avec beaucoup de coups legaux
+
+Recommandation simple:
+
+- `benchmatch` pour produire un nouveau corpus source fiable
+- `clone_existing` pour versionner une copie de travail
+- `derive_existing` pour fabriquer rapidement une variante utile sans relancer les matchs
+
+### Ameliorations recommandees sur la gestion dataset
+
+- ajouter un vrai champ `dataset_version` lisible humainement:
+  - exemple: `2026-04-06__insane_1m__variant_a`
+- distinguer clairement:
+  - `dataset_source_id` pour les corpus sources
+  - `dataset_id` pour les datasets finaux teacher-labeled
+- stocker dans le registre:
+  - parent direct
+  - date de creation
+  - mode de creation
+  - taille cible
+  - taille effective
+  - teacher
+  - tags libres comme `dedup`, `balanced`, `rare_positions`
+- ajouter plus tard une commande de listing:
+  - `dataset-list`
+  - pour voir rapidement les sources et datasets disponibles
+
+Conventions recommandees des maintenant:
+
+- pour les sources:
+  - `sampled_full_matrix_colab_pro`
+  - `sampled_full_matrix_colab_pro_unique`
+  - `sampled_full_matrix_colab_pro_endgame`
+- pour les datasets finaux:
+  - `dataset_v3_full_matrix_colab_pro_unique_insane_1m`
+  - `dataset_v3_full_matrix_colab_pro_endgame_insane_1m`
+
+Regles utiles:
+
+- le nom doit indiquer la famille source
+- le nom doit indiquer la variante
+- le nom du dataset final doit indiquer le teacher cible si important
+- ne pas reutiliser un identifiant pour un contenu different
+
+### Ameliorations recommandees sur la validation dataset
+
+- ajouter un mode `dry-run` specifique aux transformations dataset pour afficher:
+  - combien de fichiers seraient scannes
+  - combien de positions seraient gardees
+  - quelle source serait utilisee
+- ajouter un rapport de legalite:
+  - nombre de positions terminales
+  - nombre de positions sans coup legal
+  - nombre de doublons retires
+- ajouter un rapport de distribution:
+  - score gap
+  - nombre de coups legaux
+  - total de graines sur le plateau
+  - repartition des matchups
+
+### Ameliorations recommandees sur les modes de generation dataset
+
+- garder `benchmatch` pour produire ou etendre le corpus de reference
+- garder `clone_existing` pour dupliquer rapidement une source existante sans la modifier
+- ajouter ensuite un mode `derive_existing` pour:
+  - dedupliquer
+  - filtrer
+  - reequilibrer
+  - reechantillonner
+  - produire des variantes sans relancer de matchs
+
+Ce mode `derive_existing` serait ideal pour:
+
+- enrichir les positions rares
+- reduire les doublons
+- mieux couvrir certaines distributions de graines par case
+- construire plusieurs variantes rapidement a partir du corpus `1m`
+
+### Ameliorations recommandees sur les logs dataset
+
+- ajouter dans `dataset-generate` un log de mode explicite:
+  - `source_mode=benchmatch`
+  - `source_mode=clone_existing`
+  - `source_mode=derive_existing`
+- ajouter un log de source cible:
+  - `dataset_source_id=...`
+- ajouter un log de parent si present:
+  - `source_dataset_id=...`
+- ajouter un log de strategie si mode derive:
+  - `derivation_strategy=...`
+- ajouter a la fin un recap lisible:
+  - nombre de fichiers
+  - nombre de positions
+  - dossier de sortie
+  - source parente
+
+### Ameliorations recommandees sur les logs dataset-build
+
+- logger explicitement:
+  - `source_dataset_id`
+  - `dataset_id`
+  - teacher utilise
+  - taille finale reelle des splits
+- ajouter plus tard un mini resume des top-level metrics:
+  - samples train
+  - samples validation
+  - samples test
+  - skipped ratios
+
+### Ameliorations recommandees sur le notebook
+
+- afficher le registre dataset directement dans Colab
+- afficher les variables dataset effectives avant lancement
+- proposer des presets nommes:
+  - `stable_source`
+  - `unique_positions`
+  - `endgame_focus`
+  - `high_branching`
+- ajouter plus tard une cellule de comparaison rapide entre deux `dataset_metadata.json`
+
 ### Priorite 2 - Architecture du modele
 
 - activer puis tester `LayerNorm + residual_connections`
@@ -328,8 +481,12 @@ Pour une vraie comparaison, utiliser le protocole `stable vs residual` decrit pl
 - `src/songo_model_stockfish/training/model.py`
 - `src/songo_model_stockfish/training/jobs.py`
 - `src/songo_model_stockfish/evaluation/jobs.py`
+- `src/songo_model_stockfish/data/jobs.py`
+- `src/songo_model_stockfish/cli/main.py`
 - `config/train.full_matrix.colab_pro.yaml`
 - `config/train.full_matrix.colab_pro.residual.yaml`
+- `config/dataset_generation.full_matrix.colab_pro.yaml`
+- `config/dataset_build.full_matrix.colab_pro.yaml`
 
 Ce document doit rester la reference courte pour comprendre:
 
