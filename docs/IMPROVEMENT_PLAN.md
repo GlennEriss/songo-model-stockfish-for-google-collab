@@ -101,6 +101,16 @@ En plus de:
 - `policy_accuracy_top1`
 - `policy_accuracy_top3`
 
+Elle supporte maintenant aussi:
+
+- `dataset_selection_mode: largest_built`
+
+Effet attendu:
+
+- evaluation automatique sur le plus grand dataset final disponible
+- moins de risque d'evaluer un dataset obsolete par erreur
+- logs plus clairs sur le checkpoint et le dataset reellement resolus
+
 ## 5. Config Full Matrix Recommandee Actuelle
 
 La config de train full matrix active maintenant:

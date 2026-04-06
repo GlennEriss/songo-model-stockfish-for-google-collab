@@ -130,6 +130,7 @@ Important:
 
 - `dataset_generation` via `minimax` / `mcts` n'utilise pas le GPU comme levier principal, mais exploite mieux CPU + RAM en parallele
 - l'optimisation GPU est aujourd'hui principalement effective sur `train`, `evaluate` et `benchmark` quand la cible est un checkpoint neuronal
+- les configs full matrix de `train` et `evaluation` resolvent maintenant automatiquement le plus grand dataset final disponible dans le registre
 
 ## Pipeline Incremental Vers 1M
 

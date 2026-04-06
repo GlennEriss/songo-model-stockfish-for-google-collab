@@ -19,7 +19,7 @@ from songo_model_stockfish.ops.model_registry import (
     upsert_model_record,
 )
 from songo_model_stockfish.training.data import build_dataloader
-from songo_model_stockfish.training.jobs import _masked_policy_logits
+from songo_model_stockfish.training.jobs import _masked_policy_logits, _select_largest_built_dataset
 from songo_model_stockfish.training.model import PolicyValueMLP
 
 
@@ -78,9 +78,29 @@ def run_evaluation(job: JobContext) -> dict[str, object]:
     cfg = job.config.get("evaluation", {})
     runtime_cfg = job.config.get("runtime", {})
     model_id, checkpoint_path = _resolve_evaluation_target(job, cfg)
-    test_dataset_path = _resolve_storage_path(job.paths.drive_root, cfg.get("test_dataset_path"), job.job_dir / "test.npz")
+    dataset_selection_mode = str(cfg.get("dataset_selection_mode", "configured")).strip().lower() or "configured"
+    if dataset_selection_mode == "largest_built":
+        selected_dataset = _select_largest_built_dataset(job.paths.data_root)
+        dataset_id = str(selected_dataset.get("dataset_id", "dataset_v1"))
+        selected_output_dir = Path(str(selected_dataset["output_dir"]))
+        test_dataset_path = selected_output_dir / "test.npz"
+        dataset_resolution = {
+            "selection_mode": dataset_selection_mode,
+            "resolved_from_registry": True,
+            "selected_labeled_samples": int(selected_dataset.get("labeled_samples", 0)),
+            "selected_build_mode": str(selected_dataset.get("build_mode", "teacher_label")),
+            "selected_teacher_engine": str(selected_dataset.get("teacher_engine", "")),
+            "selected_teacher_level": str(selected_dataset.get("teacher_level", "")),
+            "selected_output_dir": str(selected_output_dir),
+        }
+    else:
+        test_dataset_path = _resolve_storage_path(job.paths.drive_root, cfg.get("test_dataset_path"), job.job_dir / "test.npz")
+        dataset_id = str(cfg.get("dataset_id", "dataset_v1"))
+        dataset_resolution = {
+            "selection_mode": dataset_selection_mode,
+            "resolved_from_registry": False,
+        }
     output_dir = _resolve_storage_path(job.paths.drive_root, cfg.get("output_dir"), job.job_dir / "reports")
-    dataset_id = str(cfg.get("dataset_id", "dataset_v1"))
     batch_size = int(cfg.get("batch_size", 128))
     log_every_n_batches = max(1, int(cfg.get("log_every_n_batches", 1)))
     requested_device = str(runtime_cfg.get("device", "cpu"))
@@ -129,9 +149,10 @@ def run_evaluation(job: JobContext) -> dict[str, object]:
 
     if completed_batches > 0:
         job.logger.info(
-            "evaluation resume detected | model=%s | dataset=%s | completed_batches=%s/%s | completed_examples=%s",
+            "evaluation resume detected | model=%s | dataset=%s | selection_mode=%s | completed_batches=%s/%s | completed_examples=%s",
             model_id,
             dataset_id,
+            dataset_selection_mode,
             completed_batches,
             len(test_loader),
             total_examples,
@@ -140,15 +161,19 @@ def run_evaluation(job: JobContext) -> dict[str, object]:
             "evaluation_resume_detected",
             model_id=model_id,
             dataset_id=dataset_id,
+            dataset_selection_mode=dataset_selection_mode,
             completed_batches=completed_batches,
             total_batches=len(test_loader),
             completed_examples=total_examples,
         )
 
     job.logger.info(
-        "evaluation started | model=%s | dataset=%s | device=%s | mixed_precision=%s | batch_size=%s | examples=%s",
+        "evaluation started | model=%s | checkpoint=%s | dataset=%s | selection_mode=%s | dataset_path=%s | device=%s | mixed_precision=%s | batch_size=%s | examples=%s",
         model_id,
+        checkpoint_path,
         dataset_id,
+        dataset_selection_mode,
+        test_dataset_path,
         device,
         amp_enabled,
         batch_size,
@@ -159,6 +184,10 @@ def run_evaluation(job: JobContext) -> dict[str, object]:
         "evaluation_started",
         model_id=model_id,
         dataset_id=dataset_id,
+        dataset_selection_mode=dataset_selection_mode,
+        dataset_resolution=dataset_resolution,
+        checkpoint_path=str(checkpoint_path),
+        test_dataset_path=str(test_dataset_path),
         device=str(device),
         mixed_precision=amp_enabled,
         batch_size=batch_size,
@@ -171,6 +200,7 @@ def run_evaluation(job: JobContext) -> dict[str, object]:
             "metric_type": "evaluation_started",
             "model_id": model_id,
             "dataset_id": dataset_id,
+            "dataset_selection_mode": dataset_selection_mode,
             "total_examples": len(test_loader.dataset),
             "total_batches": len(test_loader),
             "mixed_precision": amp_enabled,
@@ -279,6 +309,8 @@ def run_evaluation(job: JobContext) -> dict[str, object]:
         "job_id": job.job_id,
         "model_id": model_id,
         "dataset_id": dataset_id,
+        "dataset_selection_mode": dataset_selection_mode,
+        "dataset_resolution": dataset_resolution,
         "device": str(device),
         "mixed_precision": amp_enabled,
         "examples": total_examples,
@@ -334,12 +366,15 @@ def run_evaluation(job: JobContext) -> dict[str, object]:
     job.write_metric({"metric_type": "evaluation_completed", **summary})
     job.write_event("evaluation_completed", model_id=model_id)
     job.logger.info(
-        "evaluation completed | model=%s | examples=%s | top1=%.4f | top3=%.4f | value_mae=%.4f | loss=%.4f",
+        "evaluation completed | model=%s | dataset=%s | selection_mode=%s | examples=%s | top1=%.4f | top3=%.4f | value_mae=%.4f | loss=%.4f | summary=%s",
         model_id,
+        dataset_id,
+        dataset_selection_mode,
         total_examples,
         summary["policy_accuracy_top1"],
         summary["policy_accuracy_top3"],
         summary["value_mae"],
         summary["loss_total"],
+        report_path,
     )
     return summary

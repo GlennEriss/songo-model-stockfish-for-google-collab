@@ -357,9 +357,10 @@ def run_train(job: JobContext) -> dict[str, object]:
         shutil.copy2(init_checkpoint_path, parent_checkpoint_snapshot_path)
         best_metric = 0.0
         job.logger.info(
-            "training init checkpoint loaded | model=%s | parent_checkpoint=%s",
+            "training init checkpoint loaded | model=%s | parent_checkpoint=%s | promoted_best=%s",
             model_id,
             init_checkpoint_path,
+            init_from_promoted_best,
         )
         job.write_event(
             "train_init_checkpoint_loaded",
@@ -387,10 +388,14 @@ def run_train(job: JobContext) -> dict[str, object]:
         )
 
     job.logger.info(
-        "training started | dataset=%s | selection_mode=%s | model=%s | device=%s | mixed_precision=%s | epochs=%s | batch_size=%s | train_examples=%s | validation_examples=%s",
+        "training started | dataset=%s | selection_mode=%s | dataset_path=%s | validation_path=%s | model=%s | init_checkpoint=%s | promoted_best=%s | device=%s | mixed_precision=%s | epochs=%s | batch_size=%s | train_examples=%s | validation_examples=%s",
         dataset_id,
         dataset_selection_mode,
+        dataset_path,
+        validation_path,
         model_id,
+        init_checkpoint_path if init_checkpoint_path else "",
+        init_from_promoted_best,
         device,
         amp_enabled,
         epochs,
@@ -655,13 +660,16 @@ def run_train(job: JobContext) -> dict[str, object]:
         job.write_metric({"metric_type": "train_epoch", **epoch_payload})
         job.write_event("train_epoch_completed", total_epochs=epochs, **epoch_payload)
         job.logger.info(
-            "training epoch completed | epoch=%s/%s | train_loss=%.4f | val_loss=%.4f | train_acc=%.4f | val_acc=%.4f",
+            "training epoch completed | epoch=%s/%s | lr=%.6f | train_loss=%.4f | val_loss=%.4f | train_acc=%.4f | val_acc=%.4f | best_metric=%.4f | best_epoch=%s",
             epoch_number,
             epochs,
+            float(optimizer.param_groups[0]["lr"]),
             train_metrics["loss_total"],
             validation_metrics["loss_total"],
             train_metrics["policy_accuracy"],
             validation_metrics["policy_accuracy"],
+            best_metric,
+            best_epoch,
         )
 
         validation_score = float(validation_metrics["policy_accuracy"])
@@ -851,9 +859,12 @@ def run_train(job: JobContext) -> dict[str, object]:
         restored_best_checkpoint_for_export=restored_best_checkpoint,
     )
     job.logger.info(
-        "training completed | model=%s | final_model=%s | best_validation_metric=%.4f | best_epoch=%s | early_stopped=%s",
+        "training completed | model=%s | dataset=%s | selection_mode=%s | final_model=%s | best_checkpoint=%s | best_validation_metric=%.4f | best_epoch=%s | early_stopped=%s",
         model_id,
+        dataset_id,
+        dataset_selection_mode,
         final_model_path,
+        best_checkpoint_path,
         best_metric,
         best_epoch,
         early_stopped,
