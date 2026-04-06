@@ -120,6 +120,7 @@ Le notebook affiche maintenant aussi, juste avant `benchmark`:
 - le dernier modele disponible dans `model_registry.json` quand le mode est `auto_latest`
 - le modele promu courant pour comparaison rapide
 - les adversaires benchmark (`matchups`)
+- les ratings adverses configures via le YAML benchmark
 - `games_per_matchup`
 - `alternate_first_player`
 - `max_moves`
@@ -129,6 +130,32 @@ Effet attendu:
 - moins d'erreurs de lancement benchmark sur un mauvais checkpoint
 - verification visuelle immediate du modele oppose aux adversaires de reference
 - meilleure coherence entre notebook, config et execution reelle
+
+Le resume apres `benchmark` affiche aussi maintenant:
+
+- `benchmark_score`
+- `benchmark_score_weighted`
+- `benchmark_elo_estimate`
+- le dernier historique benchmark enregistre pour le modele
+- le detail par matchup
+- les resultats `as_first_player` et `as_second_player`
+
+Effet attendu:
+
+- lecture plus fiable des vrais progres benchmark
+- meilleure detection d'un modele fort seulement en premier joueur
+- meilleure selection du modele promu quand les adversaires n'ont pas tous la meme difficulte
+- lecture plus intuitive de la force relative du modele contre un banc d'adversaires fixes
+
+Le benchmark supporte maintenant aussi:
+
+- `opponent_ratings` dans `config/benchmark.colab_pro.yaml`
+- un historique global `models/history/benchmark_history.jsonl`
+
+Effet attendu:
+
+- ajuster facilement le banc de reference sans retoucher le code
+- suivre l'evolution benchmark et Elo-like des modeles au fil des cycles
 
 ## 5. Config Full Matrix Recommandee Actuelle
 

@@ -23,6 +23,11 @@ benchmark:
     - minimax:hard
     - mcts:medium
     - mcts:hard
+  opponent_ratings:
+    minimax:medium: 1200
+    mcts:medium: 1275
+    minimax:hard: 1375
+    mcts:hard: 1450
   games_per_matchup: 50
   alternate_first_player: true
   max_moves: 400

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 import time
 
@@ -74,6 +75,95 @@ def _winner_label(winner: object, target_name: str, opponent_name: str) -> str:
     return "draw"
 
 
+def _opponent_weight(opponent_spec: str) -> float:
+    base_weights = {
+        "minimax:medium": 1.0,
+        "mcts:medium": 1.1,
+        "minimax:hard": 1.25,
+        "mcts:hard": 1.4,
+        "minimax:insane": 1.7,
+        "mcts:insane": 1.8,
+    }
+    return float(base_weights.get(opponent_spec, 1.0))
+
+
+def _opponent_rating(opponent_spec: str, configured: dict[str, object] | None = None) -> float:
+    if configured and opponent_spec in configured:
+        return float(configured[opponent_spec])
+    base_ratings = {
+        "minimax:medium": 1200.0,
+        "mcts:medium": 1275.0,
+        "minimax:hard": 1375.0,
+        "mcts:hard": 1450.0,
+        "minimax:insane": 1600.0,
+        "mcts:insane": 1675.0,
+    }
+    return float(base_ratings.get(opponent_spec, 1300.0))
+
+
+def _record_by_role(stats: dict[str, int], winner: object) -> None:
+    if winner == 0:
+        stats["wins"] += 1
+    elif winner == 1:
+        stats["losses"] += 1
+    else:
+        stats["draws"] += 1
+
+
+def _compute_weighted_benchmark_score(matchups: list[dict[str, object]]) -> float:
+    if not matchups:
+        return 0.0
+    weighted_total = 0.0
+    total_weight = 0.0
+    for item in matchups:
+        opponent = str(item.get("opponent", ""))
+        weight = float(item.get("difficulty_weight", _opponent_weight(opponent)))
+        weighted_total += float(item.get("winrate", 0.0)) * weight
+        total_weight += weight
+    return (weighted_total / total_weight) if total_weight > 0 else 0.0
+
+
+def _score_rate(item: dict[str, object]) -> float:
+    games = int(item.get("games", 0))
+    if games <= 0:
+        return 0.0
+    wins = int(item.get("wins_a", 0))
+    draws = int(item.get("draws", 0))
+    return (wins + 0.5 * draws) / games
+
+
+def _estimate_benchmark_elo(matchups: list[dict[str, object]]) -> float | None:
+    estimates: list[float] = []
+    weights: list[float] = []
+    for item in matchups:
+        games = int(item.get("games", 0))
+        if games <= 0:
+            continue
+        score = min(max(_score_rate(item), 0.01), 0.99)
+        opponent = str(item.get("opponent", ""))
+        opponent_rating = float(item.get("opponent_rating", _opponent_rating(opponent)))
+        # Inverse of expected score formula: E = 1 / (1 + 10 ** ((Rb - Ra) / 400))
+        rating_estimate = opponent_rating - 400.0 * math.log10((1.0 / score) - 1.0)
+        estimates.append(rating_estimate)
+        weights.append(float(item.get("difficulty_weight", _opponent_weight(opponent))) * games)
+    if not estimates:
+        return None
+    total_weight = sum(weights)
+    if total_weight <= 0:
+        return sum(estimates) / len(estimates)
+    return sum(value * weight for value, weight in zip(estimates, weights)) / total_weight
+
+
+def _append_benchmark_history(models_root: Path, model_id: str, payload: dict[str, object]) -> Path:
+    history_dir = models_root / "history"
+    history_dir.mkdir(parents=True, exist_ok=True)
+    history_path = history_dir / "benchmark_history.jsonl"
+    record = {"model_id": model_id, **payload}
+    with history_path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, ensure_ascii=True) + "\n")
+    return history_path
+
+
 def _update_model_card_after_benchmark(models_root: Path, model_id: str, summary_payload: dict[str, object], benchmark_score: float, report_path: Path) -> None:
     model_card_path = models_root / "final" / f"{model_id}.model_card.json"
     if not model_card_path.exists():
@@ -81,6 +171,10 @@ def _update_model_card_after_benchmark(models_root: Path, model_id: str, summary
     payload = json.loads(model_card_path.read_text(encoding="utf-8"))
     payload["benchmark_summary_path"] = str(report_path)
     payload["benchmark_score"] = benchmark_score
+    payload["benchmark_score_weighted"] = float(summary_payload.get("benchmark_score_weighted", benchmark_score))
+    payload["benchmark_elo_estimate"] = summary_payload.get("benchmark_elo_estimate")
+    if summary_payload.get("benchmark_history_path"):
+        payload["benchmark_history_path"] = summary_payload.get("benchmark_history_path")
     payload["benchmark_matchups"] = len(summary_payload.get("matchups", []))
     model_card_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
 
@@ -115,6 +209,9 @@ def run_benchmark_job(job: JobContext) -> dict[str, object]:
     games = int(benchmark_cfg.get("games_per_matchup", 20))
     max_moves = int(benchmark_cfg.get("max_moves", 300))
     matchups = list(benchmark_cfg.get("matchups", []))
+    configured_ratings = benchmark_cfg.get("opponent_ratings", {})
+    if not isinstance(configured_ratings, dict):
+        configured_ratings = {}
 
     target_agent = _build_target_agent(job)
     benchmark_dir = job.job_dir / "benchmark"
@@ -141,6 +238,8 @@ def run_benchmark_job(job: JobContext) -> dict[str, object]:
         wins_b = 0
         draws = 0
         total_moves = 0
+        as_first = {"wins": 0, "losses": 0, "draws": 0}
+        as_second = {"wins": 0, "losses": 0, "draws": 0}
         for game_index in range(games):
             starter = game_index % 2
             game_filename = f"{matchup_key}_game_{game_index + 1:06d}.json"
@@ -182,6 +281,10 @@ def run_benchmark_job(job: JobContext) -> dict[str, object]:
                 wins_b += 1
             else:
                 draws += 1
+            if int(game_payload.get("starter", starter)) == 0:
+                _record_by_role(as_first, winner)
+            else:
+                _record_by_role(as_second, winner)
             total_moves += int(game_payload["moves"])
             winner_label = _winner_label(winner, target_agent.display_name, opponent.display_name)
             job.logger.info(
@@ -213,13 +316,31 @@ def run_benchmark_job(job: JobContext) -> dict[str, object]:
             "wins_b": wins_b,
             "draws": draws,
             "winrate": wins_a / games if games else 0.0,
+            "score_rate": (wins_a + 0.5 * draws) / games if games else 0.0,
             "avg_moves": total_moves / games if games else 0.0,
+            "difficulty_weight": _opponent_weight(str(opponent_spec)),
+            "opponent_rating": _opponent_rating(str(opponent_spec), configured_ratings),
+            "as_first_player": {
+                **as_first,
+                "games": sum(as_first.values()),
+                "winrate": (as_first["wins"] / sum(as_first.values())) if sum(as_first.values()) else 0.0,
+                "score_rate": ((as_first["wins"] + 0.5 * as_first["draws"]) / sum(as_first.values())) if sum(as_first.values()) else 0.0,
+            },
+            "as_second_player": {
+                **as_second,
+                "games": sum(as_second.values()),
+                "winrate": (as_second["wins"] / sum(as_second.values())) if sum(as_second.values()) else 0.0,
+                "score_rate": ((as_second["wins"] + 0.5 * as_second["draws"]) / sum(as_second.values())) if sum(as_second.values()) else 0.0,
+            },
         }
         _write_json(benchmark_dir / f"{matchup_key}_summary.json", payload)
         summaries.append(payload)
         completed_matchups.add(matchup_key)
+        cumulative_winrate = sum(float(item.get("winrate", 0.0)) for item in summaries) / len(summaries)
+        cumulative_weighted = _compute_weighted_benchmark_score(summaries)
+        cumulative_elo = _estimate_benchmark_elo(summaries)
         job.logger.info(
-            "benchmark matchup completed | matchup=%s | target=%s | opponent=%s | wins=%s | losses=%s | draws=%s | winrate=%.4f",
+            "benchmark matchup completed | matchup=%s | target=%s | opponent=%s | wins=%s | losses=%s | draws=%s | winrate=%.4f | score_rate=%.4f | as_first=%.4f | as_second=%.4f | weighted=%.4f | elo_estimate=%.1f",
             matchup_key,
             target_agent.display_name,
             opponent.display_name,
@@ -227,6 +348,19 @@ def run_benchmark_job(job: JobContext) -> dict[str, object]:
             wins_b,
             draws,
             payload["winrate"],
+            payload["score_rate"],
+            float(payload["as_first_player"]["winrate"]),
+            float(payload["as_second_player"]["winrate"]),
+            float(payload["winrate"]) * float(payload["difficulty_weight"]),
+            cumulative_elo if cumulative_elo is not None else -1.0,
+        )
+        job.logger.info(
+            "benchmark cumulative summary | completed_matchups=%s/%s | cumulative_winrate=%.4f | cumulative_weighted_score=%.4f | cumulative_elo_estimate=%.1f",
+            len(summaries),
+            len(matchups),
+            cumulative_winrate,
+            cumulative_weighted,
+            cumulative_elo if cumulative_elo is not None else -1.0,
         )
         job.write_state(
             {
@@ -240,15 +374,49 @@ def run_benchmark_job(job: JobContext) -> dict[str, object]:
         job.write_metric({"metric_type": "benchmark_matchup_completed", "matchup_id": matchup_key, **payload})
         job.write_event("benchmark_matchup_completed", matchup=matchup_key)
 
-    summary_payload = {"job_id": job.job_id, "engine": target_agent.display_name, "matchups": summaries}
-    report_path = benchmark_dir / "benchmark_summary.json"
-    _write_json(report_path, summary_payload)
     benchmark_score = (
         sum(float(item.get("winrate", 0.0)) for item in summaries) / len(summaries)
         if summaries
         else 0.0
     )
+    benchmark_score_weighted = _compute_weighted_benchmark_score(summaries)
+    benchmark_elo_estimate = _estimate_benchmark_elo(summaries)
+    summary_payload = {
+        "job_id": job.job_id,
+        "engine": target_agent.display_name,
+        "matchups": summaries,
+        "benchmark_score": benchmark_score,
+        "benchmark_score_weighted": benchmark_score_weighted,
+        "benchmark_elo_estimate": benchmark_elo_estimate,
+        "opponent_ratings": configured_ratings,
+    }
+    report_path = benchmark_dir / "benchmark_summary.json"
+    _write_json(report_path, summary_payload)
     if target_agent.display_name != "engine_v1":
+        history_path = _append_benchmark_history(
+            job.paths.models_root,
+            target_agent.display_name,
+            {
+                "job_id": job.job_id,
+                "created_at": time.time(),
+                "benchmark_summary_path": str(report_path),
+                "benchmark_score": benchmark_score,
+                "benchmark_score_weighted": benchmark_score_weighted,
+                "benchmark_elo_estimate": benchmark_elo_estimate,
+                "matchups": [
+                    {
+                        "opponent": item.get("opponent"),
+                        "games": item.get("games"),
+                        "winrate": item.get("winrate"),
+                        "score_rate": item.get("score_rate"),
+                        "opponent_rating": item.get("opponent_rating"),
+                    }
+                    for item in summaries
+                ],
+            },
+        )
+        summary_payload["benchmark_history_path"] = str(history_path)
+        _write_json(report_path, summary_payload)
         _update_model_card_after_benchmark(job.paths.models_root, target_agent.display_name, summary_payload, benchmark_score, report_path)
         registry = load_registry(job.paths.models_root)
         existing = next((item for item in registry.get("models", []) if str(item.get("model_id")) == target_agent.display_name), {})
@@ -262,7 +430,9 @@ def run_benchmark_job(job: JobContext) -> dict[str, object]:
                 "checkpoint_path": existing.get("checkpoint_path", ""),
                 "best_validation_metric": existing.get("best_validation_metric", -1.0),
                 "evaluation_top1": float(existing.get("evaluation_top1", -1.0)),
-                "benchmark_score": benchmark_score,
+                "benchmark_score": benchmark_score_weighted,
+                "benchmark_elo_estimate": benchmark_elo_estimate if benchmark_elo_estimate is not None else -1.0,
+                "benchmark_history_path": str(history_path),
                 "benchmark_summary_path": str(report_path),
                 "model_card_path": str(job.paths.models_root / "final" / f"{target_agent.display_name}.model_card.json"),
             },
