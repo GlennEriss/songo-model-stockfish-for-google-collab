@@ -45,6 +45,42 @@ def _resolve_storage_path(base: Path, configured: str | None, fallback: Path) ->
     return base / path
 
 
+def _read_dataset_registry(data_root: Path) -> dict[str, Any]:
+    registry_path = data_root / "dataset_registry.json"
+    if not registry_path.exists():
+        return {"dataset_sources": [], "built_datasets": []}
+    payload = json.loads(registry_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        return {"dataset_sources": [], "built_datasets": []}
+    payload.setdefault("dataset_sources", [])
+    payload.setdefault("built_datasets", [])
+    return payload
+
+
+def _select_largest_built_dataset(data_root: Path) -> dict[str, Any]:
+    registry = _read_dataset_registry(data_root)
+    candidates: list[dict[str, Any]] = []
+    for entry in registry.get("built_datasets", []):
+        output_dir = Path(str(entry.get("output_dir", "")))
+        if not output_dir:
+            continue
+        if not (output_dir / "train.npz").exists():
+            continue
+        if not (output_dir / "validation.npz").exists():
+            continue
+        candidates.append(entry)
+    if not candidates:
+        raise FileNotFoundError("Aucun built dataset complet avec train.npz et validation.npz trouve dans le registre")
+    candidates.sort(
+        key=lambda entry: (
+            int(entry.get("labeled_samples", 0)),
+            str(entry.get("updated_at", "")),
+        ),
+        reverse=True,
+    )
+    return candidates[0]
+
+
 def _masked_policy_logits(policy_logits: torch.Tensor, legal_mask: torch.Tensor) -> torch.Tensor:
     # Mixed precision safe value for fp16/bf16/fp32.
     mask_value = torch.finfo(policy_logits.dtype).min
@@ -166,9 +202,30 @@ def _write_json(path: Path, payload: dict) -> None:
 def run_train(job: JobContext) -> dict[str, object]:
     cfg = job.config.get("train", {})
     runtime_cfg = job.config.get("runtime", {})
-    dataset_id = str(cfg.get("dataset_id", "dataset_v1"))
-    dataset_path = _resolve_storage_path(job.paths.drive_root, cfg.get("dataset_path"), job.job_dir / "train.npz")
-    validation_path = _resolve_storage_path(job.paths.drive_root, cfg.get("validation_path"), job.job_dir / "validation.npz")
+    dataset_selection_mode = str(cfg.get("dataset_selection_mode", "configured")).strip().lower() or "configured"
+    if dataset_selection_mode == "largest_built":
+        selected_dataset = _select_largest_built_dataset(job.paths.data_root)
+        dataset_id = str(selected_dataset.get("dataset_id", "dataset_v1"))
+        selected_output_dir = Path(str(selected_dataset["output_dir"]))
+        dataset_path = selected_output_dir / "train.npz"
+        validation_path = selected_output_dir / "validation.npz"
+        dataset_resolution = {
+            "selection_mode": dataset_selection_mode,
+            "resolved_from_registry": True,
+            "selected_labeled_samples": int(selected_dataset.get("labeled_samples", 0)),
+            "selected_build_mode": str(selected_dataset.get("build_mode", "teacher_label")),
+            "selected_teacher_engine": str(selected_dataset.get("teacher_engine", "")),
+            "selected_teacher_level": str(selected_dataset.get("teacher_level", "")),
+            "selected_output_dir": str(selected_output_dir),
+        }
+    else:
+        dataset_id = str(cfg.get("dataset_id", "dataset_v1"))
+        dataset_path = _resolve_storage_path(job.paths.drive_root, cfg.get("dataset_path"), job.job_dir / "train.npz")
+        validation_path = _resolve_storage_path(job.paths.drive_root, cfg.get("validation_path"), job.job_dir / "validation.npz")
+        dataset_resolution = {
+            "selection_mode": dataset_selection_mode,
+            "resolved_from_registry": False,
+        }
     checkpoint_dir = _resolve_storage_path(job.paths.drive_root, cfg.get("checkpoint_dir"), job.job_dir / "checkpoints")
     final_dir = _resolve_storage_path(job.paths.drive_root, cfg.get("final_dir"), job.job_dir / "final")
     init_checkpoint_path_cfg = cfg.get("init_checkpoint_path")
@@ -330,8 +387,9 @@ def run_train(job: JobContext) -> dict[str, object]:
         )
 
     job.logger.info(
-        "training started | dataset=%s | model=%s | device=%s | mixed_precision=%s | epochs=%s | batch_size=%s | train_examples=%s | validation_examples=%s",
+        "training started | dataset=%s | selection_mode=%s | model=%s | device=%s | mixed_precision=%s | epochs=%s | batch_size=%s | train_examples=%s | validation_examples=%s",
         dataset_id,
+        dataset_selection_mode,
         model_id,
         device,
         amp_enabled,
@@ -344,6 +402,8 @@ def run_train(job: JobContext) -> dict[str, object]:
     job.write_event(
         "train_started",
         dataset_id=dataset_id,
+        dataset_selection_mode=dataset_selection_mode,
+        dataset_resolution=dataset_resolution,
         model_id=model_id,
         init_checkpoint_path=str(init_checkpoint_path) if init_checkpoint_path else "",
         init_from_promoted_best=init_from_promoted_best,
@@ -365,6 +425,7 @@ def run_train(job: JobContext) -> dict[str, object]:
         {
             "metric_type": "train_started",
             "dataset_id": dataset_id,
+            "dataset_selection_mode": dataset_selection_mode,
             "model_id": model_id,
             "train_examples": len(train_loader.dataset),
             "validation_examples": len(validation_loader.dataset),
@@ -700,6 +761,8 @@ def run_train(job: JobContext) -> dict[str, object]:
     training_summary = {
         "job_id": job.job_id,
         "dataset_id": dataset_id,
+        "dataset_selection_mode": dataset_selection_mode,
+        "dataset_resolution": dataset_resolution,
         "model_id": model_id,
         "init_checkpoint_path": str(init_checkpoint_path) if init_checkpoint_path else "",
         "init_from_promoted_best": init_from_promoted_best,
@@ -728,6 +791,8 @@ def run_train(job: JobContext) -> dict[str, object]:
         "created_at": utc_now_iso(),
         "git_commit": job.config.get("project", {}).get("git_commit", "auto"),
         "dataset_id": dataset_id,
+        "dataset_selection_mode": dataset_selection_mode,
+        "dataset_resolution": dataset_resolution,
         "training_job_id": job.job_id,
         "init_checkpoint_path": str(init_checkpoint_path) if init_checkpoint_path else "",
         "init_from_promoted_best": init_from_promoted_best,

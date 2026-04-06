@@ -63,6 +63,7 @@ Le pipeline d'entrainement supporte maintenant:
 - `early_stopping_patience`
 - un scheduler de learning rate de type `cosine`
 - l'export du meilleur checkpoint, pas seulement du dernier etat du modele
+- la selection automatique du plus grand dataset final construit quand `dataset_selection_mode: largest_built`
 
 Effet attendu:
 
@@ -70,6 +71,7 @@ Effet attendu:
 - moins de surentrainement inutile
 - meilleure reutilisation GPU/temps Colab
 - modele final plus coherent avec la meilleure validation observee
+- training stable lance par defaut sur le dataset final le plus grand disponible dans le registre
 
 ### 4.2 Architecture MLP preparée pour la suite
 
@@ -103,6 +105,7 @@ En plus de:
 
 La config de train full matrix active maintenant:
 
+- `dataset_selection_mode: largest_built`
 - `gradient_clip_norm: 1.0`
 - `early_stopping_patience: 6`
 - `scheduler.type: cosine`
@@ -116,6 +119,7 @@ Les options d'architecture sont presentes mais gardees a:
 
 Cela permet de:
 
+- toujours viser automatiquement le plus grand dataset final disponible
 - beneficier tout de suite des ameliorations de training
 - sans casser la compatibilite avec les checkpoints existants
 
@@ -494,6 +498,11 @@ Ce mode `derive_existing` serait ideal pour:
   - ou fusionner directement tous les datasets finaux du registre
   - dedupliquer les `sample_ids` pendant la fusion
   - produire un nouveau dataset final versionne et re-enregistre dans le registre
+  - produire un `source_breakdown` par split et par dataset final source:
+    - `input_samples`
+    - `kept_samples`
+    - `duplicate_samples`
+    - `unique_games`
 
 ### Ameliorations recommandees sur le notebook
 

@@ -500,6 +500,79 @@ def _merge_npz_splits(
     return merged, summary
 
 
+def _merge_npz_splits_with_source_breakdown(
+    split_items: list[tuple[str, Path]],
+    *,
+    dedupe_sample_ids: bool,
+) -> tuple[dict[str, np.ndarray], dict[str, int], dict[str, dict[str, int]]]:
+    merged_chunks: dict[str, list[np.ndarray]] = {
+        "x": [],
+        "legal_mask": [],
+        "policy_index": [],
+        "value_target": [],
+        "sample_ids": [],
+        "game_ids": [],
+    }
+    seen_sample_ids: set[str] = set()
+    source_breakdown: dict[str, dict[str, int]] = {}
+    input_samples = 0
+    kept_samples = 0
+    duplicate_samples = 0
+
+    for source_dataset_id, split_path in split_items:
+        arrays = _load_npz_arrays(split_path)
+        sample_ids = arrays["sample_ids"]
+        keep_indices: list[int] = []
+        stats = {
+            "input_samples": int(len(sample_ids)),
+            "kept_samples": 0,
+            "duplicate_samples": 0,
+            "unique_games": 0,
+        }
+        source_games: set[str] = set()
+        for index, sample_id in enumerate(sample_ids.tolist()):
+            input_samples += 1
+            sample_id_str = str(sample_id)
+            if dedupe_sample_ids and sample_id_str in seen_sample_ids:
+                duplicate_samples += 1
+                stats["duplicate_samples"] += 1
+                continue
+            seen_sample_ids.add(sample_id_str)
+            keep_indices.append(index)
+            source_games.add(str(arrays["game_ids"][index]))
+
+        if keep_indices:
+            keep = np.asarray(keep_indices, dtype=np.int64)
+            for key in merged_chunks:
+                merged_chunks[key].append(arrays[key][keep])
+            kept_samples += len(keep_indices)
+            stats["kept_samples"] = len(keep_indices)
+            stats["unique_games"] = len(source_games)
+        source_breakdown[source_dataset_id] = stats
+
+    if kept_samples == 0:
+        merged = {
+            "x": np.zeros((0, 17), dtype=np.float32),
+            "legal_mask": np.zeros((0, 7), dtype=np.float32),
+            "policy_index": np.zeros((0,), dtype=np.int64),
+            "value_target": np.zeros((0,), dtype=np.float32),
+            "sample_ids": np.asarray([], dtype=object),
+            "game_ids": np.asarray([], dtype=object),
+        }
+    else:
+        merged = {}
+        for key, chunks in merged_chunks.items():
+            merged[key] = np.concatenate(chunks, axis=0)
+
+    summary = {
+        "input_samples": input_samples,
+        "kept_samples": kept_samples,
+        "duplicate_samples": duplicate_samples,
+        "unique_games": len({str(value) for value in merged["game_ids"].tolist()}),
+    }
+    return merged, summary, source_breakdown
+
+
 def _existing_game_numbers(raw_dir: Path, sampled_dir: Path, matchup_id: str) -> set[int]:
     raw_matchup_dir = raw_dir / matchup_id
     sampled_matchup_dir = sampled_dir / matchup_id
@@ -2000,31 +2073,36 @@ def run_dataset_merge_final(job: JobContext) -> dict[str, object]:
 
     split_summary: dict[str, dict[str, int]] = {}
     merge_breakdown: dict[str, dict[str, int]] = {}
+    source_breakdown: dict[str, dict[str, dict[str, int]]] = {}
     total_labeled_samples = 0
     source_sampled_roots = [str(entry.get("sampled_root", "")) for entry in source_entries if str(entry.get("sampled_root", "")).strip()]
     label_cache_dirs = [str(entry.get("label_cache_dir", "")) for entry in source_entries if str(entry.get("label_cache_dir", "")).strip()]
 
     for split_name in ("train", "validation", "test"):
-        split_paths: list[Path] = []
+        split_items: list[tuple[str, Path]] = []
         for entry in source_entries:
             output_dir = Path(str(entry["output_dir"]))
             split_path = output_dir / f"{split_name}.npz"
             if not split_path.exists():
                 raise FileNotFoundError(f"Split introuvable pour {entry['dataset_id']}: {split_path}")
-            split_paths.append(split_path)
+            split_items.append((str(entry["dataset_id"]), split_path))
 
         job.logger.info(
             "dataset final merge split started | split=%s | source_files=%s",
             split_name,
-            len(split_paths),
+            len(split_items),
         )
-        merged_arrays, split_metrics = _merge_npz_splits(split_paths, dedupe_sample_ids=dedupe_sample_ids)
+        merged_arrays, split_metrics, split_source_breakdown = _merge_npz_splits_with_source_breakdown(
+            split_items,
+            dedupe_sample_ids=dedupe_sample_ids,
+        )
         np.savez_compressed(output_root / f"{split_name}.npz", **merged_arrays)
         split_summary[split_name] = {
             "games": int(split_metrics["unique_games"]),
             "samples": int(split_metrics["kept_samples"]),
         }
         merge_breakdown[split_name] = split_metrics
+        source_breakdown[split_name] = split_source_breakdown
         total_labeled_samples += int(split_metrics["kept_samples"])
         job.logger.info(
             "dataset final merge split completed | split=%s | kept_samples=%s | duplicate_samples=%s | unique_games=%s | path=%s",
@@ -2034,6 +2112,16 @@ def run_dataset_merge_final(job: JobContext) -> dict[str, object]:
             split_metrics["unique_games"],
             output_root / f"{split_name}.npz",
         )
+        for source_dataset_id, stats in split_source_breakdown.items():
+            job.logger.info(
+                "dataset final merge source breakdown | split=%s | source_dataset_id=%s | input_samples=%s | kept_samples=%s | duplicate_samples=%s | unique_games=%s",
+                split_name,
+                source_dataset_id,
+                stats["input_samples"],
+                stats["kept_samples"],
+                stats["duplicate_samples"],
+                stats["unique_games"],
+            )
 
     metadata = _register_built_dataset(
         job,
@@ -2052,6 +2140,7 @@ def run_dataset_merge_final(job: JobContext) -> dict[str, object]:
         parent_dataset_ids=source_dataset_ids,
     )
     metadata["merge_breakdown"] = merge_breakdown
+    metadata["source_breakdown"] = source_breakdown
     metadata["dedupe_sample_ids"] = dedupe_sample_ids
     metadata["source_dataset_ids"] = source_dataset_ids
     _write_json(output_root / "dataset_metadata.json", metadata)
@@ -2066,6 +2155,7 @@ def run_dataset_merge_final(job: JobContext) -> dict[str, object]:
         "dedupe_sample_ids": dedupe_sample_ids,
         "splits": split_summary,
         "merge_breakdown": merge_breakdown,
+        "source_breakdown": source_breakdown,
         "output_dir": str(output_root),
         "labeled_samples": total_labeled_samples,
     }
@@ -2084,6 +2174,7 @@ def run_dataset_merge_final(job: JobContext) -> dict[str, object]:
         dataset_id=dataset_id,
         source_dataset_ids=source_dataset_ids,
         labeled_samples=total_labeled_samples,
+        source_breakdown=source_breakdown,
     )
     job.write_metric({"metric_type": "dataset_merge_final_completed", "dataset_id": dataset_id, "labeled_samples": total_labeled_samples})
     return summary
