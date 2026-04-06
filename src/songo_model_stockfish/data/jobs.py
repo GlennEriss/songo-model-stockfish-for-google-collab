@@ -97,7 +97,94 @@ def _resolve_dataset_source(job: JobContext, dataset_source_id: str) -> dict[str
     for entry in registry.get("dataset_sources", []):
         if str(entry.get("dataset_source_id", "")) == dataset_source_id:
             return entry
+    legacy_entry = _discover_legacy_dataset_source(job, dataset_source_id)
+    if legacy_entry is not None:
+        job.logger.info(
+            "dataset source legacy auto-registered | dataset_source_id=%s | sampled_dir=%s | raw_dir=%s",
+            dataset_source_id,
+            legacy_entry["sampled_dir"],
+            legacy_entry["raw_dir"],
+        )
+        job.write_event(
+            "dataset_source_legacy_autoregistered",
+            dataset_source_id=dataset_source_id,
+            sampled_dir=str(legacy_entry["sampled_dir"]),
+            raw_dir=str(legacy_entry["raw_dir"]),
+        )
+        return legacy_entry
     raise FileNotFoundError(f"Dataset source introuvable dans le registre: {dataset_source_id}")
+
+
+def _discover_legacy_dataset_source(job: JobContext, dataset_source_id: str) -> dict[str, Any] | None:
+    candidate_sampled_dirs = [
+        job.paths.data_root / dataset_source_id,
+        job.paths.drive_root / dataset_source_id,
+    ]
+    seen_paths: set[Path] = set()
+
+    for sampled_dir in candidate_sampled_dirs:
+        sampled_dir = sampled_dir.resolve()
+        if sampled_dir in seen_paths:
+            continue
+        seen_paths.add(sampled_dir)
+        if not sampled_dir.exists() or not sampled_dir.is_dir():
+            continue
+        sampled_files = _count_jsonl_files(sampled_dir)
+        if sampled_files <= 0:
+            continue
+
+        metadata_path = sampled_dir / "_dataset_source_metadata.json"
+        if metadata_path.exists():
+            payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+            registry = _read_dataset_registry(job)
+            _upsert_registry_entry(
+                registry["dataset_sources"],
+                key="dataset_source_id",
+                value=str(payload.get("dataset_source_id", dataset_source_id)),
+                payload=payload,
+            )
+            _write_dataset_registry(job, registry)
+            return payload
+
+        raw_dir_name = dataset_source_id
+        if dataset_source_id.startswith("sampled_"):
+            raw_dir_name = "raw_" + dataset_source_id[len("sampled_") :]
+        raw_dir = job.paths.data_root / raw_dir_name
+        if not raw_dir.exists():
+            raw_dir = sampled_dir.parent / raw_dir_name
+
+        payload = {
+            "dataset_source_id": dataset_source_id,
+            "source_mode": "legacy_import",
+            "raw_dir": str(raw_dir),
+            "sampled_dir": str(sampled_dir),
+            "target_samples": _count_total_jsonl_lines(sampled_dir),
+            "games_per_matchup": 0,
+            "sample_every_n_plies": 0,
+            "matchups": [],
+            "raw_files": _count_json_files(raw_dir),
+            "sampled_files": sampled_files,
+            "sampled_positions": _count_total_jsonl_lines(sampled_dir),
+            "source_dataset_id": "",
+            "source_dataset_ids": [],
+            "derivation_strategy": "",
+            "derivation_params": {},
+            "dataset_version": utc_now_iso(),
+            "updated_at": utc_now_iso(),
+        }
+        registry = _read_dataset_registry(job)
+        _upsert_registry_entry(
+            registry["dataset_sources"],
+            key="dataset_source_id",
+            value=dataset_source_id,
+            payload=payload,
+        )
+        _write_dataset_registry(job, registry)
+        _write_json(sampled_dir / "_dataset_source_metadata.json", payload)
+        if raw_dir.exists():
+            _write_json(raw_dir / "_dataset_source_metadata.json", payload)
+        return payload
+    return None
 
 
 def _resolve_built_dataset(job: JobContext, dataset_id: str) -> dict[str, Any]:
