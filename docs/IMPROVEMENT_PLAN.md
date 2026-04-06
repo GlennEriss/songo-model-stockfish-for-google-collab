@@ -110,6 +110,25 @@ Effet attendu:
 - evaluation automatique sur le plus grand dataset final disponible
 - moins de risque d'evaluer un dataset obsolete par erreur
 - logs plus clairs sur le checkpoint et le dataset reellement resolus
+- notebook avec previsualisation explicite du dataset et du modele resolus avant `evaluation`
+
+### 4.4 Benchmark plus lisible dans le notebook
+
+Le notebook affiche maintenant aussi, juste avant `benchmark`:
+
+- la cible benchmark resolue selon la config (`auto_latest`, `auto_best`, `engine_v1` ou checkpoint explicite)
+- le dernier modele disponible dans `model_registry.json` quand le mode est `auto_latest`
+- le modele promu courant pour comparaison rapide
+- les adversaires benchmark (`matchups`)
+- `games_per_matchup`
+- `alternate_first_player`
+- `max_moves`
+
+Effet attendu:
+
+- moins d'erreurs de lancement benchmark sur un mauvais checkpoint
+- verification visuelle immediate du modele oppose aux adversaires de reference
+- meilleure coherence entre notebook, config et execution reelle
 
 ## 5. Config Full Matrix Recommandee Actuelle
 
