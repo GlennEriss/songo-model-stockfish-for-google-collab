@@ -97,6 +97,10 @@ def _resolve_dataset_source(job: JobContext, dataset_source_id: str) -> dict[str
     for entry in registry.get("dataset_sources", []):
         if str(entry.get("dataset_source_id", "")) == dataset_source_id:
             return entry
+    job.logger.info(
+        "dataset source missing from registry, probing legacy paths | dataset_source_id=%s",
+        dataset_source_id,
+    )
     legacy_entry = _discover_legacy_dataset_source(job, dataset_source_id)
     if legacy_entry is not None:
         job.logger.info(
@@ -153,18 +157,20 @@ def _discover_legacy_dataset_source(job: JobContext, dataset_source_id: str) -> 
         if not raw_dir.exists():
             raw_dir = sampled_dir.parent / raw_dir_name
 
+        # Legacy sources may be large; avoid an expensive full line count during
+        # auto-registration and let dataset-build scan the files directly.
         payload = {
             "dataset_source_id": dataset_source_id,
             "source_mode": "legacy_import",
             "raw_dir": str(raw_dir),
             "sampled_dir": str(sampled_dir),
-            "target_samples": _count_total_jsonl_lines(sampled_dir),
+            "target_samples": 0,
             "games_per_matchup": 0,
             "sample_every_n_plies": 0,
             "matchups": [],
             "raw_files": _count_json_files(raw_dir),
             "sampled_files": sampled_files,
-            "sampled_positions": _count_total_jsonl_lines(sampled_dir),
+            "sampled_positions": 0,
             "source_dataset_id": "",
             "source_dataset_ids": [],
             "derivation_strategy": "",
@@ -1674,6 +1680,15 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
     max_pending_futures = max(1, int(cfg.get("max_pending_futures", num_workers * 2)))
     multiprocessing_start_method = str(runtime_cfg.get("multiprocessing_start_method", "spawn")).strip().lower() or "spawn"
     max_tasks_per_child = int(runtime_cfg.get("max_tasks_per_child", 25))
+
+    job.logger.info(
+        "dataset build startup | dataset=%s | source_dataset_id=%s | configured_input_sampled_dir=%s | workers=%s | max_pending_futures=%s",
+        dataset_id,
+        source_dataset_id or "<auto>",
+        str(cfg.get("input_sampled_dir", "")),
+        num_workers,
+        max_pending_futures,
+    )
 
     dataset_dir = job.job_dir / "dataset_build"
     if source_dataset_id:
