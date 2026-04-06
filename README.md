@@ -193,6 +193,7 @@ Donc:
 - on conserve les positions deja generees
 - on ne repart pas de zero sur le corpus brut
 - on peut maintenant composer une grande source a partir de plusieurs sources deja versionnees
+- la fusion de sources fournit aussi un detail par source sur la contribution reelle et les doublons retires
 - mais on reconstruit les labels finaux avec un teacher plus fort et un objectif de plus grande echelle
 
 ## Workflow Colab

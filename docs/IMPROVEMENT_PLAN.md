@@ -368,6 +368,13 @@ Important:
 - pour viser un dataset final `2M`, il est en pratique recommande d'aligner les deux cibles a `2_000_000`
 - `merge_existing` deduplique par `sample_id` par defaut
 - `merge_existing` range les fichiers fusionnes par sous-dossier `dataset_source_id` pour eviter les collisions de chemins entre sources
+- `merge_existing` produit maintenant aussi un `source_breakdown` par source:
+  - fichiers scannes
+  - positions scannees
+  - fichiers retenus
+  - positions retenues
+  - doublons retires
+  - fichiers raw recopies
 
 ### Ameliorations recommandees sur la gestion dataset
 

@@ -321,16 +321,26 @@ def _merge_existing_dataset_sources(
     selected_samples = 0
     duplicate_samples = 0
     copied_raw_files = 0
+    source_breakdown: dict[str, dict[str, int]] = {}
 
     for source_entry in source_entries:
         source_dataset_id = str(source_entry["dataset_source_id"])
         source_raw_dir = Path(str(source_entry["raw_dir"]))
         source_sampled_dir = Path(str(source_entry["sampled_dir"]))
+        source_stats = {
+            "scanned_files": 0,
+            "scanned_samples": 0,
+            "selected_files": 0,
+            "selected_samples": 0,
+            "duplicate_samples": 0,
+            "copied_raw_files": 0,
+        }
 
         for source_sampled_file in sorted(source_sampled_dir.rglob("*.jsonl")):
             if target_samples > 0 and selected_samples >= target_samples:
                 break
             scanned_files += 1
+            source_stats["scanned_files"] += 1
             relative_path = source_sampled_file.relative_to(source_sampled_dir)
             target_sampled_file = target_sampled_dir / source_dataset_id / relative_path
             target_sampled_file.parent.mkdir(parents=True, exist_ok=True)
@@ -338,22 +348,26 @@ def _merge_existing_dataset_sources(
             kept_samples: list[dict[str, Any]] = []
             for sample in _iter_jsonl(source_sampled_file):
                 scanned_samples += 1
+                source_stats["scanned_samples"] += 1
                 if target_samples > 0 and selected_samples >= target_samples:
                     break
                 sample_id = str(sample.get("sample_id", ""))
                 if dedupe_sample_ids and sample_id:
                     if sample_id in seen_sample_ids:
                         duplicate_samples += 1
+                        source_stats["duplicate_samples"] += 1
                         continue
                     seen_sample_ids.add(sample_id)
                 kept_samples.append(sample)
                 selected_samples += 1
+                source_stats["selected_samples"] += 1
 
             if kept_samples:
                 with target_sampled_file.open("w", encoding="utf-8") as handle:
                     for sample in kept_samples:
                         handle.write(json.dumps(sample, ensure_ascii=True) + "\n")
                 selected_files += 1
+                source_stats["selected_files"] += 1
 
                 source_raw_file = source_raw_dir / relative_path.with_suffix(".json")
                 target_raw_file = target_raw_dir / source_dataset_id / relative_path.with_suffix(".json")
@@ -361,9 +375,12 @@ def _merge_existing_dataset_sources(
                     target_raw_file.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(source_raw_file, target_raw_file)
                     copied_raw_files += 1
+                    source_stats["copied_raw_files"] += 1
 
         if target_samples > 0 and selected_samples >= target_samples:
+            source_breakdown[source_dataset_id] = source_stats
             break
+        source_breakdown[source_dataset_id] = source_stats
 
     return {
         "scanned_files": scanned_files,
@@ -372,6 +389,7 @@ def _merge_existing_dataset_sources(
         "selected_samples": selected_samples,
         "duplicate_samples": duplicate_samples,
         "copied_raw_files": copied_raw_files,
+        "source_breakdown": source_breakdown,
     }
 
 
@@ -1103,6 +1121,18 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
             merged_summary["selected_samples"],
             merged_summary["duplicate_samples"],
         )
+        for merged_source_id, merged_stats in merged_summary["source_breakdown"].items():
+            job.logger.info(
+                "dataset generation merged source breakdown | dataset_source_id=%s | source_dataset_id=%s | scanned_files=%s | scanned_samples=%s | selected_files=%s | selected_samples=%s | duplicate_samples=%s | copied_raw_files=%s",
+                dataset_source_id,
+                merged_source_id,
+                merged_stats["scanned_files"],
+                merged_stats["scanned_samples"],
+                merged_stats["selected_files"],
+                merged_stats["selected_samples"],
+                merged_stats["duplicate_samples"],
+                merged_stats["copied_raw_files"],
+            )
         job.write_event(
             "dataset_generation_merged_existing",
             dataset_source_id=dataset_source_id,
@@ -1110,6 +1140,7 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
             selected_files=merged_summary["selected_files"],
             selected_samples=merged_summary["selected_samples"],
             duplicate_samples=merged_summary["duplicate_samples"],
+            source_breakdown=merged_summary["source_breakdown"],
         )
         job.write_metric(
             {
