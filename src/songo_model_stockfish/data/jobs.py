@@ -69,6 +69,14 @@ def _count_jsonl_files(root: Path) -> int:
     return sum(1 for _ in root.rglob("*.jsonl")) if root.exists() else 0
 
 
+def _count_jsonl_lines(path: Path) -> int:
+    count = 0
+    with path.open("r", encoding="utf-8") as handle:
+        for count, _line in enumerate(handle, start=1):
+            pass
+    return count
+
+
 def _count_json_files(root: Path) -> int:
     if not root.exists():
         return 0
@@ -1726,7 +1734,17 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
     state = job.read_state()
     completed_files = set(state.get("completed_files", []))
     file_sample_counts: dict[str, int] = {}
-    processed_count = 0
+    sampled_relative_names = [str(path.relative_to(sampled_root)) for path in sampled_files]
+    contiguous_completed_prefix = 0
+    for relative_name in sampled_relative_names:
+        if relative_name not in completed_files:
+            break
+        if not (labeled_root / relative_name).exists():
+            break
+        contiguous_completed_prefix += 1
+
+    processed_count = contiguous_completed_prefix
+    labeled_samples_total = int(state.get("labeled_samples", 0)) if contiguous_completed_prefix > 0 else 0
     skipped_terminal_samples = 0
     skipped_no_legal_samples = 0
     log_every_n_files = max(1, int(cfg.get("log_every_n_files", 1)))
@@ -1748,7 +1766,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
             return None, None
         elapsed = max(0.001, time.monotonic() - build_started_monotonic)
         files_per_second = processed_count / elapsed
-        samples_per_second = sum(file_sample_counts.values()) / elapsed
+        samples_per_second = labeled_samples_total / elapsed
         return files_per_second, samples_per_second
 
     def _write_build_state() -> None:
@@ -1757,10 +1775,12 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
                 "completed_files": sorted(completed_files),
                 "processed_files": processed_count,
                 "remaining_files": len(sampled_files) - processed_count,
-                "labeled_samples": sum(file_sample_counts.values()),
+                "labeled_samples": labeled_samples_total,
                 "skipped_terminal_samples": skipped_terminal_samples,
                 "skipped_no_legal_samples": skipped_no_legal_samples,
                 "target_labeled_samples": target_labeled_samples,
+                "contiguous_completed_prefix": contiguous_completed_prefix,
+                "last_completed_file": sampled_relative_names[processed_count - 1] if processed_count > 0 else "",
             }
         )
 
@@ -1775,7 +1795,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
             "dataset build progress | files=%s/%s | labeled_samples=%s | skipped_terminal=%s | skipped_no_legal=%s | files_per_sec=%.2f | samples_per_sec=%.2f | eta=%s",
             processed_count,
             len(sampled_files),
-            sum(file_sample_counts.values()),
+            labeled_samples_total,
             skipped_terminal_samples,
             skipped_no_legal_samples,
             files_per_second or 0.0,
@@ -1812,25 +1832,39 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
     )
     job.write_metric({"metric_type": "dataset_build_started"})
 
+    if contiguous_completed_prefix > 0:
+        job.logger.info(
+            "dataset build resume shortcut | contiguous_completed_prefix=%s | skipped_rescan_files=%s | labeled_samples=%s",
+            contiguous_completed_prefix,
+            contiguous_completed_prefix,
+            labeled_samples_total,
+        )
+        job.write_event(
+            "dataset_build_resume_shortcut",
+            contiguous_completed_prefix=contiguous_completed_prefix,
+            skipped_rescan_files=contiguous_completed_prefix,
+            labeled_samples=labeled_samples_total,
+        )
+
     pending_files: list[dict[str, Any]] = []
-    for file_index, sampled_file in enumerate(sampled_files, start=1):
+    for file_index, sampled_file in enumerate(sampled_files[contiguous_completed_prefix:], start=contiguous_completed_prefix + 1):
         relative_name = str(sampled_file.relative_to(sampled_root))
         output_labeled = labeled_root / relative_name
         output_labeled.parent.mkdir(parents=True, exist_ok=True)
 
         if output_labeled.exists():
-            file_samples = list(_iter_jsonl(output_labeled))
-            source_count = len(file_samples)
+            source_count = _count_jsonl_lines(output_labeled)
             job.logger.info(
                 "dataset build file reused | %s/%s | file=%s | labeled_samples=%s",
                 file_index,
                 len(sampled_files),
                 relative_name,
-                len(file_samples),
+                source_count,
             )
             completed_files.add(relative_name)
-            file_sample_counts[relative_name] = len(file_samples)
+            file_sample_counts[relative_name] = source_count
             processed_count += 1
+            labeled_samples_total += source_count
         else:
             pending_files.append(
                 {
@@ -1852,7 +1886,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         reused_count,
         pending_count,
         len(sampled_files),
-        sum(file_sample_counts.values()),
+        labeled_samples_total,
         files_per_second or 0.0,
         samples_per_second or 0.0,
         _format_eta_seconds(_estimate_remaining_seconds()),
@@ -1862,7 +1896,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         reused_files=reused_count,
         pending_files=pending_count,
         total_files=len(sampled_files),
-        labeled_samples=sum(file_sample_counts.values()),
+        labeled_samples=labeled_samples_total,
     )
 
     def _materialize_labeled_file(
@@ -1874,7 +1908,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         *,
         mode: str,
     ) -> None:
-        nonlocal processed_count, skipped_terminal_samples, skipped_no_legal_samples
+        nonlocal processed_count, skipped_terminal_samples, skipped_no_legal_samples, labeled_samples_total
         output_labeled = Path(file_item["output_labeled"])
         output_labeled.parent.mkdir(parents=True, exist_ok=True)
         with output_labeled.open("w", encoding="utf-8") as handle:
@@ -1886,6 +1920,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         completed_files.add(str(file_item["relative_name"]))
         file_sample_counts[str(file_item["relative_name"])] = len(file_samples)
         processed_count += 1
+        labeled_samples_total += len(file_samples)
         job.logger.info(
             "dataset build file completed | %s/%s | file=%s | mode=%s | source_samples=%s | labeled_samples=%s | skipped_terminal=%s | skipped_no_legal=%s",
             file_item["file_index"],
@@ -2028,7 +2063,14 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
 
     split_summary: dict[str, dict[str, int]] = {}
     for split_name, selected_files in split_files.items():
-        selected_sample_count = sum(file_sample_counts.get(relative_name, 0) for relative_name in selected_files)
+        selected_sample_count = 0
+        for relative_name in selected_files:
+            sample_count = file_sample_counts.get(relative_name)
+            if sample_count is None:
+                labeled_path = labeled_root / relative_name
+                sample_count = _count_jsonl_lines(labeled_path) if labeled_path.exists() else 0
+                file_sample_counts[relative_name] = sample_count
+            selected_sample_count += sample_count
         job.logger.info(
             "dataset build split export started | split=%s | games=%s | samples=%s",
             split_name,
@@ -2084,7 +2126,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         "label_cache_dir": str(label_cache_dir),
         "splits": split_summary,
         "output_dir": str(output_root),
-        "labeled_samples": sum(file_sample_counts.values()),
+        "labeled_samples": labeled_samples_total,
         "target_labeled_samples": target_labeled_samples,
         "skipped_terminal_samples": skipped_terminal_samples,
         "skipped_no_legal_samples": skipped_no_legal_samples,
@@ -2100,7 +2142,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         teacher_engine=teacher_engine,
         teacher_level=teacher_level,
         split_summary=split_summary,
-        labeled_samples=sum(file_sample_counts.values()),
+        labeled_samples=labeled_samples_total,
         target_labeled_samples=target_labeled_samples,
         build_mode="teacher_label",
         parent_dataset_ids=[],
