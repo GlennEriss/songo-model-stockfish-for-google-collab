@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import json
 import multiprocessing
+import shutil
 import time
 from pathlib import Path
 from typing import Any
@@ -31,6 +33,252 @@ def _resolve_storage_path(base: Path, configured: str | None, fallback: Path) ->
     if path.is_absolute():
         return path
     return base / path
+
+
+def _dataset_registry_path(job: JobContext) -> Path:
+    return job.paths.data_root / "dataset_registry.json"
+
+
+def _read_dataset_registry(job: JobContext) -> dict[str, Any]:
+    path = _dataset_registry_path(job)
+    if not path.exists():
+        return {"dataset_sources": [], "built_datasets": []}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        return {"dataset_sources": [], "built_datasets": []}
+    payload.setdefault("dataset_sources", [])
+    payload.setdefault("built_datasets", [])
+    return payload
+
+
+def _write_dataset_registry(job: JobContext, payload: dict[str, Any]) -> None:
+    path = _dataset_registry_path(job)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+
+
+def _upsert_registry_entry(entries: list[dict[str, Any]], *, key: str, value: str, payload: dict[str, Any]) -> None:
+    for index, entry in enumerate(entries):
+        if str(entry.get(key, "")) == value:
+            entries[index] = payload
+            return
+    entries.append(payload)
+
+
+def _count_jsonl_files(root: Path) -> int:
+    return sum(1 for _ in root.rglob("*.jsonl")) if root.exists() else 0
+
+
+def _count_json_files(root: Path) -> int:
+    if not root.exists():
+        return 0
+    return sum(1 for path in root.rglob("*.json") if not path.name.startswith("_"))
+
+
+def _copy_tree_incremental(source_root: Path, target_root: Path, *, pattern: str) -> int:
+    copied = 0
+    if not source_root.exists():
+        return copied
+    for source_path in sorted(source_root.rglob(pattern)):
+        if source_path.name.startswith("_"):
+            continue
+        relative_path = source_path.relative_to(source_root)
+        target_path = target_root / relative_path
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        if target_path.exists():
+            continue
+        shutil.copy2(source_path, target_path)
+        copied += 1
+    return copied
+
+
+def _resolve_dataset_source(job: JobContext, dataset_source_id: str) -> dict[str, Any]:
+    registry = _read_dataset_registry(job)
+    for entry in registry.get("dataset_sources", []):
+        if str(entry.get("dataset_source_id", "")) == dataset_source_id:
+            return entry
+    raise FileNotFoundError(f"Dataset source introuvable dans le registre: {dataset_source_id}")
+
+
+def _register_dataset_source(
+    job: JobContext,
+    *,
+    dataset_source_id: str,
+    source_mode: str,
+    raw_dir: Path,
+    sampled_dir: Path,
+    target_samples: int,
+    games_per_matchup: int,
+    sample_every_n_plies: int,
+    matchups: list[str],
+    source_dataset_id: str = "",
+    derivation_strategy: str = "",
+    derivation_params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = {
+        "dataset_source_id": dataset_source_id,
+        "source_mode": source_mode,
+        "raw_dir": str(raw_dir),
+        "sampled_dir": str(sampled_dir),
+        "target_samples": target_samples,
+        "games_per_matchup": games_per_matchup,
+        "sample_every_n_plies": sample_every_n_plies,
+        "matchups": matchups,
+        "raw_files": _count_json_files(raw_dir),
+        "sampled_files": _count_jsonl_files(sampled_dir),
+        "sampled_positions": _count_total_jsonl_lines(sampled_dir) if sampled_dir.exists() else 0,
+        "source_dataset_id": source_dataset_id,
+        "derivation_strategy": derivation_strategy,
+        "derivation_params": derivation_params or {},
+        "updated_at": utc_now_iso(),
+    }
+    registry = _read_dataset_registry(job)
+    _upsert_registry_entry(
+        registry["dataset_sources"],
+        key="dataset_source_id",
+        value=dataset_source_id,
+        payload=payload,
+    )
+    _write_dataset_registry(job, registry)
+    _write_json(sampled_dir / "_dataset_source_metadata.json", payload)
+    _write_json(raw_dir / "_dataset_source_metadata.json", payload)
+    return payload
+
+
+def _register_built_dataset(
+    job: JobContext,
+    *,
+    dataset_id: str,
+    source_dataset_id: str,
+    sampled_root: Path,
+    output_root: Path,
+    label_cache_dir: Path,
+    teacher_engine: str,
+    teacher_level: str,
+    split_summary: dict[str, dict[str, int]],
+    labeled_samples: int,
+    target_labeled_samples: int,
+) -> dict[str, Any]:
+    payload = {
+        "dataset_id": dataset_id,
+        "source_dataset_id": source_dataset_id,
+        "sampled_root": str(sampled_root),
+        "output_dir": str(output_root),
+        "label_cache_dir": str(label_cache_dir),
+        "teacher_engine": teacher_engine,
+        "teacher_level": teacher_level,
+        "splits": split_summary,
+        "labeled_samples": labeled_samples,
+        "target_labeled_samples": target_labeled_samples,
+        "updated_at": utc_now_iso(),
+    }
+    registry = _read_dataset_registry(job)
+    _upsert_registry_entry(
+        registry["built_datasets"],
+        key="dataset_id",
+        value=dataset_id,
+        payload=payload,
+    )
+    _write_dataset_registry(job, registry)
+    _write_json(output_root / "dataset_metadata.json", payload)
+    return payload
+
+
+def _sample_position_signature(sample: dict[str, Any]) -> str:
+    state = sample["state"]
+    scores = state["scores"]
+    signature_payload = {
+        "board": list(state["board"]),
+        "south": int(scores["south"]),
+        "north": int(scores["north"]),
+        "player_to_move": str(state["player_to_move"]),
+    }
+    encoded = json.dumps(signature_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha1(encoded.encode("utf-8")).hexdigest()
+
+
+def _derive_existing_dataset_source(
+    *,
+    source_entry: dict[str, Any],
+    target_raw_dir: Path,
+    target_sampled_dir: Path,
+    target_samples: int,
+    derivation_strategy: str,
+    derivation_params: dict[str, Any],
+) -> dict[str, Any]:
+    source_raw_dir = Path(str(source_entry["raw_dir"]))
+    source_sampled_dir = Path(str(source_entry["sampled_dir"]))
+    target_raw_dir.mkdir(parents=True, exist_ok=True)
+    target_sampled_dir.mkdir(parents=True, exist_ok=True)
+
+    if derivation_strategy not in {"unique_positions", "endgame_focus", "high_branching"}:
+        raise ValueError(f"Unsupported derivation_strategy: {derivation_strategy}")
+
+    seen_signatures: set[str] = set()
+    selected_files = 0
+    selected_samples = 0
+    scanned_files = 0
+    scanned_samples = 0
+    copied_raw_files = 0
+
+    endgame_max_board_seeds = int(derivation_params.get("endgame_max_board_seeds", 24))
+    high_branching_min_legal_moves = int(derivation_params.get("high_branching_min_legal_moves", 4))
+
+    def _keep_sample(sample: dict[str, Any]) -> bool:
+        nonlocal selected_samples
+        if target_samples > 0 and selected_samples >= target_samples:
+            return False
+        if derivation_strategy == "unique_positions":
+            signature = _sample_position_signature(sample)
+            if signature in seen_signatures:
+                return False
+            seen_signatures.add(signature)
+            return True
+        if derivation_strategy == "endgame_focus":
+            board_seeds = int(sum(int(value) for value in sample["state"]["board"]))
+            return board_seeds <= endgame_max_board_seeds
+        if derivation_strategy == "high_branching":
+            return len(sample.get("legal_moves", [])) >= high_branching_min_legal_moves
+        return False
+
+    for source_sampled_file in sorted(source_sampled_dir.rglob("*.jsonl")):
+        scanned_files += 1
+        relative_path = source_sampled_file.relative_to(source_sampled_dir)
+        kept_samples: list[dict[str, Any]] = []
+        for sample in _iter_jsonl(source_sampled_file):
+            scanned_samples += 1
+            if _keep_sample(sample):
+                kept_samples.append(sample)
+                selected_samples += 1
+                if target_samples > 0 and selected_samples >= target_samples:
+                    break
+
+        if kept_samples:
+            target_sampled_file = target_sampled_dir / relative_path
+            target_sampled_file.parent.mkdir(parents=True, exist_ok=True)
+            with target_sampled_file.open("w", encoding="utf-8") as handle:
+                for sample in kept_samples:
+                    handle.write(json.dumps(sample, ensure_ascii=True) + "\n")
+            selected_files += 1
+
+            if source_raw_dir.exists():
+                source_raw_file = source_raw_dir / relative_path.with_suffix(".json")
+                target_raw_file = target_raw_dir / relative_path.with_suffix(".json")
+                if source_raw_file.exists() and not target_raw_file.exists():
+                    target_raw_file.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source_raw_file, target_raw_file)
+                    copied_raw_files += 1
+
+        if target_samples > 0 and selected_samples >= target_samples:
+            break
+
+    return {
+        "scanned_files": scanned_files,
+        "scanned_samples": scanned_samples,
+        "selected_files": selected_files,
+        "selected_samples": selected_samples,
+        "copied_raw_files": copied_raw_files,
+    }
 
 
 def _append_jsonl(path: Path, payloads: list[dict[str, Any]]) -> None:
@@ -496,6 +744,11 @@ def _run_pending_games_sequential(
 def run_dataset_generation(job: JobContext) -> dict[str, object]:
     cfg = job.config.get("dataset_generation", {})
     runtime_cfg = job.config.get("runtime", {})
+    source_mode = str(cfg.get("source_mode", "benchmatch")).strip().lower() or "benchmatch"
+    dataset_source_id = str(cfg.get("dataset_source_id", "")).strip() or Path(str(cfg.get("output_sampled_dir", "sampled_positions"))).name
+    source_dataset_id = str(cfg.get("source_dataset_id", "")).strip()
+    derivation_strategy = str(cfg.get("derivation_strategy", "unique_positions")).strip().lower() or "unique_positions"
+    derivation_params = dict(cfg.get("derivation_params", {}))
     games = int(cfg.get("games", 20))
     matchups = list(cfg.get("matchups", []))
     sample_every_n_plies = int(cfg.get("sample_every_n_plies", 2))
@@ -514,6 +767,134 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
     sampled_dir = _resolve_storage_path(job.paths.drive_root, cfg.get("output_sampled_dir"), dataset_dir / "sampled_positions")
     raw_dir.mkdir(parents=True, exist_ok=True)
     sampled_dir.mkdir(parents=True, exist_ok=True)
+
+    if source_mode not in {"benchmatch", "clone_existing", "derive_existing"}:
+        raise ValueError(f"Unsupported dataset generation source_mode: {source_mode}")
+
+    if source_mode == "clone_existing":
+        if not source_dataset_id:
+            raise ValueError("`source_dataset_id` est requis quand `source_mode=clone_existing`")
+        source_entry = _resolve_dataset_source(job, source_dataset_id)
+        source_raw_dir = Path(str(source_entry["raw_dir"]))
+        source_sampled_dir = Path(str(source_entry["sampled_dir"]))
+        copied_raw_files = _copy_tree_incremental(source_raw_dir, raw_dir, pattern="*.json")
+        copied_sampled_files = _copy_tree_incremental(source_sampled_dir, sampled_dir, pattern="*.jsonl")
+        metadata = _register_dataset_source(
+            job,
+            dataset_source_id=dataset_source_id,
+            source_mode=source_mode,
+            raw_dir=raw_dir,
+            sampled_dir=sampled_dir,
+            target_samples=target_samples,
+            games_per_matchup=games,
+            sample_every_n_plies=sample_every_n_plies,
+            matchups=[str(matchup) for matchup in matchups],
+            source_dataset_id=source_dataset_id,
+        )
+        summary = {
+            "job_id": job.job_id,
+            "dataset_source_id": dataset_source_id,
+            "source_mode": source_mode,
+            "source_dataset_id": source_dataset_id,
+            "copied_raw_files": copied_raw_files,
+            "copied_sampled_files": copied_sampled_files,
+            "raw_dir": str(raw_dir),
+            "sampled_dir": str(sampled_dir),
+            "total_samples": int(metadata["sampled_positions"]),
+        }
+        _write_json(dataset_dir / "dataset_generation_summary.json", summary)
+        job.logger.info(
+            "dataset generation cloned existing source | source_dataset_id=%s | dataset_source_id=%s | copied_raw_files=%s | copied_sampled_files=%s | total_samples=%s",
+            source_dataset_id,
+            dataset_source_id,
+            copied_raw_files,
+            copied_sampled_files,
+            metadata["sampled_positions"],
+        )
+        job.write_event(
+            "dataset_generation_cloned_existing",
+            source_dataset_id=source_dataset_id,
+            dataset_source_id=dataset_source_id,
+            copied_raw_files=copied_raw_files,
+            copied_sampled_files=copied_sampled_files,
+        )
+        job.write_metric(
+            {
+                "metric_type": "dataset_generation_cloned_existing",
+                "source_dataset_id": source_dataset_id,
+                "dataset_source_id": dataset_source_id,
+                "copied_raw_files": copied_raw_files,
+                "copied_sampled_files": copied_sampled_files,
+            }
+        )
+        return summary
+
+    if source_mode == "derive_existing":
+        if not source_dataset_id:
+            raise ValueError("`source_dataset_id` est requis quand `source_mode=derive_existing`")
+        source_entry = _resolve_dataset_source(job, source_dataset_id)
+        derived_summary = _derive_existing_dataset_source(
+            source_entry=source_entry,
+            target_raw_dir=raw_dir,
+            target_sampled_dir=sampled_dir,
+            target_samples=target_samples,
+            derivation_strategy=derivation_strategy,
+            derivation_params=derivation_params,
+        )
+        metadata = _register_dataset_source(
+            job,
+            dataset_source_id=dataset_source_id,
+            source_mode=source_mode,
+            raw_dir=raw_dir,
+            sampled_dir=sampled_dir,
+            target_samples=target_samples,
+            games_per_matchup=games,
+            sample_every_n_plies=sample_every_n_plies,
+            matchups=[str(matchup) for matchup in matchups],
+            source_dataset_id=source_dataset_id,
+            derivation_strategy=derivation_strategy,
+            derivation_params=derivation_params,
+        )
+        summary = {
+            "job_id": job.job_id,
+            "dataset_source_id": dataset_source_id,
+            "source_mode": source_mode,
+            "source_dataset_id": source_dataset_id,
+            "derivation_strategy": derivation_strategy,
+            "derivation_params": derivation_params,
+            **derived_summary,
+            "raw_dir": str(raw_dir),
+            "sampled_dir": str(sampled_dir),
+            "total_samples": int(metadata["sampled_positions"]),
+        }
+        _write_json(dataset_dir / "dataset_generation_summary.json", summary)
+        job.logger.info(
+            "dataset generation derived existing source | source_dataset_id=%s | dataset_source_id=%s | strategy=%s | selected_files=%s | selected_samples=%s",
+            source_dataset_id,
+            dataset_source_id,
+            derivation_strategy,
+            derived_summary["selected_files"],
+            derived_summary["selected_samples"],
+        )
+        job.write_event(
+            "dataset_generation_derived_existing",
+            source_dataset_id=source_dataset_id,
+            dataset_source_id=dataset_source_id,
+            derivation_strategy=derivation_strategy,
+            selected_files=derived_summary["selected_files"],
+            selected_samples=derived_summary["selected_samples"],
+        )
+        job.write_metric(
+            {
+                "metric_type": "dataset_generation_derived_existing",
+                "source_dataset_id": source_dataset_id,
+                "dataset_source_id": dataset_source_id,
+                "derivation_strategy": derivation_strategy,
+                "selected_files": derived_summary["selected_files"],
+                "selected_samples": derived_summary["selected_samples"],
+            }
+        )
+        return summary
 
     state = job.read_state()
     summaries: list[dict[str, Any]] = []
@@ -536,8 +917,24 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
     )
 
     if target_samples > 0 and initial_total_samples >= target_samples:
+        _register_dataset_source(
+            job,
+            dataset_source_id=dataset_source_id,
+            source_mode=source_mode,
+            raw_dir=raw_dir,
+            sampled_dir=sampled_dir,
+            target_samples=target_samples,
+            games_per_matchup=games,
+            sample_every_n_plies=sample_every_n_plies,
+            matchups=[str(matchup) for matchup in matchups],
+            source_dataset_id=source_dataset_id,
+            derivation_strategy=derivation_strategy,
+            derivation_params=derivation_params,
+        )
         summary = {
             "job_id": job.job_id,
+            "dataset_source_id": dataset_source_id,
+            "source_mode": source_mode,
             "matchups": [],
             "existing_samples": initial_total_samples,
             "added_samples": 0,
@@ -799,6 +1196,8 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
     added_samples = sum(int(item["samples_added"]) for item in summaries)
     summary = {
         "job_id": job.job_id,
+        "dataset_source_id": dataset_source_id,
+        "source_mode": source_mode,
         "matchups": summaries,
         "existing_samples": initial_total_samples,
         "added_games": added_games,
@@ -806,6 +1205,20 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
         "total_samples": initial_total_samples + added_samples,
         "target_samples": target_samples,
     }
+    _register_dataset_source(
+        job,
+        dataset_source_id=dataset_source_id,
+        source_mode=source_mode,
+        raw_dir=raw_dir,
+        sampled_dir=sampled_dir,
+        target_samples=target_samples,
+        games_per_matchup=games,
+        sample_every_n_plies=sample_every_n_plies,
+        matchups=[str(matchup) for matchup in matchups],
+        source_dataset_id=source_dataset_id,
+        derivation_strategy=derivation_strategy,
+        derivation_params=derivation_params,
+    )
     _write_json(dataset_dir / "dataset_generation_summary.json", summary)
     job.logger.info(
         "dataset generation completed | matchups=%s | added_games=%s | added_samples=%s | total_samples=%s | target_samples=%s",
@@ -835,6 +1248,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
     teacher_engine = str(teacher_cfg.get("engine", "minimax"))
     teacher_level = str(teacher_cfg.get("level", "hard"))
     dataset_id = str(cfg.get("dataset_id", "dataset_v1"))
+    source_dataset_id = str(cfg.get("source_dataset_id", "")).strip()
     split_cfg = cfg.get("split", {})
     train_ratio = float(split_cfg.get("train", 0.8))
     validation_ratio = float(split_cfg.get("validation", 0.1))
@@ -844,7 +1258,12 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
     max_tasks_per_child = int(runtime_cfg.get("max_tasks_per_child", 25))
 
     dataset_dir = job.job_dir / "dataset_build"
-    sampled_root = _resolve_storage_path(job.paths.drive_root, cfg.get("input_sampled_dir"), dataset_dir.parent / "dataset_generation" / "sampled_positions")
+    if source_dataset_id:
+        source_entry = _resolve_dataset_source(job, source_dataset_id)
+        sampled_root = Path(str(source_entry["sampled_dir"]))
+    else:
+        sampled_root = _resolve_storage_path(job.paths.drive_root, cfg.get("input_sampled_dir"), dataset_dir.parent / "dataset_generation" / "sampled_positions")
+        source_dataset_id = Path(sampled_root).name
     label_cache_dir = _resolve_storage_path(
         job.paths.drive_root,
         cfg.get("label_cache_dir"),
@@ -860,6 +1279,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         label_cache_metadata_path,
         {
             "dataset_id": dataset_id,
+            "source_dataset_id": source_dataset_id,
             "teacher_engine": teacher_engine,
             "teacher_level": teacher_level,
             "label_cache_dir": str(label_cache_dir),
@@ -945,6 +1365,8 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
     job.set_phase("dataset_build")
     job.write_event(
         "dataset_build_started",
+        dataset_id=dataset_id,
+        source_dataset_id=source_dataset_id,
         teacher_engine=teacher_engine,
         teacher_level=teacher_level,
         sampled_root=str(sampled_root),
@@ -1223,6 +1645,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         "dataset_id": dataset_id,
         "teacher_engine": teacher_engine,
         "teacher_level": teacher_level,
+        "source_dataset_id": source_dataset_id,
         "label_cache_dir": str(label_cache_dir),
         "splits": split_summary,
         "output_dir": str(output_root),
@@ -1231,6 +1654,19 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         "skipped_terminal_samples": skipped_terminal_samples,
         "skipped_no_legal_samples": skipped_no_legal_samples,
     }
+    _register_built_dataset(
+        job,
+        dataset_id=dataset_id,
+        source_dataset_id=source_dataset_id,
+        sampled_root=sampled_root,
+        output_root=output_root,
+        label_cache_dir=label_cache_dir,
+        teacher_engine=teacher_engine,
+        teacher_level=teacher_level,
+        split_summary=split_summary,
+        labeled_samples=sum(file_sample_counts.values()),
+        target_labeled_samples=target_labeled_samples,
+    )
     _write_json(dataset_dir / "dataset_build_summary.json", summary)
     job.logger.info(
         "dataset build completed | dataset=%s | train=%s | validation=%s | test=%s | skipped_terminal=%s | skipped_no_legal=%s",

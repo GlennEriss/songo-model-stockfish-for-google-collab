@@ -13,6 +13,7 @@ job:
   auto_rollover_completed_job: true
 
 dataset_build:
+  source_dataset_id: sampled_full_matrix_colab_pro
   input_sampled_dir: data/sampled_full_matrix_colab_pro
   dataset_id: dataset_v2_full_matrix_colab_pro_insane_1m
   output_dir: data/datasets/dataset_v2_full_matrix_colab_pro_insane_1m

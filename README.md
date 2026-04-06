@@ -49,6 +49,7 @@ La ligne technique retenue est:
 - `docs/DOCS_INDEX.md` : point d'entree central dans toute la documentation
 - `docs/PROJECT_OVERVIEW.md` : cadrage du nouveau projet
 - `docs/ROADMAP.md` : roadmap alignee sur le nouveau cadre
+- `docs/IMPROVEMENT_PLAN.md` : etat actuel, ameliorations deja faites et plan d'evolution priorise
 - `docs/COLAB_PIPELINE.md` : organisation cible pour l'execution Colab
 - `docs/STOCKFISH_PLAN.md` : plan de construction du moteur type Stockfish
 - `docs/ENGINE_V1_DESIGN.md` : design concret de la premiere version du moteur
@@ -114,6 +115,7 @@ Le repo contient maintenant des configurations dediees a une machine Google Cola
 - `config/dataset_build.colab_pro.yaml`
 - `config/dataset_build.full_matrix.colab_pro.yaml`
 - `config/train.full_matrix.colab_pro.yaml`
+- `config/train.full_matrix.colab_pro.residual.yaml`
 - `config/evaluation.full_matrix.colab_pro.yaml`
 - `config/benchmark.colab_pro.yaml`
 
@@ -254,3 +256,41 @@ Le classement courant est ordonne en priorite par:
 1. `benchmark_score`
 2. `evaluation_top1`
 3. ordre de creation recent
+
+## Etat Actuel Et Ameliorations Recentes
+
+Pour une vue concise et reutilisable de l'etat du projet, lire:
+
+- `docs/IMPROVEMENT_PLAN.md`
+
+Ce document centralise:
+
+- ce qui est deja en place dans le pipeline
+- ce qui a ete ameliore recemment
+- les nouvelles options de training deja disponibles
+- les prochaines evolutions recommandees
+
+Sur le lot actuel, les evolutions concretes ajoutees sont:
+
+- `dataset-build` plus lisible avec scan resume, debit et ETA
+- `dataset-generate` peut maintenant fonctionner en:
+  - `benchmatch`
+  - `clone_existing`
+  - `derive_existing`
+- `dataset-build` peut maintenant choisir explicitement quelle source de dataset il enrichit
+- debut de versionning dataset via `data/dataset_registry.json`
+- `train` avec `gradient clipping`, scheduler `cosine` et `early stopping`
+- export du meilleur checkpoint comme modele final
+- `evaluation` enrichie avec `value_mae`
+- support dans le code pour un MLP plus robuste avec:
+  - `use_layer_norm`
+  - `dropout`
+  - `residual_connections`
+
+Une config experimentale separee est maintenant disponible pour tester cette variante sans toucher a la config stable:
+
+- `config/train.full_matrix.colab_pro.residual.yaml`
+
+Le protocole recommande pour comparer proprement les variantes `stable` et `residual` est documente dans:
+
+- `docs/IMPROVEMENT_PLAN.md`

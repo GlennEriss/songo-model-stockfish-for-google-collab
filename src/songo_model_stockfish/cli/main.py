@@ -12,6 +12,32 @@ from songo_model_stockfish.ops.job import create_job_context
 from songo_model_stockfish.training.jobs import run_train
 
 
+def _apply_dataset_generate_overrides(config: dict[str, object], args: argparse.Namespace) -> dict[str, object]:
+    dataset_cfg = dict(config.get("dataset_generation", {}))
+    if getattr(args, "generation_mode", None):
+        dataset_cfg["source_mode"] = args.generation_mode
+    if getattr(args, "dataset_source_id", None):
+        dataset_cfg["dataset_source_id"] = args.dataset_source_id
+    if getattr(args, "source_dataset_id", None):
+        dataset_cfg["source_dataset_id"] = args.source_dataset_id
+    if getattr(args, "derivation_strategy", None):
+        dataset_cfg["derivation_strategy"] = args.derivation_strategy
+    updated = dict(config)
+    updated["dataset_generation"] = dataset_cfg
+    return updated
+
+
+def _apply_dataset_build_overrides(config: dict[str, object], args: argparse.Namespace) -> dict[str, object]:
+    dataset_cfg = dict(config.get("dataset_build", {}))
+    if getattr(args, "source_dataset_id", None):
+        dataset_cfg["source_dataset_id"] = args.source_dataset_id
+    if getattr(args, "dataset_id_override", None):
+        dataset_cfg["dataset_id"] = args.dataset_id_override
+    updated = dict(config)
+    updated["dataset_build"] = dataset_cfg
+    return updated
+
+
 def _add_common_arguments(parser: argparse.ArgumentParser, *, require_config: bool = True) -> None:
     if require_config:
         parser.add_argument("--config", required=True)
@@ -20,8 +46,8 @@ def _add_common_arguments(parser: argparse.ArgumentParser, *, require_config: bo
     parser.add_argument("--dry-run", action="store_true")
 
 
-def _execute_job(config_path: str, handler, *, override_job_id: str | None, dry_run: bool) -> int:
-    config = load_yaml_config(config_path)
+def _execute_job(config_path: str, handler, *, override_job_id: str | None, dry_run: bool, config_override: dict[str, object] | None = None) -> int:
+    config = config_override or load_yaml_config(config_path)
     job = create_job_context(config, override_job_id=override_job_id)
     job.write_status("running", phase="startup")
     job.write_event("job_started", config_path=str(config_path))
@@ -83,9 +109,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     dataset_generate = subparsers.add_parser("dataset-generate")
     _add_common_arguments(dataset_generate)
+    dataset_generate.add_argument("--generation-mode", choices=["benchmatch", "clone_existing", "derive_existing"])
+    dataset_generate.add_argument("--dataset-source-id")
+    dataset_generate.add_argument("--source-dataset-id")
+    dataset_generate.add_argument("--derivation-strategy", choices=["unique_positions", "endgame_focus", "high_branching"])
 
     dataset_build = subparsers.add_parser("dataset-build")
     _add_common_arguments(dataset_build)
+    dataset_build.add_argument("--source-dataset-id")
+    dataset_build.add_argument("--dataset-id-override")
 
     train = subparsers.add_parser("train")
     _add_common_arguments(train)
@@ -109,9 +141,23 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "dataset-generate":
-        return _execute_job(args.config, run_dataset_generation, override_job_id=args.job_id, dry_run=args.dry_run)
+        config = _apply_dataset_generate_overrides(load_yaml_config(args.config), args)
+        return _execute_job(
+            args.config,
+            run_dataset_generation,
+            override_job_id=args.job_id,
+            dry_run=args.dry_run,
+            config_override=config,
+        )
     if args.command == "dataset-build":
-        return _execute_job(args.config, run_dataset_build, override_job_id=args.job_id, dry_run=args.dry_run)
+        config = _apply_dataset_build_overrides(load_yaml_config(args.config), args)
+        return _execute_job(
+            args.config,
+            run_dataset_build,
+            override_job_id=args.job_id,
+            dry_run=args.dry_run,
+            config_override=config,
+        )
     if args.command == "train":
         return _execute_job(args.config, run_train, override_job_id=args.job_id, dry_run=args.dry_run)
     if args.command == "benchmark":
