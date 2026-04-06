@@ -67,3 +67,10 @@
 - tester un mode evaluateur rapide
 - tester un mode policy-value avec recherche
 - viser progressivement un moteur "Stockfish du Songo"
+
+## Phase 6 - Hardening Du Pipeline
+
+- fiabiliser le training long sur Colab avec clipping, scheduler et early stopping
+- enrichir les rapports d'evaluation avec des metriques plus lisibles
+- clarifier l'etat du projet et les priorites dans une doc courte et reutilisable
+- preparer l'activation future de variantes MLP plus robustes sans casser la compatibilite des checkpoints

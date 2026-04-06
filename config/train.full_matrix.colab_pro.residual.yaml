@@ -26,11 +26,11 @@ train:
   validation_path: data/datasets/dataset_v2_full_matrix_colab_pro_insane_1m/validation.npz
   model_family: policy_value
   backbone: mlp
-  hidden_sizes: [1024, 1024, 512, 256]
+  hidden_sizes: [1024, 1024, 1024, 512, 512, 256]
   model_id: auto
-  model_id_prefix: songo_policy_value_colab_pro
+  model_id_prefix: songo_policy_value_colab_pro_residual
   init_checkpoint_path: ""
-  init_from_promoted_best: true
+  init_from_promoted_best: false
   promoted_best_checkpoint_path: models/promoted/best/model.pt
   lineage_dir: models/lineage
   batch_size: 4096
@@ -38,9 +38,9 @@ train:
   log_every_n_batches: 10
   learning_rate: 0.0005
   value_loss_weight: 1.0
-  use_layer_norm: false
-  dropout: 0.0
-  residual_connections: false
+  use_layer_norm: true
+  dropout: 0.05
+  residual_connections: true
   gradient_clip_norm: 1.0
   early_stopping_patience: 6
   scheduler:

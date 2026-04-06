@@ -17,6 +17,25 @@ from songo_model_stockfish.training.data import build_dataloader
 from songo_model_stockfish.training.model import PolicyValueMLP
 
 
+def _build_model_config(
+    input_dim: int,
+    hidden_sizes: list[int],
+    *,
+    policy_dim: int = 7,
+    use_layer_norm: bool = False,
+    dropout: float = 0.0,
+    residual_connections: bool = False,
+) -> dict[str, Any]:
+    return {
+        "input_dim": input_dim,
+        "hidden_sizes": hidden_sizes,
+        "policy_dim": policy_dim,
+        "use_layer_norm": use_layer_norm,
+        "dropout": dropout,
+        "residual_connections": residual_connections,
+    }
+
+
 def _resolve_storage_path(base: Path, configured: str | None, fallback: Path) -> Path:
     if not configured:
         return fallback
@@ -37,6 +56,22 @@ def _masked_policy_loss(policy_logits: torch.Tensor, legal_mask: torch.Tensor, p
     return F.cross_entropy(masked_logits, policy_index)
 
 
+def _build_scheduler(optimizer: torch.optim.Optimizer, cfg: dict[str, Any], epochs: int):
+    scheduler_cfg = cfg.get("scheduler", {})
+    scheduler_type = str(scheduler_cfg.get("type", "none")).strip().lower()
+    if scheduler_type in {"", "none"}:
+        return None, scheduler_type, {}
+    if scheduler_type == "cosine":
+        min_lr = float(scheduler_cfg.get("min_lr", 0.0))
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(1, epochs),
+            eta_min=min_lr,
+        )
+        return scheduler, scheduler_type, {"min_lr": min_lr}
+    raise ValueError(f"Unsupported scheduler type: {scheduler_type}")
+
+
 def _run_epoch(
     model,
     loader,
@@ -45,6 +80,7 @@ def _run_epoch(
     scaler: GradScaler | None = None,
     amp_enabled: bool = False,
     value_loss_weight: float = 1.0,
+    gradient_clip_norm: float = 0.0,
     on_batch_end: Callable[[dict[str, float | int | str]], None] | None = None,
 ) -> dict[str, float]:
     training = optimizer is not None
@@ -74,10 +110,15 @@ def _run_epoch(
             optimizer.zero_grad(set_to_none=True)
             if scaler is not None and amp_enabled:
                 scaler.scale(loss_total).backward()
+                if gradient_clip_norm > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss_total.backward()
+                if gradient_clip_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
                 optimizer.step()
 
         preds = _masked_policy_logits(policy_logits, legal_mask).argmax(dim=1)
@@ -144,11 +185,16 @@ def run_train(job: JobContext) -> dict[str, object]:
     if model_id in {"", "auto"}:
         model_id = f"{model_id_prefix}_v{next_model_version(job.paths.models_root, model_id_prefix)}"
     hidden_sizes = list(cfg.get("hidden_sizes", [256, 256, 128]))
+    use_layer_norm = bool(cfg.get("use_layer_norm", False))
+    dropout = float(cfg.get("dropout", 0.0))
+    residual_connections = bool(cfg.get("residual_connections", False))
     batch_size = int(cfg.get("batch_size", 64))
     epochs = int(cfg.get("epochs", 20))
     learning_rate = float(cfg.get("learning_rate", 0.0003))
     value_loss_weight = float(cfg.get("value_loss_weight", 1.0))
     log_every_n_batches = max(1, int(cfg.get("log_every_n_batches", 1)))
+    gradient_clip_norm = float(cfg.get("gradient_clip_norm", 0.0))
+    early_stopping_patience = max(0, int(cfg.get("early_stopping_patience", 0)))
     requested_device = str(runtime_cfg.get("device", "cpu"))
     device = torch.device(requested_device if requested_device == "cpu" or torch.cuda.is_available() else "cpu")
     num_workers = int(runtime_cfg.get("num_workers", 0))
@@ -178,15 +224,31 @@ def run_train(job: JobContext) -> dict[str, object]:
         prefetch_factor=prefetch_factor,
     )
 
-    model = PolicyValueMLP(input_dim=input_dim, hidden_sizes=hidden_sizes)
+    model = PolicyValueMLP(
+        input_dim=input_dim,
+        hidden_sizes=hidden_sizes,
+        use_layer_norm=use_layer_norm,
+        dropout=dropout,
+        residual_connections=residual_connections,
+    )
     model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    scheduler, scheduler_type, scheduler_params = _build_scheduler(optimizer, cfg, epochs)
     scaler = GradScaler(device="cuda", enabled=amp_enabled)
+    model_config = _build_model_config(
+        input_dim,
+        hidden_sizes,
+        use_layer_norm=use_layer_norm,
+        dropout=dropout,
+        residual_connections=residual_connections,
+    )
 
     state = job.read_state()
     start_epoch = int(state.get("epoch", 0))
     global_step = int(state.get("global_step", 0))
     best_metric = float(state.get("best_metric", float("-inf")))
+    best_epoch = int(state.get("best_epoch", 0))
+    epochs_without_improvement = int(state.get("epochs_without_improvement", 0))
     if best_metric == float("-inf"):
         best_metric = 0.0
     checkpoint_path_value = state.get("checkpoint_path")
@@ -197,9 +259,13 @@ def run_train(job: JobContext) -> dict[str, object]:
             checkpoint = torch.load(checkpoint_path, map_location=device)
             model.load_state_dict(checkpoint["model_state"])
             optimizer.load_state_dict(checkpoint["optimizer_state"])
+            if scheduler is not None and checkpoint.get("scheduler_state") is not None:
+                scheduler.load_state_dict(checkpoint["scheduler_state"])
             start_epoch = int(checkpoint.get("epoch", start_epoch))
             global_step = int(checkpoint.get("global_step", global_step))
             best_metric = float(checkpoint.get("best_metric", best_metric))
+            best_epoch = int(checkpoint.get("best_epoch", best_epoch))
+            epochs_without_improvement = int(checkpoint.get("epochs_without_improvement", epochs_without_improvement))
     elif init_checkpoint_path is None and init_from_promoted_best and promoted_best_checkpoint_path.exists():
         init_checkpoint_path = promoted_best_checkpoint_path
     elif init_checkpoint_path:
@@ -210,10 +276,23 @@ def run_train(job: JobContext) -> dict[str, object]:
         parent_hidden_sizes = list(parent_model_config.get("hidden_sizes", hidden_sizes))
         parent_input_dim = int(parent_model_config.get("input_dim", input_dim))
         parent_policy_dim = int(parent_model_config.get("policy_dim", 7))
-        if parent_hidden_sizes != hidden_sizes or parent_input_dim != input_dim or parent_policy_dim != 7:
+        parent_use_layer_norm = bool(parent_model_config.get("use_layer_norm", False))
+        parent_dropout = float(parent_model_config.get("dropout", 0.0))
+        parent_residual_connections = bool(parent_model_config.get("residual_connections", False))
+        if (
+            parent_hidden_sizes != hidden_sizes
+            or parent_input_dim != input_dim
+            or parent_policy_dim != 7
+            or parent_use_layer_norm != use_layer_norm
+            or parent_dropout != dropout
+            or parent_residual_connections != residual_connections
+        ):
             raise ValueError(
                 "Le checkpoint parent n'est pas compatible avec la config d'entrainement actuelle "
-                f"(parent hidden_sizes={parent_hidden_sizes}, current hidden_sizes={hidden_sizes})"
+                f"(parent hidden_sizes={parent_hidden_sizes}, current hidden_sizes={hidden_sizes}, "
+                f"parent use_layer_norm={parent_use_layer_norm}, current use_layer_norm={use_layer_norm}, "
+                f"parent dropout={parent_dropout}, current dropout={dropout}, "
+                f"parent residual_connections={parent_residual_connections}, current residual_connections={residual_connections})"
             )
         model.load_state_dict(parent_checkpoint["model_state"])
         lineage_dir.mkdir(parents=True, exist_ok=True)
@@ -278,6 +357,9 @@ def run_train(job: JobContext) -> dict[str, object]:
         train_examples=len(train_loader.dataset),
         validation_examples=len(validation_loader.dataset),
         resume_granularity="epoch",
+        scheduler_type=scheduler_type,
+        gradient_clip_norm=gradient_clip_norm,
+        early_stopping_patience=early_stopping_patience,
     )
     job.write_metric(
         {
@@ -294,6 +376,7 @@ def run_train(job: JobContext) -> dict[str, object]:
     last_checkpoint_path = checkpoint_dir / f"{model_id}_last.pt"
 
     history: list[dict[str, float | int]] = []
+    early_stopped = False
     for epoch in range(start_epoch, epochs):
         epoch_number = epoch + 1
         job.set_phase(f"training:epoch_{epoch_number:03d}")
@@ -314,6 +397,8 @@ def run_train(job: JobContext) -> dict[str, object]:
                 "total_batches": len(train_loader),
                 "global_step": global_step,
                 "best_metric": best_metric,
+                "best_epoch": best_epoch,
+                "epochs_without_improvement": epochs_without_improvement,
                 "last_completed_phase": "epoch_initialized",
                 "checkpoint_path": str(last_checkpoint_path),
             }
@@ -397,6 +482,7 @@ def run_train(job: JobContext) -> dict[str, object]:
             scaler=scaler,
             amp_enabled=amp_enabled,
             value_loss_weight=value_loss_weight,
+            gradient_clip_norm=gradient_clip_norm,
             on_batch_end=on_train_batch_end,
         )
         job.logger.info(
@@ -494,6 +580,7 @@ def run_train(job: JobContext) -> dict[str, object]:
 
         epoch_payload = {
             "epoch": epoch_number,
+            "learning_rate": float(optimizer.param_groups[0]["lr"]),
             "train_loss_total": train_metrics["loss_total"],
             "train_loss_policy": train_metrics["loss_policy"],
             "train_loss_value": train_metrics["loss_value"],
@@ -516,18 +603,29 @@ def run_train(job: JobContext) -> dict[str, object]:
             validation_metrics["policy_accuracy"],
         )
 
+        validation_score = float(validation_metrics["policy_accuracy"])
+        improved = validation_score >= best_metric
+        if improved:
+            best_metric = validation_score
+            best_epoch = epoch_number
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+
+        if scheduler is not None:
+            scheduler.step()
+
         checkpoint_payload = {
             "epoch": epoch_number,
             "global_step": global_step,
             "best_metric": best_metric,
+            "best_epoch": best_epoch,
+            "epochs_without_improvement": epochs_without_improvement,
             "model_state": model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
+            "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
             "amp_enabled": amp_enabled,
-            "model_config": {
-                "input_dim": input_dim,
-                "hidden_sizes": hidden_sizes,
-                "policy_dim": 7,
-            },
+            "model_config": model_config,
         }
         _save_checkpoint(last_checkpoint_path, checkpoint_payload)
         job.write_event(
@@ -536,10 +634,10 @@ def run_train(job: JobContext) -> dict[str, object]:
             checkpoint_path=str(last_checkpoint_path),
         )
 
-        validation_score = float(validation_metrics["policy_accuracy"])
-        if validation_score >= best_metric:
-            best_metric = validation_score
+        if improved:
             checkpoint_payload["best_metric"] = best_metric
+            checkpoint_payload["best_epoch"] = best_epoch
+            checkpoint_payload["epochs_without_improvement"] = epochs_without_improvement
             _save_checkpoint(best_checkpoint_path, checkpoint_payload)
             job.write_event("best_checkpoint_updated", epoch=epoch_number, checkpoint_path=str(best_checkpoint_path))
 
@@ -548,6 +646,8 @@ def run_train(job: JobContext) -> dict[str, object]:
                 "epoch": epoch_number,
                 "global_step": global_step,
                 "best_metric": best_metric,
+                "best_epoch": best_epoch,
+                "epochs_without_improvement": epochs_without_improvement,
                 "last_completed_phase": "validation",
                 "checkpoint_path": str(last_checkpoint_path),
             }
@@ -562,15 +662,35 @@ def run_train(job: JobContext) -> dict[str, object]:
             },
         )
 
+        if early_stopping_patience > 0 and epochs_without_improvement >= early_stopping_patience:
+            early_stopped = True
+            job.write_event(
+                "train_early_stopped",
+                epoch=epoch_number,
+                best_epoch=best_epoch,
+                best_metric=best_metric,
+                early_stopping_patience=early_stopping_patience,
+            )
+            job.logger.info(
+                "training early stopped | epoch=%s/%s | best_epoch=%s | best_validation_metric=%.4f | patience=%s",
+                epoch_number,
+                epochs,
+                best_epoch,
+                best_metric,
+                early_stopping_patience,
+            )
+            break
+
     final_dir.mkdir(parents=True, exist_ok=True)
+    restored_best_checkpoint = False
+    if best_checkpoint_path.exists():
+        best_checkpoint = torch.load(best_checkpoint_path, map_location=device)
+        model.load_state_dict(best_checkpoint["model_state"])
+        restored_best_checkpoint = True
     final_model_path = final_dir / f"{model_id}.pt"
     final_payload = {
         "model_state": model.state_dict(),
-        "model_config": {
-            "input_dim": input_dim,
-            "hidden_sizes": hidden_sizes,
-            "policy_dim": 7,
-        },
+        "model_config": model_config,
         "dataset_id": dataset_id,
         "best_metric": best_metric,
         "amp_enabled": amp_enabled,
@@ -588,7 +708,15 @@ def run_train(job: JobContext) -> dict[str, object]:
         "device": str(device),
         "mixed_precision": amp_enabled,
         "epochs": epochs,
+        "completed_epochs": len(history),
         "best_validation_metric": best_metric,
+        "best_epoch": best_epoch,
+        "early_stopped": early_stopped,
+        "early_stopping_patience": early_stopping_patience,
+        "scheduler_type": scheduler_type,
+        "scheduler": scheduler_params,
+        "gradient_clip_norm": gradient_clip_norm,
+        "restored_best_checkpoint_for_export": restored_best_checkpoint,
         "final_model_path": str(final_model_path),
         "best_checkpoint_path": str(best_checkpoint_path),
         "history": history,
@@ -609,9 +737,13 @@ def run_train(job: JobContext) -> dict[str, object]:
             "family": str(cfg.get("model_family", "policy_value")),
             "backbone": str(cfg.get("backbone", "mlp")),
             "hidden_sizes": hidden_sizes,
+            "use_layer_norm": use_layer_norm,
+            "dropout": dropout,
+            "residual_connections": residual_connections,
         },
         "checkpoint_path": str(final_model_path),
         "best_validation_metric": best_metric,
+        "best_epoch": best_epoch,
         "benchmark_summary_path": "",
         "runtime": {
             "device": str(device),
@@ -619,6 +751,12 @@ def run_train(job: JobContext) -> dict[str, object]:
             "batch_size": batch_size,
             "num_workers": num_workers,
             "pin_memory": pin_memory,
+        },
+        "training_controls": {
+            "gradient_clip_norm": gradient_clip_norm,
+            "early_stopping_patience": early_stopping_patience,
+            "scheduler_type": scheduler_type,
+            "scheduler": scheduler_params,
         },
     }
     _write_json(final_dir / f"{model_id}.model_card.json", model_card)
@@ -639,11 +777,20 @@ def run_train(job: JobContext) -> dict[str, object]:
     )
     promote_best_model(job.paths.models_root)
     job.write_metric({"metric_type": "train_completed", "model_id": model_id, "best_validation_metric": best_metric})
-    job.write_event("train_completed", model_id=model_id, final_model_path=str(final_model_path))
+    job.write_event(
+        "train_completed",
+        model_id=model_id,
+        final_model_path=str(final_model_path),
+        best_epoch=best_epoch,
+        early_stopped=early_stopped,
+        restored_best_checkpoint_for_export=restored_best_checkpoint,
+    )
     job.logger.info(
-        "training completed | model=%s | final_model=%s | best_validation_metric=%.4f",
+        "training completed | model=%s | final_model=%s | best_validation_metric=%.4f | best_epoch=%s | early_stopped=%s",
         model_id,
         final_model_path,
         best_metric,
+        best_epoch,
+        early_stopped,
     )
     return training_summary

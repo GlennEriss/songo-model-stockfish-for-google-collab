@@ -70,6 +70,7 @@ def _update_model_card_after_evaluation(models_root: Path, model_id: str, summar
     payload["evaluation_top1"] = float(summary["policy_accuracy_top1"])
     payload["evaluation_top3"] = float(summary["policy_accuracy_top3"])
     payload["evaluation_loss_total"] = float(summary["loss_total"])
+    payload["evaluation_value_mae"] = float(summary["value_mae"])
     model_card_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
 
 
@@ -98,6 +99,9 @@ def run_evaluation(job: JobContext) -> dict[str, object]:
         input_dim=int(model_config.get("input_dim", 17)),
         hidden_sizes=list(model_config.get("hidden_sizes", [256, 256, 128])),
         policy_dim=int(model_config.get("policy_dim", 7)),
+        use_layer_norm=bool(model_config.get("use_layer_norm", False)),
+        dropout=float(model_config.get("dropout", 0.0)),
+        residual_connections=bool(model_config.get("residual_connections", False)),
     )
     model.load_state_dict(checkpoint["model_state"])
     model.to(device)
@@ -118,6 +122,7 @@ def run_evaluation(job: JobContext) -> dict[str, object]:
     total_loss = float(state.get("total_loss", 0.0))
     total_policy = float(state.get("total_policy", 0.0))
     total_value = float(state.get("total_value", 0.0))
+    total_abs_value_error = float(state.get("total_abs_value_error", 0.0))
     total_correct = int(state.get("total_correct", 0))
     total_top3 = int(state.get("total_top3", 0))
     total_examples = int(state.get("total_examples", 0))
@@ -212,15 +217,17 @@ def run_evaluation(job: JobContext) -> dict[str, object]:
             total_loss += float(loss_total.item()) * batch_count
             total_policy += float(loss_policy.item()) * batch_count
             total_value += float(loss_value.item()) * batch_count
+            total_abs_value_error += float(torch.abs(value_pred - value_target).sum().item())
             if batch_index == 1 or batch_index == len(test_loader) or batch_index % log_every_n_batches == 0:
                 job.logger.info(
-                    "evaluation batch | batch=%s/%s | examples=%s | loss=%.4f | policy=%.4f | value=%.4f | top1=%.4f | top3=%.4f",
+                    "evaluation batch | batch=%s/%s | examples=%s | loss=%.4f | policy=%.4f | value=%.4f | value_mae=%.4f | top1=%.4f | top3=%.4f",
                     batch_index,
                     len(test_loader),
                     total_examples,
                     float(loss_total.item()),
                     float(loss_policy.item()),
                     float(loss_value.item()),
+                    total_abs_value_error / max(1, total_examples),
                     total_correct / max(1, total_examples),
                     total_top3 / max(1, total_examples),
                 )
@@ -235,6 +242,7 @@ def run_evaluation(job: JobContext) -> dict[str, object]:
                     loss_total=float(loss_total.item()),
                     loss_policy=float(loss_policy.item()),
                     loss_value=float(loss_value.item()),
+                    value_mae=total_abs_value_error / max(1, total_examples),
                     accuracy_top1=total_correct / max(1, total_examples),
                     accuracy_top3=total_top3 / max(1, total_examples),
                 )
@@ -246,6 +254,7 @@ def run_evaluation(job: JobContext) -> dict[str, object]:
                     "total_loss": total_loss,
                     "total_policy": total_policy,
                     "total_value": total_value,
+                    "total_abs_value_error": total_abs_value_error,
                     "total_correct": total_correct,
                     "total_top3": total_top3,
                     "last_completed_phase": "evaluation_batch_completed",
@@ -276,6 +285,7 @@ def run_evaluation(job: JobContext) -> dict[str, object]:
         "loss_total": total_loss / denom,
         "loss_policy": total_policy / denom,
         "loss_value": total_value / denom,
+        "value_mae": total_abs_value_error / denom,
         "policy_accuracy_top1": total_correct / denom,
         "policy_accuracy_top3": total_top3 / denom,
         "checkpoint_path": str(checkpoint_path),
@@ -314,6 +324,7 @@ def run_evaluation(job: JobContext) -> dict[str, object]:
             "total_loss": total_loss,
             "total_policy": total_policy,
             "total_value": total_value,
+            "total_abs_value_error": total_abs_value_error,
             "total_correct": total_correct,
             "total_top3": total_top3,
             "last_completed_phase": "evaluation_completed",
@@ -323,11 +334,12 @@ def run_evaluation(job: JobContext) -> dict[str, object]:
     job.write_metric({"metric_type": "evaluation_completed", **summary})
     job.write_event("evaluation_completed", model_id=model_id)
     job.logger.info(
-        "evaluation completed | model=%s | examples=%s | top1=%.4f | top3=%.4f | loss=%.4f",
+        "evaluation completed | model=%s | examples=%s | top1=%.4f | top3=%.4f | value_mae=%.4f | loss=%.4f",
         model_id,
         total_examples,
         summary["policy_accuracy_top1"],
         summary["policy_accuracy_top3"],
+        summary["value_mae"],
         summary["loss_total"],
     )
     return summary

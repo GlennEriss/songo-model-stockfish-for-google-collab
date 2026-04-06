@@ -25,6 +25,11 @@ Si tu veux comprendre rapidement le projet, lis dans cet ordre:
   - roadmap generale du projet
   - grands blocs de travail
 
+- `IMPROVEMENT_PLAN.md`
+  - etat actuel du pipeline
+  - ameliorations deja faites
+  - prochaines evolutions priorisees
+
 - `STOCKFISH_PLAN.md`
   - trajectoire vers un moteur de type Stockfish
   - versions successives
@@ -117,6 +122,7 @@ Lis:
 
 - `PROJECT_OVERVIEW.md`
 - `ROADMAP.md`
+- `IMPROVEMENT_PLAN.md`
 - `STOCKFISH_PLAN.md`
 
 ### Si tu veux comprendre le moteur V1
