@@ -1,0 +1,20 @@
+project:
+  name: songo-model-stockfish-for-google-collab
+
+storage:
+  drive_root: /content/drive/MyDrive/songo-stockfish
+  repo_root: /content/songo-model-stockfish-for-google-collab
+
+job:
+  run_type: dataset_merge_final
+  job_id: auto
+  resume: true
+  save_every_minutes: 5
+  auto_rollover_completed_job: true
+
+dataset_merge_final:
+  dataset_id: dataset_merged_final_colab_pro
+  source_dataset_ids: []
+  include_all_built: true
+  dedupe_sample_ids: true
+  output_dir: data/datasets/dataset_merged_final_colab_pro

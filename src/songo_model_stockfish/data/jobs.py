@@ -100,6 +100,14 @@ def _resolve_dataset_source(job: JobContext, dataset_source_id: str) -> dict[str
     raise FileNotFoundError(f"Dataset source introuvable dans le registre: {dataset_source_id}")
 
 
+def _resolve_built_dataset(job: JobContext, dataset_id: str) -> dict[str, Any]:
+    registry = _read_dataset_registry(job)
+    for entry in registry.get("built_datasets", []):
+        if str(entry.get("dataset_id", "")) == dataset_id:
+            return entry
+    raise FileNotFoundError(f"Built dataset introuvable dans le registre: {dataset_id}")
+
+
 def _register_dataset_source(
     job: JobContext,
     *,
@@ -112,9 +120,12 @@ def _register_dataset_source(
     sample_every_n_plies: int,
     matchups: list[str],
     source_dataset_id: str = "",
+    source_dataset_ids: list[str] | None = None,
     derivation_strategy: str = "",
     derivation_params: dict[str, Any] | None = None,
+    dataset_version: str | None = None,
 ) -> dict[str, Any]:
+    resolved_source_dataset_ids = source_dataset_ids or ([source_dataset_id] if source_dataset_id else [])
     payload = {
         "dataset_source_id": dataset_source_id,
         "source_mode": source_mode,
@@ -128,8 +139,10 @@ def _register_dataset_source(
         "sampled_files": _count_jsonl_files(sampled_dir),
         "sampled_positions": _count_total_jsonl_lines(sampled_dir) if sampled_dir.exists() else 0,
         "source_dataset_id": source_dataset_id,
+        "source_dataset_ids": resolved_source_dataset_ids,
         "derivation_strategy": derivation_strategy,
         "derivation_params": derivation_params or {},
+        "dataset_version": dataset_version or utc_now_iso(),
         "updated_at": utc_now_iso(),
     }
     registry = _read_dataset_registry(job)
@@ -150,6 +163,7 @@ def _register_built_dataset(
     *,
     dataset_id: str,
     source_dataset_id: str,
+    source_dataset_ids: list[str] | None = None,
     sampled_root: Path,
     output_root: Path,
     label_cache_dir: Path,
@@ -158,10 +172,15 @@ def _register_built_dataset(
     split_summary: dict[str, dict[str, int]],
     labeled_samples: int,
     target_labeled_samples: int,
+    build_mode: str = "teacher_label",
+    parent_dataset_ids: list[str] | None = None,
+    dataset_version: str | None = None,
 ) -> dict[str, Any]:
+    resolved_source_dataset_ids = source_dataset_ids or ([source_dataset_id] if source_dataset_id else [])
     payload = {
         "dataset_id": dataset_id,
         "source_dataset_id": source_dataset_id,
+        "source_dataset_ids": resolved_source_dataset_ids,
         "sampled_root": str(sampled_root),
         "output_dir": str(output_root),
         "label_cache_dir": str(label_cache_dir),
@@ -170,6 +189,9 @@ def _register_built_dataset(
         "splits": split_summary,
         "labeled_samples": labeled_samples,
         "target_labeled_samples": target_labeled_samples,
+        "build_mode": build_mode,
+        "parent_dataset_ids": parent_dataset_ids or [],
+        "dataset_version": dataset_version or utc_now_iso(),
         "updated_at": utc_now_iso(),
     }
     registry = _read_dataset_registry(job)
@@ -281,6 +303,78 @@ def _derive_existing_dataset_source(
     }
 
 
+def _merge_existing_dataset_sources(
+    *,
+    source_entries: list[dict[str, Any]],
+    target_raw_dir: Path,
+    target_sampled_dir: Path,
+    target_samples: int,
+    dedupe_sample_ids: bool,
+) -> dict[str, Any]:
+    target_raw_dir.mkdir(parents=True, exist_ok=True)
+    target_sampled_dir.mkdir(parents=True, exist_ok=True)
+
+    seen_sample_ids: set[str] = set()
+    scanned_files = 0
+    scanned_samples = 0
+    selected_files = 0
+    selected_samples = 0
+    duplicate_samples = 0
+    copied_raw_files = 0
+
+    for source_entry in source_entries:
+        source_dataset_id = str(source_entry["dataset_source_id"])
+        source_raw_dir = Path(str(source_entry["raw_dir"]))
+        source_sampled_dir = Path(str(source_entry["sampled_dir"]))
+
+        for source_sampled_file in sorted(source_sampled_dir.rglob("*.jsonl")):
+            if target_samples > 0 and selected_samples >= target_samples:
+                break
+            scanned_files += 1
+            relative_path = source_sampled_file.relative_to(source_sampled_dir)
+            target_sampled_file = target_sampled_dir / source_dataset_id / relative_path
+            target_sampled_file.parent.mkdir(parents=True, exist_ok=True)
+
+            kept_samples: list[dict[str, Any]] = []
+            for sample in _iter_jsonl(source_sampled_file):
+                scanned_samples += 1
+                if target_samples > 0 and selected_samples >= target_samples:
+                    break
+                sample_id = str(sample.get("sample_id", ""))
+                if dedupe_sample_ids and sample_id:
+                    if sample_id in seen_sample_ids:
+                        duplicate_samples += 1
+                        continue
+                    seen_sample_ids.add(sample_id)
+                kept_samples.append(sample)
+                selected_samples += 1
+
+            if kept_samples:
+                with target_sampled_file.open("w", encoding="utf-8") as handle:
+                    for sample in kept_samples:
+                        handle.write(json.dumps(sample, ensure_ascii=True) + "\n")
+                selected_files += 1
+
+                source_raw_file = source_raw_dir / relative_path.with_suffix(".json")
+                target_raw_file = target_raw_dir / source_dataset_id / relative_path.with_suffix(".json")
+                if source_raw_file.exists() and not target_raw_file.exists():
+                    target_raw_file.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source_raw_file, target_raw_file)
+                    copied_raw_files += 1
+
+        if target_samples > 0 and selected_samples >= target_samples:
+            break
+
+    return {
+        "scanned_files": scanned_files,
+        "scanned_samples": scanned_samples,
+        "selected_files": selected_files,
+        "selected_samples": selected_samples,
+        "duplicate_samples": duplicate_samples,
+        "copied_raw_files": copied_raw_files,
+    }
+
+
 def _append_jsonl(path: Path, payloads: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
@@ -319,6 +413,73 @@ def _format_eta_seconds(total_seconds: float | None) -> str:
     if minutes > 0:
         return f"{minutes}m{seconds:02d}s"
     return f"{seconds}s"
+
+
+def _load_npz_arrays(path: Path) -> dict[str, np.ndarray]:
+    with np.load(path, allow_pickle=True) as data:
+        return {key: data[key] for key in data.files}
+
+
+def _merge_npz_splits(
+    split_paths: list[Path],
+    *,
+    dedupe_sample_ids: bool,
+) -> tuple[dict[str, np.ndarray], dict[str, int]]:
+    merged_chunks: dict[str, list[np.ndarray]] = {
+        "x": [],
+        "legal_mask": [],
+        "policy_index": [],
+        "value_target": [],
+        "sample_ids": [],
+        "game_ids": [],
+    }
+    seen_sample_ids: set[str] = set()
+    input_samples = 0
+    kept_samples = 0
+    duplicate_samples = 0
+
+    for split_path in split_paths:
+        arrays = _load_npz_arrays(split_path)
+        sample_ids = arrays["sample_ids"]
+        keep_indices: list[int] = []
+        for index, sample_id in enumerate(sample_ids.tolist()):
+            input_samples += 1
+            sample_id_str = str(sample_id)
+            if dedupe_sample_ids and sample_id_str in seen_sample_ids:
+                duplicate_samples += 1
+                continue
+            seen_sample_ids.add(sample_id_str)
+            keep_indices.append(index)
+
+        if not keep_indices:
+            continue
+
+        keep = np.asarray(keep_indices, dtype=np.int64)
+        for key in merged_chunks:
+            merged_chunks[key].append(arrays[key][keep])
+        kept_samples += len(keep_indices)
+
+    if kept_samples == 0:
+        merged = {
+            "x": np.zeros((0, 17), dtype=np.float32),
+            "legal_mask": np.zeros((0, 7), dtype=np.float32),
+            "policy_index": np.zeros((0,), dtype=np.int64),
+            "value_target": np.zeros((0,), dtype=np.float32),
+            "sample_ids": np.asarray([], dtype=object),
+            "game_ids": np.asarray([], dtype=object),
+        }
+    else:
+        merged = {}
+        for key, chunks in merged_chunks.items():
+            merged[key] = np.concatenate(chunks, axis=0)
+
+    summary = {
+        "input_samples": input_samples,
+        "kept_samples": kept_samples,
+        "duplicate_samples": duplicate_samples,
+        "unique_games": len({str(value) for value in merged["game_ids"].tolist()}),
+    }
+    return merged, summary
 
 
 def _existing_game_numbers(raw_dir: Path, sampled_dir: Path, matchup_id: str) -> set[int]:
@@ -747,8 +908,10 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
     source_mode = str(cfg.get("source_mode", "benchmatch")).strip().lower() or "benchmatch"
     dataset_source_id = str(cfg.get("dataset_source_id", "")).strip() or Path(str(cfg.get("output_sampled_dir", "sampled_positions"))).name
     source_dataset_id = str(cfg.get("source_dataset_id", "")).strip()
+    source_dataset_ids = [str(value).strip() for value in cfg.get("source_dataset_ids", []) if str(value).strip()]
     derivation_strategy = str(cfg.get("derivation_strategy", "unique_positions")).strip().lower() or "unique_positions"
     derivation_params = dict(cfg.get("derivation_params", {}))
+    merge_dedupe_sample_ids = bool(cfg.get("merge_dedupe_sample_ids", True))
     games = int(cfg.get("games", 20))
     matchups = list(cfg.get("matchups", []))
     sample_every_n_plies = int(cfg.get("sample_every_n_plies", 2))
@@ -768,7 +931,7 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
     raw_dir.mkdir(parents=True, exist_ok=True)
     sampled_dir.mkdir(parents=True, exist_ok=True)
 
-    if source_mode not in {"benchmatch", "clone_existing", "derive_existing"}:
+    if source_mode not in {"benchmatch", "clone_existing", "derive_existing", "merge_existing"}:
         raise ValueError(f"Unsupported dataset generation source_mode: {source_mode}")
 
     if source_mode == "clone_existing":
@@ -892,6 +1055,70 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
                 "derivation_strategy": derivation_strategy,
                 "selected_files": derived_summary["selected_files"],
                 "selected_samples": derived_summary["selected_samples"],
+            }
+        )
+        return summary
+
+    if source_mode == "merge_existing":
+        if not source_dataset_ids:
+            raise ValueError("`source_dataset_ids` est requis quand `source_mode=merge_existing`")
+        source_entries = [_resolve_dataset_source(job, value) for value in source_dataset_ids]
+        merged_summary = _merge_existing_dataset_sources(
+            source_entries=source_entries,
+            target_raw_dir=raw_dir,
+            target_sampled_dir=sampled_dir,
+            target_samples=target_samples,
+            dedupe_sample_ids=merge_dedupe_sample_ids,
+        )
+        metadata = _register_dataset_source(
+            job,
+            dataset_source_id=dataset_source_id,
+            source_mode=source_mode,
+            raw_dir=raw_dir,
+            sampled_dir=sampled_dir,
+            target_samples=target_samples,
+            games_per_matchup=games,
+            sample_every_n_plies=sample_every_n_plies,
+            matchups=[str(matchup) for matchup in matchups],
+            source_dataset_id=source_dataset_ids[0],
+            source_dataset_ids=source_dataset_ids,
+        )
+        summary = {
+            "job_id": job.job_id,
+            "dataset_source_id": dataset_source_id,
+            "source_mode": source_mode,
+            "source_dataset_ids": source_dataset_ids,
+            "merge_dedupe_sample_ids": merge_dedupe_sample_ids,
+            **merged_summary,
+            "raw_dir": str(raw_dir),
+            "sampled_dir": str(sampled_dir),
+            "total_samples": int(metadata["sampled_positions"]),
+        }
+        _write_json(dataset_dir / "dataset_generation_summary.json", summary)
+        job.logger.info(
+            "dataset generation merged existing sources | dataset_source_id=%s | source_datasets=%s | selected_files=%s | selected_samples=%s | duplicate_samples=%s",
+            dataset_source_id,
+            len(source_dataset_ids),
+            merged_summary["selected_files"],
+            merged_summary["selected_samples"],
+            merged_summary["duplicate_samples"],
+        )
+        job.write_event(
+            "dataset_generation_merged_existing",
+            dataset_source_id=dataset_source_id,
+            source_dataset_ids=source_dataset_ids,
+            selected_files=merged_summary["selected_files"],
+            selected_samples=merged_summary["selected_samples"],
+            duplicate_samples=merged_summary["duplicate_samples"],
+        )
+        job.write_metric(
+            {
+                "metric_type": "dataset_generation_merged_existing",
+                "dataset_source_id": dataset_source_id,
+                "source_datasets": len(source_dataset_ids),
+                "selected_files": merged_summary["selected_files"],
+                "selected_samples": merged_summary["selected_samples"],
+                "duplicate_samples": merged_summary["duplicate_samples"],
             }
         )
         return summary
@@ -1352,12 +1579,14 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         last_logged_progress_count = processed_count
 
     job.logger.info(
-        "dataset build started | dataset=%s | teacher=%s:%s | sampled_root=%s | label_cache=%s | files=%s | target_labeled_samples=%s | workers=%s",
+        "dataset build started | dataset=%s | source_dataset_id=%s | teacher=%s:%s | sampled_root=%s | label_cache=%s | output_dir=%s | files=%s | target_labeled_samples=%s | workers=%s",
         dataset_id,
+        source_dataset_id,
         teacher_engine,
         teacher_level,
         sampled_root,
         label_cache_dir,
+        output_root,
         len(sampled_files),
         target_labeled_samples,
         num_workers,
@@ -1658,6 +1887,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         job,
         dataset_id=dataset_id,
         source_dataset_id=source_dataset_id,
+        source_dataset_ids=[source_dataset_id] if source_dataset_id else [],
         sampled_root=sampled_root,
         output_root=output_root,
         label_cache_dir=label_cache_dir,
@@ -1666,17 +1896,163 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         split_summary=split_summary,
         labeled_samples=sum(file_sample_counts.values()),
         target_labeled_samples=target_labeled_samples,
+        build_mode="teacher_label",
+        parent_dataset_ids=[],
     )
     _write_json(dataset_dir / "dataset_build_summary.json", summary)
     job.logger.info(
-        "dataset build completed | dataset=%s | train=%s | validation=%s | test=%s | skipped_terminal=%s | skipped_no_legal=%s",
+        "dataset build completed | dataset=%s | build_mode=teacher_label | source_dataset_id=%s | train=%s | validation=%s | test=%s | skipped_terminal=%s | skipped_no_legal=%s | output_dir=%s",
         dataset_id,
+        source_dataset_id,
         split_summary.get("train", {}).get("samples", 0),
         split_summary.get("validation", {}).get("samples", 0),
         split_summary.get("test", {}).get("samples", 0),
         skipped_terminal_samples,
         skipped_no_legal_samples,
+        output_root,
     )
     job.write_metric({"metric_type": "dataset_build_completed", "dataset_id": dataset_id})
     job.write_event("dataset_build_completed", dataset_id=dataset_id)
+    return summary
+
+
+def run_dataset_merge_final(job: JobContext) -> dict[str, object]:
+    cfg = job.config.get("dataset_merge_final", {})
+    dataset_id = str(cfg.get("dataset_id", "dataset_merged_final")).strip()
+    if not dataset_id:
+        raise ValueError("`dataset_id` est requis pour `dataset_merge_final`")
+
+    source_dataset_ids = [str(value).strip() for value in cfg.get("source_dataset_ids", []) if str(value).strip()]
+    include_all_built = bool(cfg.get("include_all_built", False))
+    dedupe_sample_ids = bool(cfg.get("dedupe_sample_ids", True))
+
+    registry = _read_dataset_registry(job)
+    built_entries = registry.get("built_datasets", [])
+    if include_all_built:
+        source_dataset_ids = [str(entry.get("dataset_id", "")).strip() for entry in built_entries if str(entry.get("dataset_id", "")).strip()]
+    if not source_dataset_ids:
+        raise ValueError("Aucun `source_dataset_ids` fourni pour `dataset_merge_final`")
+
+    source_entries = [_resolve_built_dataset(job, source_dataset_id) for source_dataset_id in source_dataset_ids]
+    teacher_pairs = {(str(entry.get("teacher_engine", "")), str(entry.get("teacher_level", ""))) for entry in source_entries}
+    if len(teacher_pairs) != 1:
+        raise ValueError("Tous les datasets finaux a fusionner doivent partager le meme teacher")
+    teacher_engine, teacher_level = next(iter(teacher_pairs))
+
+    output_root = _resolve_storage_path(
+        job.paths.drive_root,
+        cfg.get("output_dir"),
+        job.paths.data_root / "datasets" / dataset_id,
+    )
+    output_root.mkdir(parents=True, exist_ok=True)
+    merge_dir = job.job_dir / "dataset_merge_final"
+    merge_dir.mkdir(parents=True, exist_ok=True)
+
+    job.logger.info(
+        "dataset final merge started | dataset=%s | source_datasets=%s | teacher=%s:%s | dedupe_sample_ids=%s | output_dir=%s",
+        dataset_id,
+        len(source_entries),
+        teacher_engine,
+        teacher_level,
+        dedupe_sample_ids,
+        output_root,
+    )
+    job.write_event(
+        "dataset_merge_final_started",
+        dataset_id=dataset_id,
+        source_dataset_ids=source_dataset_ids,
+        teacher_engine=teacher_engine,
+        teacher_level=teacher_level,
+        dedupe_sample_ids=dedupe_sample_ids,
+        output_dir=str(output_root),
+    )
+
+    split_summary: dict[str, dict[str, int]] = {}
+    merge_breakdown: dict[str, dict[str, int]] = {}
+    total_labeled_samples = 0
+    source_sampled_roots = [str(entry.get("sampled_root", "")) for entry in source_entries if str(entry.get("sampled_root", "")).strip()]
+    label_cache_dirs = [str(entry.get("label_cache_dir", "")) for entry in source_entries if str(entry.get("label_cache_dir", "")).strip()]
+
+    for split_name in ("train", "validation", "test"):
+        split_paths: list[Path] = []
+        for entry in source_entries:
+            output_dir = Path(str(entry["output_dir"]))
+            split_path = output_dir / f"{split_name}.npz"
+            if not split_path.exists():
+                raise FileNotFoundError(f"Split introuvable pour {entry['dataset_id']}: {split_path}")
+            split_paths.append(split_path)
+
+        job.logger.info(
+            "dataset final merge split started | split=%s | source_files=%s",
+            split_name,
+            len(split_paths),
+        )
+        merged_arrays, split_metrics = _merge_npz_splits(split_paths, dedupe_sample_ids=dedupe_sample_ids)
+        np.savez_compressed(output_root / f"{split_name}.npz", **merged_arrays)
+        split_summary[split_name] = {
+            "games": int(split_metrics["unique_games"]),
+            "samples": int(split_metrics["kept_samples"]),
+        }
+        merge_breakdown[split_name] = split_metrics
+        total_labeled_samples += int(split_metrics["kept_samples"])
+        job.logger.info(
+            "dataset final merge split completed | split=%s | kept_samples=%s | duplicate_samples=%s | unique_games=%s | path=%s",
+            split_name,
+            split_metrics["kept_samples"],
+            split_metrics["duplicate_samples"],
+            split_metrics["unique_games"],
+            output_root / f"{split_name}.npz",
+        )
+
+    metadata = _register_built_dataset(
+        job,
+        dataset_id=dataset_id,
+        source_dataset_id=source_dataset_ids[0],
+        source_dataset_ids=source_dataset_ids,
+        sampled_root=Path(source_sampled_roots[0]) if source_sampled_roots else output_root,
+        output_root=output_root,
+        label_cache_dir=Path(label_cache_dirs[0]) if label_cache_dirs else output_root,
+        teacher_engine=teacher_engine,
+        teacher_level=teacher_level,
+        split_summary=split_summary,
+        labeled_samples=total_labeled_samples,
+        target_labeled_samples=total_labeled_samples,
+        build_mode="merged_final",
+        parent_dataset_ids=source_dataset_ids,
+    )
+    metadata["merge_breakdown"] = merge_breakdown
+    metadata["dedupe_sample_ids"] = dedupe_sample_ids
+    metadata["source_dataset_ids"] = source_dataset_ids
+    _write_json(output_root / "dataset_metadata.json", metadata)
+
+    summary = {
+        "job_id": job.job_id,
+        "dataset_id": dataset_id,
+        "build_mode": "merged_final",
+        "source_dataset_ids": source_dataset_ids,
+        "teacher_engine": teacher_engine,
+        "teacher_level": teacher_level,
+        "dedupe_sample_ids": dedupe_sample_ids,
+        "splits": split_summary,
+        "merge_breakdown": merge_breakdown,
+        "output_dir": str(output_root),
+        "labeled_samples": total_labeled_samples,
+    }
+    _write_json(merge_dir / "dataset_merge_final_summary.json", summary)
+    job.logger.info(
+        "dataset final merge completed | dataset=%s | sources=%s | train=%s | validation=%s | test=%s | labeled_samples=%s",
+        dataset_id,
+        len(source_dataset_ids),
+        split_summary.get("train", {}).get("samples", 0),
+        split_summary.get("validation", {}).get("samples", 0),
+        split_summary.get("test", {}).get("samples", 0),
+        total_labeled_samples,
+    )
+    job.write_event(
+        "dataset_merge_final_completed",
+        dataset_id=dataset_id,
+        source_dataset_ids=source_dataset_ids,
+        labeled_samples=total_labeled_samples,
+    )
+    job.write_metric({"metric_type": "dataset_merge_final_completed", "dataset_id": dataset_id, "labeled_samples": total_labeled_samples})
     return summary

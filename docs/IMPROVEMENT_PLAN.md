@@ -295,12 +295,24 @@ Etat:
   - `--generation-mode benchmatch`
   - `--generation-mode clone_existing`
   - `--generation-mode derive_existing`
+  - `--generation-mode merge_existing`
   - `--dataset-source-id`
   - `--source-dataset-id`
+  - `--source-dataset-ids`
   - `--derivation-strategy`
+  - `--target-samples`
 - `dataset-build` supporte maintenant:
   - `--source-dataset-id`
   - `--dataset-id-override`
+  - `--target-labeled-samples`
+- `dataset-merge-final` supporte maintenant:
+  - `--dataset-id`
+  - `--source-dataset-ids`
+  - `--include-all-built`
+  - `--dedupe-sample-ids`
+- une commande de listing est disponible:
+  - `dataset-list`
+  - pour voir rapidement les sources et datasets deja enregistres
 - les metadonnees sont enregistrees dans:
   - `data/dataset_registry.json`
 
@@ -318,6 +330,44 @@ Recommandation simple:
 - `benchmatch` pour produire un nouveau corpus source fiable
 - `clone_existing` pour versionner une copie de travail
 - `derive_existing` pour fabriquer rapidement une variante utile sans relancer les matchs
+- `merge_existing` pour construire un `giant dataset source` a partir de plusieurs sources deja versionnees
+
+### Gestion dataset en place
+
+Commandes utiles des maintenant:
+
+- lister toutes les sources et tous les datasets:
+  - `python -m songo_model_stockfish.cli.main dataset-list --config config/dataset_generation.full_matrix.colab_pro.yaml`
+- lister uniquement les sources:
+  - `python -m songo_model_stockfish.cli.main dataset-list --config config/dataset_generation.full_matrix.colab_pro.yaml --kind sources`
+- lister uniquement les datasets finaux:
+  - `python -m songo_model_stockfish.cli.main dataset-list --config config/dataset_generation.full_matrix.colab_pro.yaml --kind built`
+- sortie JSON exploitable dans un notebook ou un script:
+  - `python -m songo_model_stockfish.cli.main dataset-list --config config/dataset_generation.full_matrix.colab_pro.yaml --json`
+- generer une source cible a `2_000_000` positions:
+  - `python -m songo_model_stockfish.cli.main dataset-generate --config config/dataset_generation.full_matrix.colab_pro.yaml --target-samples 2000000`
+- fusionner plusieurs sources deja versionnees en une nouvelle grande source:
+  - `python -m songo_model_stockfish.cli.main dataset-generate --config config/dataset_generation.full_matrix.colab_pro.yaml --generation-mode merge_existing --dataset-source-id sampled_full_matrix_colab_pro_giant --source-dataset-ids sampled_full_matrix_colab_pro sampled_full_matrix_colab_pro_unique`
+- construire un dataset final cible a `2_000_000` labels:
+  - `python -m songo_model_stockfish.cli.main dataset-build --config config/dataset_build.full_matrix.colab_pro.yaml --target-labeled-samples 2000000`
+- fusionner tous les datasets finaux existants en un nouveau dataset versionne:
+  - `python -m songo_model_stockfish.cli.main dataset-merge-final --config config/dataset_merge_final.colab_pro.yaml --dataset-id dataset_merged_final_colab_pro_insane_1m --include-all-built`
+
+Cette commande permet de verifier rapidement:
+
+- les sources disponibles
+- leur mode de creation
+- leur parent eventuel
+- les variantes deja construites
+- le teacher utilise pour les datasets finaux
+
+Important:
+
+- `target_samples` pilote la taille de la source dataset produite par `dataset-generate`
+- `target_labeled_samples` pilote la taille du dataset final teacher-labeled produit par `dataset-build`
+- pour viser un dataset final `2M`, il est en pratique recommande d'aligner les deux cibles a `2_000_000`
+- `merge_existing` deduplique par `sample_id` par defaut
+- `merge_existing` range les fichiers fusionnes par sous-dossier `dataset_source_id` pour eviter les collisions de chemins entre sources
 
 ### Ameliorations recommandees sur la gestion dataset
 
@@ -334,9 +384,6 @@ Recommandation simple:
   - taille effective
   - teacher
   - tags libres comme `dedup`, `balanced`, `rare_positions`
-- ajouter plus tard une commande de listing:
-  - `dataset-list`
-  - pour voir rapidement les sources et datasets disponibles
 
 Conventions recommandees des maintenant:
 
@@ -414,11 +461,32 @@ Ce mode `derive_existing` serait ideal pour:
   - `dataset_id`
   - teacher utilise
   - taille finale reelle des splits
+- logger aussi:
+  - `build_mode=teacher_label`
+  - `output_dir`
+  - pour une fusion finale: nombre de datasets sources, doublons retires, taille finale par split
 - ajouter plus tard un mini resume des top-level metrics:
   - samples train
   - samples validation
   - samples test
   - skipped ratios
+
+### Ameliorations deja ajoutees sur les datasets finaux
+
+- les datasets finaux enregistres dans le registre portent maintenant aussi:
+  - `build_mode`
+  - `source_dataset_ids`
+  - `parent_dataset_ids`
+  - `dataset_version`
+- `dataset-build` logge plus clairement:
+  - `source_dataset_id`
+  - `output_dir`
+  - `build_mode`
+- `dataset-merge-final` permet maintenant de:
+  - fusionner plusieurs datasets finaux teachers identiques
+  - ou fusionner directement tous les datasets finaux du registre
+  - dedupliquer les `sample_ids` pendant la fusion
+  - produire un nouveau dataset final versionne et re-enregistre dans le registre
 
 ### Ameliorations recommandees sur le notebook
 

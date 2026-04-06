@@ -22,7 +22,9 @@ dataset_generation:
   source_mode: benchmatch
   dataset_source_id: sampled_full_matrix_colab_pro
   source_dataset_id: ""
+  source_dataset_ids: []
   derivation_strategy: unique_positions
+  merge_dedupe_sample_ids: true
   derivation_params:
     endgame_max_board_seeds: 24
     high_branching_min_legal_moves: 4

@@ -114,6 +114,7 @@ Le repo contient maintenant des configurations dediees a une machine Google Cola
 - `config/dataset_generation.colab_pro.yaml`
 - `config/dataset_build.colab_pro.yaml`
 - `config/dataset_build.full_matrix.colab_pro.yaml`
+- `config/dataset_merge_final.colab_pro.yaml`
 - `config/train.full_matrix.colab_pro.yaml`
 - `config/train.full_matrix.colab_pro.residual.yaml`
 - `config/evaluation.full_matrix.colab_pro.yaml`
@@ -146,10 +147,52 @@ Pour la construction du dataset final:
 - la config full matrix vise maintenant un dataset final `insane` dedie:
   - `dataset_v2_full_matrix_colab_pro_insane_1m`
 
+La gestion dataset supporte maintenant plusieurs modes:
+
+- `dataset-generate --generation-mode benchmatch`
+  - produit ou etend un corpus source fiable a partir de matchs
+- `dataset-generate --generation-mode clone_existing`
+  - duplique une source existante pour creer une nouvelle base versionnee
+- `dataset-generate --generation-mode derive_existing`
+  - cree une variante rapide a partir d'un corpus existant sans relancer les matchs
+- `dataset-generate --generation-mode merge_existing`
+  - fusionne plusieurs sources existantes en une nouvelle grande source dedupliquee
+- `dataset-build --source-dataset-id ...`
+  - permet de choisir explicitement la source a enrichir avec le teacher
+- `dataset-build --dataset-id-override ...`
+  - permet de versionner une nouvelle sortie sans modifier le YAML
+- `dataset-generate --target-samples ...`
+  - permet de choisir une taille cible comme `2000000` ou `3000000` au lancement
+- `dataset-build --target-labeled-samples ...`
+  - permet de choisir la taille cible du dataset final labelise au lancement
+- `dataset-merge-final --dataset-id ... --include-all-built`
+  - permet de fusionner tous les datasets finaux existants en un nouveau dataset final versionne
+- `dataset-merge-final --dataset-id ... --source-dataset-ids ...`
+  - permet de fusionner seulement une selection de datasets finaux
+- `dataset-list`
+  - affiche les sources et datasets deja enregistres dans le registre
+
+Strategies de derivation deja disponibles:
+
+- `unique_positions`
+- `endgame_focus`
+- `high_branching`
+
+Pour les datasets finaux teacher-labeled:
+
+- `dataset-build` produit les fichiers:
+  - `train.npz`
+  - `validation.npz`
+  - `test.npz`
+- `dataset-merge-final` peut maintenant fusionner ces datasets finaux entre eux
+- la fusion conserve un nouveau dataset final versionne
+- les `sample_ids` peuvent etre dedupliques automatiquement pour eviter un gros dataset artificiellement duplique
+
 Donc:
 
 - on conserve les positions deja generees
 - on ne repart pas de zero sur le corpus brut
+- on peut maintenant composer une grande source a partir de plusieurs sources deja versionnees
 - mais on reconstruit les labels finaux avec un teacher plus fort et un objectif de plus grande echelle
 
 ## Workflow Colab
@@ -181,6 +224,10 @@ Principe recommande:
 - artefacts persistants dans `/content/drive/MyDrive/songo-stockfish`
 - mise a jour Git sur le worktree uniquement
 - datasets, checkpoints, jobs, rapports et logs uniquement sur Drive
+
+Commande utile pour voir rapidement ce qui existe deja:
+
+- `python -m songo_model_stockfish.cli.main dataset-list --config config/dataset_generation.full_matrix.colab_pro.yaml`
 
 ## Continuer Un Modele
 
