@@ -432,28 +432,41 @@ def _augment_existing_dataset_source(
     duplicate_samples = 0
     copied_raw_files = 0
     next_augmented_sample_index = 0
+    augmentation_depth_breakdown: dict[str, int] = {}
+    source_file_breakdown: dict[str, dict[str, int]] = {}
 
     for source_sampled_file in sorted(source_sampled_dir.rglob("*.jsonl")):
         if target_samples > 0 and selected_samples >= target_samples:
             break
         scanned_files += 1
         relative_path = source_sampled_file.relative_to(source_sampled_dir)
+        relative_name = str(relative_path)
         kept_samples: list[dict[str, Any]] = []
+        file_stats = {
+            "scanned_samples": 0,
+            "selected_original_samples": 0,
+            "selected_augmented_samples": 0,
+            "duplicate_samples": 0,
+            "max_depth_reached": 0,
+        }
 
         for sample in _iter_jsonl(source_sampled_file):
             if target_samples > 0 and selected_samples >= target_samples:
                 break
             scanned_samples += 1
+            file_stats["scanned_samples"] += 1
 
             sample_signature = _sample_position_signature(sample)
             if include_original_samples:
                 if sample_signature in seen_signatures:
                     duplicate_samples += 1
+                    file_stats["duplicate_samples"] += 1
                 else:
                     kept_samples.append(sample)
                     seen_signatures.add(sample_signature)
                     selected_samples += 1
                     selected_original_samples += 1
+                    file_stats["selected_original_samples"] += 1
                     if target_samples > 0 and selected_samples >= target_samples:
                         break
 
@@ -495,6 +508,7 @@ def _augment_existing_dataset_source(
                     augmented_signature = _sample_position_signature(augmented_sample)
                     if augmented_signature in seen_signatures or augmented_signature in local_signatures:
                         duplicate_samples += 1
+                        file_stats["duplicate_samples"] += 1
                         continue
 
                     local_signatures.add(augmented_signature)
@@ -507,7 +521,11 @@ def _augment_existing_dataset_source(
                     kept_samples.append(augmented_sample)
                     selected_samples += 1
                     selected_augmented_samples += 1
+                    file_stats["selected_augmented_samples"] += 1
                     generated_from_sample += 1
+                    depth_key = str(current_depth + 1)
+                    augmentation_depth_breakdown[depth_key] = augmentation_depth_breakdown.get(depth_key, 0) + 1
+                    file_stats["max_depth_reached"] = max(file_stats["max_depth_reached"], current_depth + 1)
 
                     if current_depth + 1 < max_depth:
                         frontier.append((next_state, current_depth + 1, lineage_moves + [int(move)]))
@@ -528,6 +546,8 @@ def _augment_existing_dataset_source(
                     shutil.copy2(source_raw_file, target_raw_file)
                     copied_raw_files += 1
 
+        source_file_breakdown[relative_name] = file_stats
+
     return {
         "scanned_files": scanned_files,
         "scanned_samples": scanned_samples,
@@ -537,6 +557,8 @@ def _augment_existing_dataset_source(
         "selected_augmented_samples": selected_augmented_samples,
         "duplicate_samples": duplicate_samples,
         "copied_raw_files": copied_raw_files,
+        "augmentation_depth_breakdown": augmentation_depth_breakdown,
+        "source_file_breakdown": source_file_breakdown,
         "augmentation_params": {
             "include_original_samples": include_original_samples,
             "max_depth": max_depth,
