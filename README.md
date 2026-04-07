@@ -156,6 +156,8 @@ La gestion dataset supporte maintenant plusieurs modes:
   - duplique une source existante pour creer une nouvelle base versionnee
 - `dataset-generate --generation-mode derive_existing`
   - cree une variante rapide a partir d'un corpus existant sans relancer les matchs
+- `dataset-generate --generation-mode augment_existing`
+  - cree une nouvelle grande source en rejouant des coups legaux a partir d'un corpus existant, avec deduplication par etat
 - `dataset-generate --generation-mode merge_existing`
   - fusionne plusieurs sources existantes en une nouvelle grande source dedupliquee
 - `dataset-build --source-dataset-id ...`

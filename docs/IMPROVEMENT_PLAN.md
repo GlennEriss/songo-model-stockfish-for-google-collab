@@ -355,6 +355,7 @@ Etat:
   - `--generation-mode benchmatch`
   - `--generation-mode clone_existing`
   - `--generation-mode derive_existing`
+  - `--generation-mode augment_existing`
   - `--generation-mode merge_existing`
   - `--dataset-source-id`
   - `--source-dataset-id`
@@ -390,6 +391,7 @@ Recommandation simple:
 - `benchmatch` pour produire un nouveau corpus source fiable
 - `clone_existing` pour versionner une copie de travail
 - `derive_existing` pour fabriquer rapidement une variante utile sans relancer les matchs
+- `augment_existing` pour etendre une source existante en rejouant des coups legaux depuis les positions deja presentes, avec deduplication par etat
 - `merge_existing` pour construire un `giant dataset source` a partir de plusieurs sources deja versionnees
 
 ### Gestion dataset en place
@@ -406,6 +408,8 @@ Commandes utiles des maintenant:
   - `python -m songo_model_stockfish.cli.main dataset-list --config config/dataset_generation.full_matrix.colab_pro.yaml --json`
 - generer une source cible a `2_000_000` positions:
   - `python -m songo_model_stockfish.cli.main dataset-generate --config config/dataset_generation.full_matrix.colab_pro.yaml --target-samples 2000000`
+- generer une source augmentee cible a `10_000_000` positions depuis une source existante:
+  - `python -m songo_model_stockfish.cli.main dataset-generate --config config/dataset_generation.full_matrix.colab_pro.yaml --generation-mode augment_existing --dataset-source-id sampled_full_matrix_colab_pro_aug_10m --source-dataset-id sampled_full_matrix_colab_pro --target-samples 10000000 --augmentation-include-original-samples --augmentation-max-depth 2 --augmentation-max-branching 3 --augmentation-max-generated-per-source-sample 8`
 - fusionner plusieurs sources deja versionnees en une nouvelle grande source:
   - `python -m songo_model_stockfish.cli.main dataset-generate --config config/dataset_generation.full_matrix.colab_pro.yaml --generation-mode merge_existing --dataset-source-id sampled_full_matrix_colab_pro_giant --source-dataset-ids sampled_full_matrix_colab_pro sampled_full_matrix_colab_pro_unique`
 - construire un dataset final cible a `2_000_000` labels:

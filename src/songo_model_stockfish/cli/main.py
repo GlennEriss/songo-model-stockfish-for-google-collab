@@ -11,6 +11,7 @@ from songo_model_stockfish.ops.paths import build_project_paths
 
 def _apply_dataset_generate_overrides(config: dict[str, object], args: argparse.Namespace) -> dict[str, object]:
     dataset_cfg = dict(config.get("dataset_generation", {}))
+    derivation_params = dict(dataset_cfg.get("derivation_params", {}))
     if getattr(args, "generation_mode", None):
         dataset_cfg["source_mode"] = args.generation_mode
     if getattr(args, "dataset_source_id", None):
@@ -21,6 +22,15 @@ def _apply_dataset_generate_overrides(config: dict[str, object], args: argparse.
         dataset_cfg["source_dataset_ids"] = [item.strip() for item in str(args.source_dataset_ids).split(",") if item.strip()]
     if getattr(args, "derivation_strategy", None):
         dataset_cfg["derivation_strategy"] = args.derivation_strategy
+    if getattr(args, "augmentation_include_original_samples", None) is not None:
+        derivation_params["include_original_samples"] = bool(args.augmentation_include_original_samples)
+    if getattr(args, "augmentation_max_depth", None) is not None:
+        derivation_params["max_depth"] = int(args.augmentation_max_depth)
+    if getattr(args, "augmentation_max_branching", None) is not None:
+        derivation_params["max_branching"] = int(args.augmentation_max_branching)
+    if getattr(args, "augmentation_max_generated_per_source_sample", None) is not None:
+        derivation_params["max_generated_per_source_sample"] = int(args.augmentation_max_generated_per_source_sample)
+    dataset_cfg["derivation_params"] = derivation_params
     if getattr(args, "target_samples", None) is not None:
         dataset_cfg["target_samples"] = int(args.target_samples)
     if getattr(args, "merge_dedupe_sample_ids", None) is not None:
@@ -198,12 +208,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     dataset_generate = subparsers.add_parser("dataset-generate")
     _add_common_arguments(dataset_generate)
-    dataset_generate.add_argument("--generation-mode", choices=["benchmatch", "clone_existing", "derive_existing", "merge_existing"])
+    dataset_generate.add_argument("--generation-mode", choices=["benchmatch", "clone_existing", "derive_existing", "augment_existing", "merge_existing"])
     dataset_generate.add_argument("--dataset-source-id")
     dataset_generate.add_argument("--source-dataset-id")
     dataset_generate.add_argument("--source-dataset-ids", nargs="*")
     dataset_generate.add_argument("--derivation-strategy", choices=["unique_positions", "endgame_focus", "high_branching"])
     dataset_generate.add_argument("--target-samples", type=int)
+    dataset_generate.add_argument("--augmentation-include-original-samples", dest="augmentation_include_original_samples", action="store_true", default=None)
+    dataset_generate.add_argument("--augmentation-only-new-samples", dest="augmentation_include_original_samples", action="store_false")
+    dataset_generate.add_argument("--augmentation-max-depth", type=int)
+    dataset_generate.add_argument("--augmentation-max-branching", type=int)
+    dataset_generate.add_argument("--augmentation-max-generated-per-source-sample", type=int)
     dataset_generate.add_argument("--merge-dedupe-sample-ids", dest="merge_dedupe_sample_ids", action="store_true", default=None)
     dataset_generate.add_argument("--keep-duplicate-sample-ids", dest="merge_dedupe_sample_ids", action="store_false")
 

@@ -28,6 +28,10 @@ dataset_generation:
   derivation_params:
     endgame_max_board_seeds: 24
     high_branching_min_legal_moves: 4
+    include_original_samples: true
+    max_depth: 2
+    max_branching: 3
+    max_generated_per_source_sample: 8
   matchups:
     - minimax:medium vs minimax:medium
     - minimax:medium vs minimax:hard

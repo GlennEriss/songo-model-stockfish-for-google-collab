@@ -404,6 +404,148 @@ def _derive_existing_dataset_source(
     }
 
 
+def _augment_existing_dataset_source(
+    *,
+    source_entry: dict[str, Any],
+    target_raw_dir: Path,
+    target_sampled_dir: Path,
+    target_samples: int,
+    augmentation_params: dict[str, Any],
+) -> dict[str, Any]:
+    source_raw_dir = Path(str(source_entry["raw_dir"]))
+    source_sampled_dir = Path(str(source_entry["sampled_dir"]))
+    target_raw_dir.mkdir(parents=True, exist_ok=True)
+    target_sampled_dir.mkdir(parents=True, exist_ok=True)
+
+    include_original_samples = bool(augmentation_params.get("include_original_samples", True))
+    max_depth = max(1, int(augmentation_params.get("max_depth", 2)))
+    max_branching = max(1, int(augmentation_params.get("max_branching", 3)))
+    max_generated_per_source_sample = max(1, int(augmentation_params.get("max_generated_per_source_sample", 8)))
+
+    seen_signatures: set[str] = set()
+    scanned_files = 0
+    scanned_samples = 0
+    selected_files = 0
+    selected_samples = 0
+    selected_original_samples = 0
+    selected_augmented_samples = 0
+    duplicate_samples = 0
+    copied_raw_files = 0
+    next_augmented_sample_index = 0
+
+    for source_sampled_file in sorted(source_sampled_dir.rglob("*.jsonl")):
+        if target_samples > 0 and selected_samples >= target_samples:
+            break
+        scanned_files += 1
+        relative_path = source_sampled_file.relative_to(source_sampled_dir)
+        kept_samples: list[dict[str, Any]] = []
+
+        for sample in _iter_jsonl(source_sampled_file):
+            if target_samples > 0 and selected_samples >= target_samples:
+                break
+            scanned_samples += 1
+
+            sample_signature = _sample_position_signature(sample)
+            if include_original_samples:
+                if sample_signature in seen_signatures:
+                    duplicate_samples += 1
+                else:
+                    kept_samples.append(sample)
+                    seen_signatures.add(sample_signature)
+                    selected_samples += 1
+                    selected_original_samples += 1
+                    if target_samples > 0 and selected_samples >= target_samples:
+                        break
+
+            runtime_state = _raw_state_to_runtime_state(sample["state"])
+            frontier: list[tuple[Any, int, list[int]]] = [(runtime_state, 0, [])]
+            generated_from_sample = 0
+            local_signatures: set[str] = {sample_signature}
+
+            while frontier and generated_from_sample < max_generated_per_source_sample:
+                if target_samples > 0 and selected_samples >= target_samples:
+                    break
+                current_state, current_depth, lineage_moves = frontier.pop(0)
+                if current_depth >= max_depth:
+                    continue
+                legal_moves = list(songo_ai_game.legal_moves(current_state))
+                if not legal_moves:
+                    continue
+
+                for move in legal_moves[:max_branching]:
+                    if target_samples > 0 and selected_samples >= target_samples:
+                        break
+                    if generated_from_sample >= max_generated_per_source_sample:
+                        break
+
+                    next_state = songo_ai_game.simulate_move(current_state, int(move))
+                    augmented_sample = _sample_position(
+                        game_id=f"aug_{sample['game_id']}",
+                        matchup_id=f"{sample.get('matchup_id', 'derived')}_aug",
+                        sample_index=next_augmented_sample_index,
+                        ply=int(sample.get("ply", 0)) + current_depth + 1,
+                        seed=int(sample.get("seed", 0)),
+                        state=next_state,
+                    )
+                    next_augmented_sample_index += 1
+
+                    if bool(augmented_sample["state"].get("is_terminal", False)) or not augmented_sample["legal_moves"]:
+                        continue
+
+                    augmented_signature = _sample_position_signature(augmented_sample)
+                    if augmented_signature in seen_signatures or augmented_signature in local_signatures:
+                        duplicate_samples += 1
+                        continue
+
+                    local_signatures.add(augmented_signature)
+                    seen_signatures.add(augmented_signature)
+                    augmented_sample["source_engine"] = "augment_existing"
+                    augmented_sample["source_level"] = "derived"
+                    augmented_sample["augmented_from_sample_id"] = str(sample.get("sample_id", ""))
+                    augmented_sample["augmentation_depth"] = current_depth + 1
+                    augmented_sample["augmentation_lineage_moves"] = lineage_moves + [int(move)]
+                    kept_samples.append(augmented_sample)
+                    selected_samples += 1
+                    selected_augmented_samples += 1
+                    generated_from_sample += 1
+
+                    if current_depth + 1 < max_depth:
+                        frontier.append((next_state, current_depth + 1, lineage_moves + [int(move)]))
+
+        if kept_samples:
+            target_sampled_file = target_sampled_dir / relative_path
+            target_sampled_file.parent.mkdir(parents=True, exist_ok=True)
+            with target_sampled_file.open("w", encoding="utf-8") as handle:
+                for kept_sample in kept_samples:
+                    handle.write(json.dumps(kept_sample, ensure_ascii=True) + "\n")
+            selected_files += 1
+
+            if source_raw_dir.exists():
+                source_raw_file = source_raw_dir / relative_path.with_suffix(".json")
+                target_raw_file = target_raw_dir / relative_path.with_suffix(".json")
+                if source_raw_file.exists() and not target_raw_file.exists():
+                    target_raw_file.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source_raw_file, target_raw_file)
+                    copied_raw_files += 1
+
+    return {
+        "scanned_files": scanned_files,
+        "scanned_samples": scanned_samples,
+        "selected_files": selected_files,
+        "selected_samples": selected_samples,
+        "selected_original_samples": selected_original_samples,
+        "selected_augmented_samples": selected_augmented_samples,
+        "duplicate_samples": duplicate_samples,
+        "copied_raw_files": copied_raw_files,
+        "augmentation_params": {
+            "include_original_samples": include_original_samples,
+            "max_depth": max_depth,
+            "max_branching": max_branching,
+            "max_generated_per_source_sample": max_generated_per_source_sample,
+        },
+    }
+
+
 def _merge_existing_dataset_sources(
     *,
     source_entries: list[dict[str, Any]],
@@ -1123,7 +1265,7 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
     raw_dir.mkdir(parents=True, exist_ok=True)
     sampled_dir.mkdir(parents=True, exist_ok=True)
 
-    if source_mode not in {"benchmatch", "clone_existing", "derive_existing", "merge_existing"}:
+    if source_mode not in {"benchmatch", "clone_existing", "derive_existing", "augment_existing", "merge_existing"}:
         raise ValueError(f"Unsupported dataset generation source_mode: {source_mode}")
 
     if source_mode == "clone_existing":
@@ -1247,6 +1389,71 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
                 "derivation_strategy": derivation_strategy,
                 "selected_files": derived_summary["selected_files"],
                 "selected_samples": derived_summary["selected_samples"],
+            }
+        )
+        return summary
+
+    if source_mode == "augment_existing":
+        if not source_dataset_id:
+            raise ValueError("`source_dataset_id` est requis quand `source_mode=augment_existing`")
+        source_entry = _resolve_dataset_source(job, source_dataset_id)
+        augmented_summary = _augment_existing_dataset_source(
+            source_entry=source_entry,
+            target_raw_dir=raw_dir,
+            target_sampled_dir=sampled_dir,
+            target_samples=target_samples,
+            augmentation_params=derivation_params,
+        )
+        metadata = _register_dataset_source(
+            job,
+            dataset_source_id=dataset_source_id,
+            source_mode=source_mode,
+            raw_dir=raw_dir,
+            sampled_dir=sampled_dir,
+            target_samples=target_samples,
+            games_per_matchup=games,
+            sample_every_n_plies=sample_every_n_plies,
+            matchups=[str(matchup) for matchup in matchups],
+            source_dataset_id=source_dataset_id,
+            derivation_params=augmented_summary["augmentation_params"],
+        )
+        summary = {
+            "job_id": job.job_id,
+            "dataset_source_id": dataset_source_id,
+            "source_mode": source_mode,
+            "source_dataset_id": source_dataset_id,
+            **augmented_summary,
+            "raw_dir": str(raw_dir),
+            "sampled_dir": str(sampled_dir),
+            "total_samples": int(metadata["sampled_positions"]),
+        }
+        _write_json(dataset_dir / "dataset_generation_summary.json", summary)
+        job.logger.info(
+            "dataset generation augmented existing source | source_dataset_id=%s | dataset_source_id=%s | selected_original_samples=%s | selected_augmented_samples=%s | duplicate_samples=%s | total_samples=%s",
+            source_dataset_id,
+            dataset_source_id,
+            augmented_summary["selected_original_samples"],
+            augmented_summary["selected_augmented_samples"],
+            augmented_summary["duplicate_samples"],
+            metadata["sampled_positions"],
+        )
+        job.write_event(
+            "dataset_generation_augmented_existing",
+            source_dataset_id=source_dataset_id,
+            dataset_source_id=dataset_source_id,
+            selected_original_samples=augmented_summary["selected_original_samples"],
+            selected_augmented_samples=augmented_summary["selected_augmented_samples"],
+            duplicate_samples=augmented_summary["duplicate_samples"],
+        )
+        job.write_metric(
+            {
+                "metric_type": "dataset_generation_augmented_existing",
+                "source_dataset_id": source_dataset_id,
+                "dataset_source_id": dataset_source_id,
+                "selected_original_samples": augmented_summary["selected_original_samples"],
+                "selected_augmented_samples": augmented_summary["selected_augmented_samples"],
+                "duplicate_samples": augmented_summary["duplicate_samples"],
+                "total_samples": int(metadata["sampled_positions"]),
             }
         )
         return summary
