@@ -35,6 +35,15 @@ def _resolve_storage_path(base: Path, configured: str | None, fallback: Path) ->
     return base / path
 
 
+def _default_raw_dir_name_for_dataset_source(dataset_source_id: str) -> str:
+    if dataset_source_id.startswith("sampled_"):
+        return "raw_" + dataset_source_id[len("sampled_") :]
+    if dataset_source_id.startswith("data/"):
+        leaf = Path(dataset_source_id).name
+        return _default_raw_dir_name_for_dataset_source(leaf)
+    return f"raw_{dataset_source_id}"
+
+
 def _dataset_registry_path(job: JobContext) -> Path:
     return job.paths.data_root / "dataset_registry.json"
 
@@ -1293,10 +1302,32 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
     target_samples = int(cfg.get("target_samples", 0))
 
     dataset_dir = job.job_dir / "dataset_generation"
-    raw_dir = _resolve_storage_path(job.paths.drive_root, cfg.get("output_raw_dir"), dataset_dir / "raw_match_logs")
-    sampled_dir = _resolve_storage_path(job.paths.drive_root, cfg.get("output_sampled_dir"), dataset_dir / "sampled_positions")
+    configured_output_raw_dir = cfg.get("output_raw_dir")
+    configured_output_sampled_dir = cfg.get("output_sampled_dir")
+    raw_dir = _resolve_storage_path(job.paths.drive_root, configured_output_raw_dir, dataset_dir / "raw_match_logs")
+    sampled_dir = _resolve_storage_path(job.paths.drive_root, configured_output_sampled_dir, dataset_dir / "sampled_positions")
+
+    if source_mode != "benchmatch":
+        sampled_dir = _resolve_storage_path(
+            job.paths.drive_root,
+            None,
+            job.paths.data_root / dataset_source_id,
+        )
+        raw_dir = _resolve_storage_path(
+            job.paths.drive_root,
+            None,
+            job.paths.data_root / _default_raw_dir_name_for_dataset_source(dataset_source_id),
+        )
     raw_dir.mkdir(parents=True, exist_ok=True)
     sampled_dir.mkdir(parents=True, exist_ok=True)
+
+    if source_mode != "benchmatch":
+        job.logger.info(
+            "dataset generation output isolation enabled | dataset_source_id=%s | isolated_raw_dir=%s | isolated_sampled_dir=%s",
+            dataset_source_id,
+            raw_dir,
+            sampled_dir,
+        )
 
     job.logger.info(
         "dataset generation startup | source_mode=%s | dataset_source_id=%s | source_dataset_id=%s | source_dataset_ids=%s | target_samples=%s | output_raw_dir=%s | output_sampled_dir=%s | workers=%s | max_pending_futures=%s",
