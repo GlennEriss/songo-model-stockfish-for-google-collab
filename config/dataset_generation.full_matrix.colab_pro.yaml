@@ -3,7 +3,7 @@ project:
 
 runtime:
   seed: 42
-  num_workers: 8
+  num_workers: 16
   multiprocessing_start_method: spawn
   max_tasks_per_child: 25
 
