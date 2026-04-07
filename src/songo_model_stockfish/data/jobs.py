@@ -987,20 +987,116 @@ def _normalize_value(value: float) -> float:
     return float(np.tanh(clipped / 200.0))
 
 
-def _build_policy_distribution(best_move: int, legal_moves: list[int]) -> dict[str, float]:
+def _build_policy_distribution_from_scores(
+    legal_moves: list[int],
+    move_scores: dict[int, float],
+    *,
+    temperature: float = 0.35,
+) -> dict[str, float]:
     distribution = {str(move): 0.0 for move in legal_moves}
     if not legal_moves:
         return distribution
-    if best_move not in legal_moves:
-        best_move = legal_moves[0]
     if len(legal_moves) == 1:
-        distribution[str(best_move)] = 1.0
+        distribution[str(legal_moves[0])] = 1.0
         return distribution
-    off_value = 0.25 / float(len(legal_moves) - 1)
-    for move in legal_moves:
-        distribution[str(move)] = off_value
-    distribution[str(best_move)] = 0.75
+
+    logits = np.asarray(
+        [_normalize_value(move_scores.get(int(move), 0.0)) / max(temperature, 1e-6) for move in legal_moves],
+        dtype=np.float64,
+    )
+    logits -= float(np.max(logits))
+    weights = np.exp(logits)
+    total = float(np.sum(weights))
+    if not np.isfinite(total) or total <= 0.0:
+        uniform = 1.0 / float(len(legal_moves))
+        for move in legal_moves:
+            distribution[str(move)] = uniform
+        return distribution
+
+    probs = weights / total
+    for move, prob in zip(legal_moves, probs.tolist()):
+        distribution[str(move)] = float(prob)
     return distribution
+
+
+def _build_tactical_analysis(
+    runtime_state: Any,
+    legal_moves: list[int],
+    move_scores: dict[int, float],
+    *,
+    best_move: int,
+) -> dict[str, Any]:
+    root_player = int(runtime_state["current_player"])
+    opponent = 1 - root_player
+    root_scores = list(runtime_state["scores"])
+    root_player_score = int(root_scores[root_player])
+    root_opponent_score = int(root_scores[opponent])
+
+    per_move: dict[str, dict[str, Any]] = {}
+    capture_moves_count = 0
+    safe_moves_count = 0
+    risky_moves_count = 0
+    max_immediate_score_gain = 0
+    min_opponent_best_gain: int | None = None
+
+    for move in legal_moves:
+        next_state = songo_ai_game.simulate_move(runtime_state, int(move))
+        next_scores = list(next_state["scores"])
+        immediate_score_gain = int(next_scores[root_player]) - root_player_score
+        immediate_score_loss = int(next_scores[opponent]) - root_opponent_score
+        opponent_legal_moves = list(songo_ai_game.legal_moves(next_state))
+
+        opponent_best_immediate_gain = 0
+        opponent_capture_moves = 0
+        for opponent_move in opponent_legal_moves:
+            reply_state = songo_ai_game.simulate_move(next_state, int(opponent_move))
+            reply_scores = list(reply_state["scores"])
+            gain = int(reply_scores[opponent]) - int(next_scores[opponent])
+            if gain > 0:
+                opponent_capture_moves += 1
+            if gain > opponent_best_immediate_gain:
+                opponent_best_immediate_gain = gain
+
+        net_score_swing = int(immediate_score_gain) - int(opponent_best_immediate_gain)
+        has_immediate_capture = immediate_score_gain > 0
+        exposes_to_immediate_capture = opponent_best_immediate_gain > 0
+        if has_immediate_capture:
+            capture_moves_count += 1
+        if exposes_to_immediate_capture:
+            risky_moves_count += 1
+        else:
+            safe_moves_count += 1
+
+        max_immediate_score_gain = max(max_immediate_score_gain, int(immediate_score_gain))
+        if min_opponent_best_gain is None or opponent_best_immediate_gain < min_opponent_best_gain:
+            min_opponent_best_gain = int(opponent_best_immediate_gain)
+
+        per_move[str(move)] = {
+            "teacher_score": float(move_scores.get(int(move), 0.0)),
+            "immediate_score_gain": int(immediate_score_gain),
+            "immediate_score_loss": int(immediate_score_loss),
+            "has_immediate_capture": bool(has_immediate_capture),
+            "opponent_legal_moves_count": int(len(opponent_legal_moves)),
+            "opponent_capture_moves_count": int(opponent_capture_moves),
+            "opponent_best_immediate_gain": int(opponent_best_immediate_gain),
+            "exposes_to_immediate_capture": bool(exposes_to_immediate_capture),
+            "net_score_swing_next_ply": int(net_score_swing),
+        }
+
+    best_move_stats = per_move.get(str(best_move), {})
+    return {
+        "summary": {
+            "capture_moves_count": int(capture_moves_count),
+            "safe_moves_count": int(safe_moves_count),
+            "risky_moves_count": int(risky_moves_count),
+            "max_immediate_score_gain": int(max_immediate_score_gain),
+            "min_opponent_best_immediate_gain": int(min_opponent_best_gain or 0),
+            "best_move_has_immediate_capture": bool(best_move_stats.get("has_immediate_capture", False)),
+            "best_move_exposes_to_immediate_capture": bool(best_move_stats.get("exposes_to_immediate_capture", False)),
+            "best_move_net_score_swing_next_ply": int(best_move_stats.get("net_score_swing_next_ply", 0)),
+        },
+        "per_move": per_move,
+    }
 
 
 def _label_sample(sample: dict[str, Any], *, teacher_engine: str, teacher_level: str) -> dict[str, Any]:
@@ -1013,23 +1109,38 @@ def _label_sample(sample: dict[str, Any], *, teacher_engine: str, teacher_level:
     runtime_state = _raw_state_to_runtime_state(sample["state"])
     best_move, info = _teacher_choose(runtime_state, engine=teacher_engine, level=teacher_level)
     legal_moves = list(sample["legal_moves"])
-    if best_move not in legal_moves and legal_moves:
-        best_move = legal_moves[0]
-
-    teacher_score = 0.0
+    move_scores: dict[int, float] = {}
     if teacher_engine == "minimax":
-        teacher_score = float(info.get("score", 0.0))
+        move_scores = {int(move): float(score) for move, score in dict(info.get("root_scores", {})).items() if int(move) in legal_moves}
     elif teacher_engine == "mcts":
         root_q = info.get("root_q", {})
-        teacher_score = float(root_q.get(best_move, 0.0))
+        move_scores = {int(move): float(score) for move, score in dict(root_q).items() if int(move) in legal_moves}
+
+    if not move_scores:
+        fallback_score = float(info.get("score", 0.0))
+        move_scores = {int(move): fallback_score for move in legal_moves}
+
+    if best_move not in legal_moves and legal_moves:
+        best_move = legal_moves[0]
+    if legal_moves:
+        best_move = max(legal_moves, key=lambda move: float(move_scores.get(int(move), float("-inf"))))
+
+    teacher_score = float(move_scores.get(int(best_move), info.get("score", 0.0)))
 
     labeled = dict(sample)
     labeled["teacher_engine"] = teacher_engine
     labeled["teacher_level"] = teacher_level
+    labeled["teacher_move_scores"] = {str(move): float(move_scores.get(int(move), 0.0)) for move in legal_moves}
     labeled["policy_target"] = {
         "best_move": int(best_move),
-        "distribution": _build_policy_distribution(int(best_move), legal_moves),
+        "distribution": _build_policy_distribution_from_scores(legal_moves, move_scores),
     }
+    labeled["tactical_analysis"] = _build_tactical_analysis(
+        runtime_state,
+        legal_moves,
+        move_scores,
+        best_move=int(best_move),
+    )
     labeled["value_target"] = _normalize_value(teacher_score)
     return labeled
 

@@ -366,6 +366,12 @@ Etat:
   - `--source-dataset-id`
   - `--dataset-id-override`
   - `--target-labeled-samples`
+  - une policy target plus riche basee sur les scores teacher de tous les coups legaux
+  - `teacher_move_scores` dans les samples labelises
+  - `tactical_analysis` dans les samples labelises, avec:
+    - capture immediate possible
+    - risque de capture adverse au prochain coup
+    - variation de score nette sur le prochain ply
 - `dataset-merge-final` supporte maintenant:
   - `--dataset-id`
   - `--source-dataset-ids`

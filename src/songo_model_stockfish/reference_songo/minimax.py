@@ -225,6 +225,7 @@ def choose_move(state: State, cfg: SearchConfig = SearchConfig()) -> Tuple[int, 
     best_score = float("-inf")
     completed_depth = 0
     tt: Dict[TTKey, TTVal] = {}
+    best_root_scores: Dict[int, float] = {}
 
     for depth in range(1, cfg.max_depth + 1):
         if time.perf_counter() >= deadline:
@@ -238,12 +239,14 @@ def choose_move(state: State, cfg: SearchConfig = SearchConfig()) -> Tuple[int, 
         beta = float("inf")
         local_best_move = best_move
         local_best_score = float("-inf")
+        local_root_scores: Dict[int, float] = {}
 
         for m in search_moves:
             if time.perf_counter() >= deadline:
                 break
             s2 = simulate_move(state, m)
             score = _alphabeta(s2, depth - 1, alpha, beta, root_player, deadline, tt if cfg.use_tt else None, cfg.eval_mode)
+            local_root_scores[int(m)] = float(score)
             if score > local_best_score:
                 local_best_score = score
                 local_best_move = m
@@ -252,12 +255,14 @@ def choose_move(state: State, cfg: SearchConfig = SearchConfig()) -> Tuple[int, 
         if time.perf_counter() < deadline:
             best_move, best_score = local_best_move, local_best_score
             completed_depth = depth
+            best_root_scores = dict(local_root_scores)
 
     elapsed_ms = int((time.perf_counter() - start) * 1000)
     return best_move, {
         "time_ms": elapsed_ms,
         "depth_reached": completed_depth,
         "score": best_score,
+        "root_scores": best_root_scores,
         "eval_mode": cfg.eval_mode,
     }
 
@@ -320,4 +325,3 @@ def _alphabeta(
         tt[_hash_state(state, depth)] = (value, depth)
 
     return value
-
