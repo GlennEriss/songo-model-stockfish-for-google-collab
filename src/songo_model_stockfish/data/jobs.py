@@ -2101,13 +2101,35 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
     else:
         sampled_root = _resolve_storage_path(job.paths.drive_root, cfg.get("input_sampled_dir"), dataset_dir.parent / "dataset_generation" / "sampled_positions")
         source_dataset_id = Path(sampled_root).name
+    configured_label_cache_dir = cfg.get("label_cache_dir")
+    if configured_label_cache_dir:
+        configured_label_cache_path = Path(str(configured_label_cache_dir))
+        if configured_label_cache_path.name != dataset_id:
+            job.logger.info(
+                "dataset build label cache isolation enabled | dataset=%s | configured_label_cache_dir=%s | isolated_label_cache_dir=%s",
+                dataset_id,
+                configured_label_cache_path,
+                job.paths.data_root / "label_cache" / dataset_id,
+            )
+            configured_label_cache_dir = None
     label_cache_dir = _resolve_storage_path(
         job.paths.drive_root,
-        cfg.get("label_cache_dir"),
-        job.paths.data_root / "label_cache" / dataset_id / f"{teacher_engine}_{teacher_level}",
+        configured_label_cache_dir,
+        job.paths.data_root / "label_cache" / dataset_id,
     )
     labeled_root = label_cache_dir / "labeled_positions"
-    output_root = _resolve_storage_path(job.paths.drive_root, cfg.get("output_dir"), dataset_dir / "datasets" / dataset_id)
+    configured_output_dir = cfg.get("output_dir")
+    if configured_output_dir:
+        configured_output_path = Path(str(configured_output_dir))
+        if configured_output_path.name != dataset_id:
+            job.logger.info(
+                "dataset build output isolation enabled | dataset=%s | configured_output_dir=%s | isolated_output_dir=%s",
+                dataset_id,
+                configured_output_path,
+                job.paths.data_root / "datasets" / dataset_id,
+            )
+            configured_output_dir = None
+    output_root = _resolve_storage_path(job.paths.drive_root, configured_output_dir, job.paths.data_root / "datasets" / dataset_id)
     labeled_root.mkdir(parents=True, exist_ok=True)
     output_root.mkdir(parents=True, exist_ok=True)
     target_labeled_samples = int(cfg.get("target_labeled_samples", 0))
