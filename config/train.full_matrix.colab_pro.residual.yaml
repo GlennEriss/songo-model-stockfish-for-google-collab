@@ -4,7 +4,7 @@ project:
 runtime:
   device: cuda
   seed: 42
-  num_workers: 4
+  num_workers: 12
   pin_memory: true
   persistent_workers: true
   prefetch_factor: 4
