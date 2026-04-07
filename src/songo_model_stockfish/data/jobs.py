@@ -406,6 +406,7 @@ def _derive_existing_dataset_source(
 
 def _augment_existing_dataset_source(
     *,
+    job: JobContext,
     source_entry: dict[str, Any],
     target_raw_dir: Path,
     target_sampled_dir: Path,
@@ -547,6 +548,16 @@ def _augment_existing_dataset_source(
                     copied_raw_files += 1
 
         source_file_breakdown[relative_name] = file_stats
+        if scanned_files <= 3 or scanned_files % 100 == 0:
+            job.logger.info(
+                "dataset generation augment progress | files=%s | scanned_samples=%s | selected_samples=%s | selected_augmented_samples=%s | duplicate_samples=%s | last_file=%s",
+                scanned_files,
+                scanned_samples,
+                selected_samples,
+                selected_augmented_samples,
+                duplicate_samples,
+                relative_name,
+            )
 
     return {
         "scanned_files": scanned_files,
@@ -1287,6 +1298,19 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
     raw_dir.mkdir(parents=True, exist_ok=True)
     sampled_dir.mkdir(parents=True, exist_ok=True)
 
+    job.logger.info(
+        "dataset generation startup | source_mode=%s | dataset_source_id=%s | source_dataset_id=%s | source_dataset_ids=%s | target_samples=%s | output_raw_dir=%s | output_sampled_dir=%s | workers=%s | max_pending_futures=%s",
+        source_mode,
+        dataset_source_id,
+        source_dataset_id or "<none>",
+        source_dataset_ids,
+        target_samples,
+        raw_dir,
+        sampled_dir,
+        num_workers,
+        max_pending_futures,
+    )
+
     if source_mode not in {"benchmatch", "clone_existing", "derive_existing", "augment_existing", "merge_existing"}:
         raise ValueError(f"Unsupported dataset generation source_mode: {source_mode}")
 
@@ -1420,6 +1444,7 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
             raise ValueError("`source_dataset_id` est requis quand `source_mode=augment_existing`")
         source_entry = _resolve_dataset_source(job, source_dataset_id)
         augmented_summary = _augment_existing_dataset_source(
+            job=job,
             source_entry=source_entry,
             target_raw_dir=raw_dir,
             target_sampled_dir=sampled_dir,
