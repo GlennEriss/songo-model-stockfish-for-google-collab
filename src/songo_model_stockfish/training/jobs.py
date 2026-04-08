@@ -92,6 +92,36 @@ def _masked_policy_loss(policy_logits: torch.Tensor, legal_mask: torch.Tensor, p
     return F.cross_entropy(masked_logits, policy_index)
 
 
+def _soft_policy_loss(policy_logits: torch.Tensor, legal_mask: torch.Tensor, policy_target_full: torch.Tensor) -> torch.Tensor:
+    masked_logits = _masked_policy_logits(policy_logits, legal_mask)
+    log_probs = F.log_softmax(masked_logits, dim=1)
+    return -(policy_target_full * log_probs).sum(dim=1).mean()
+
+
+def _tactical_mask_regularization(
+    policy_logits: torch.Tensor,
+    legal_mask: torch.Tensor,
+    capture_move_mask: torch.Tensor,
+    safe_move_mask: torch.Tensor,
+    risky_move_mask: torch.Tensor,
+) -> torch.Tensor:
+    masked_logits = _masked_policy_logits(policy_logits, legal_mask)
+    probs = F.softmax(masked_logits, dim=1)
+    eps = 1e-6
+
+    def _mass(mask: torch.Tensor) -> torch.Tensor:
+        active = mask.sum(dim=1) > 0
+        if not bool(active.any().item()):
+            return torch.zeros((), device=policy_logits.device, dtype=policy_logits.dtype)
+        return (probs * mask).sum(dim=1)[active].mean()
+
+    capture_mass = _mass(capture_move_mask)
+    safe_mass = _mass(safe_move_mask)
+    risky_mass = _mass(risky_move_mask)
+
+    return (-torch.log(capture_mass + eps)) + (-torch.log(safe_mass + eps)) + (-torch.log(1.0 - risky_mass + eps))
+
+
 def _build_scheduler(optimizer: torch.optim.Optimizer, cfg: dict[str, Any], epochs: int):
     scheduler_cfg = cfg.get("scheduler", {})
     scheduler_type = str(scheduler_cfg.get("type", "none")).strip().lower()
@@ -116,6 +146,8 @@ def _run_epoch(
     scaler: GradScaler | None = None,
     amp_enabled: bool = False,
     value_loss_weight: float = 1.0,
+    soft_policy_loss_weight: float = 0.35,
+    tactical_aux_loss_weight: float = 0.05,
     gradient_clip_norm: float = 0.0,
     on_batch_end: Callable[[dict[str, float | int | str]], None] | None = None,
 ) -> dict[str, float]:
@@ -130,17 +162,30 @@ def _run_epoch(
     total_batches = len(loader)
     stage = "train" if training else "validation"
 
-    for batch_index, (x, legal_mask, policy_index, value_target) in enumerate(loader, start=1):
+    for batch_index, (x, legal_mask, policy_index, policy_target_full, value_target, capture_move_mask, safe_move_mask, risky_move_mask) in enumerate(loader, start=1):
         x = x.to(device)
         legal_mask = legal_mask.to(device)
         policy_index = policy_index.to(device)
+        policy_target_full = policy_target_full.to(device)
         value_target = value_target.to(device)
+        capture_move_mask = capture_move_mask.to(device)
+        safe_move_mask = safe_move_mask.to(device)
+        risky_move_mask = risky_move_mask.to(device)
 
         with autocast(device_type=device.type, enabled=amp_enabled):
             policy_logits, value_pred = model(x)
-            loss_policy = _masked_policy_loss(policy_logits, legal_mask, policy_index)
+            loss_policy_hard = _masked_policy_loss(policy_logits, legal_mask, policy_index)
+            loss_policy_soft = _soft_policy_loss(policy_logits, legal_mask, policy_target_full)
+            loss_policy = ((1.0 - soft_policy_loss_weight) * loss_policy_hard) + (soft_policy_loss_weight * loss_policy_soft)
             loss_value = F.mse_loss(value_pred, value_target)
-            loss_total = loss_policy + (value_loss_weight * loss_value)
+            tactical_aux_loss = _tactical_mask_regularization(
+                policy_logits,
+                legal_mask,
+                capture_move_mask,
+                safe_move_mask,
+                risky_move_mask,
+            )
+            loss_total = loss_policy + (value_loss_weight * loss_value) + (tactical_aux_loss_weight * tactical_aux_loss)
 
         if training:
             optimizer.zero_grad(set_to_none=True)
@@ -176,6 +221,9 @@ def _run_epoch(
                     "loss_total": float(loss_total.item()),
                     "loss_policy": float(loss_policy.item()),
                     "loss_value": float(loss_value.item()),
+                    "loss_policy_hard": float(loss_policy_hard.item()),
+                    "loss_policy_soft": float(loss_policy_soft.item()),
+                    "loss_tactical_aux": float(tactical_aux_loss.item()),
                 }
             )
 
@@ -249,6 +297,8 @@ def run_train(job: JobContext) -> dict[str, object]:
     epochs = int(cfg.get("epochs", 20))
     learning_rate = float(cfg.get("learning_rate", 0.0003))
     value_loss_weight = float(cfg.get("value_loss_weight", 1.0))
+    soft_policy_loss_weight = float(cfg.get("soft_policy_loss_weight", 0.35))
+    tactical_aux_loss_weight = float(cfg.get("tactical_aux_loss_weight", 0.05))
     log_every_n_batches = max(1, int(cfg.get("log_every_n_batches", 1)))
     gradient_clip_norm = float(cfg.get("gradient_clip_norm", 0.0))
     early_stopping_patience = max(0, int(cfg.get("early_stopping_patience", 0)))
@@ -548,6 +598,8 @@ def run_train(job: JobContext) -> dict[str, object]:
             scaler=scaler,
             amp_enabled=amp_enabled,
             value_loss_weight=value_loss_weight,
+            soft_policy_loss_weight=soft_policy_loss_weight,
+            tactical_aux_loss_weight=tactical_aux_loss_weight,
             gradient_clip_norm=gradient_clip_norm,
             on_batch_end=on_train_batch_end,
         )
@@ -640,6 +692,8 @@ def run_train(job: JobContext) -> dict[str, object]:
             scaler=None,
             amp_enabled=amp_enabled,
             value_loss_weight=value_loss_weight,
+            soft_policy_loss_weight=soft_policy_loss_weight,
+            tactical_aux_loss_weight=tactical_aux_loss_weight,
             on_batch_end=on_validation_batch_end,
         )
         global_step += int(train_metrics["examples"])

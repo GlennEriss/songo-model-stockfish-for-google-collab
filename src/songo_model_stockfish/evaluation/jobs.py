@@ -19,7 +19,12 @@ from songo_model_stockfish.ops.model_registry import (
     upsert_model_record,
 )
 from songo_model_stockfish.training.data import build_dataloader
-from songo_model_stockfish.training.jobs import _masked_policy_logits, _select_largest_built_dataset
+from songo_model_stockfish.training.jobs import (
+    _masked_policy_logits,
+    _select_largest_built_dataset,
+    _soft_policy_loss,
+    _tactical_mask_regularization,
+)
 from songo_model_stockfish.training.model import PolicyValueMLP
 
 
@@ -102,6 +107,8 @@ def run_evaluation(job: JobContext) -> dict[str, object]:
         }
     output_dir = _resolve_storage_path(job.paths.drive_root, cfg.get("output_dir"), job.job_dir / "reports")
     batch_size = int(cfg.get("batch_size", 128))
+    soft_policy_loss_weight = float(cfg.get("soft_policy_loss_weight", 0.35))
+    tactical_aux_loss_weight = float(cfg.get("tactical_aux_loss_weight", 0.05))
     log_every_n_batches = max(1, int(cfg.get("log_every_n_batches", 1)))
     requested_device = str(runtime_cfg.get("device", "cpu"))
     device = torch.device(requested_device if requested_device == "cpu" or torch.cuda.is_available() else "cpu")
@@ -220,21 +227,34 @@ def run_evaluation(job: JobContext) -> dict[str, object]:
     )
 
     with torch.no_grad():
-        for batch_index, (x, legal_mask, policy_index, value_target) in enumerate(test_loader, start=1):
+        for batch_index, (x, legal_mask, policy_index, policy_target_full, value_target, capture_move_mask, safe_move_mask, risky_move_mask) in enumerate(test_loader, start=1):
             if batch_index <= completed_batches:
                 continue
 
             x = x.to(device)
             legal_mask = legal_mask.to(device)
             policy_index = policy_index.to(device)
+            policy_target_full = policy_target_full.to(device)
             value_target = value_target.to(device)
+            capture_move_mask = capture_move_mask.to(device)
+            safe_move_mask = safe_move_mask.to(device)
+            risky_move_mask = risky_move_mask.to(device)
 
             with autocast(device_type=device.type, enabled=amp_enabled):
                 policy_logits, value_pred = model(x)
                 masked_logits = _masked_policy_logits(policy_logits, legal_mask)
-                loss_policy = F.cross_entropy(masked_logits, policy_index)
+                loss_policy_hard = F.cross_entropy(masked_logits, policy_index)
+                loss_policy_soft = _soft_policy_loss(policy_logits, legal_mask, policy_target_full)
+                loss_policy = ((1.0 - soft_policy_loss_weight) * loss_policy_hard) + (soft_policy_loss_weight * loss_policy_soft)
                 loss_value = F.mse_loss(value_pred, value_target)
-                loss_total = loss_policy + loss_value
+                tactical_aux_loss = _tactical_mask_regularization(
+                    policy_logits,
+                    legal_mask,
+                    capture_move_mask,
+                    safe_move_mask,
+                    risky_move_mask,
+                )
+                loss_total = loss_policy + loss_value + (tactical_aux_loss_weight * tactical_aux_loss)
 
             preds = masked_logits.argmax(dim=1)
             topk = min(3, masked_logits.shape[1])

@@ -55,5 +55,6 @@ dataset_generation:
   sample_every_n_plies: 2
   max_moves: 400
   max_pending_futures: 16
+  progress_update_every_n_games: 25
   output_raw_dir: data/raw_full_matrix_colab_pro
   output_sampled_dir: data/sampled_full_matrix_colab_pro

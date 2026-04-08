@@ -9,7 +9,20 @@ from torch.utils.data import DataLoader, TensorDataset
 
 def load_npz_dataset(path: str | Path) -> dict[str, np.ndarray]:
     with np.load(path, allow_pickle=True) as data:
-        return {key: data[key] for key in data.files}
+        arrays = {key: data[key] for key in data.files}
+    count = int(arrays["x"].shape[0]) if "x" in arrays and arrays["x"].ndim >= 1 else 0
+    if "policy_target_full" not in arrays:
+        policy_index = arrays.get("policy_index", np.zeros((count,), dtype=np.int64))
+        full = np.zeros((count, 7), dtype=np.float32)
+        if count > 0:
+            rows = np.arange(count, dtype=np.int64)
+            valid = np.logical_and(policy_index >= 0, policy_index < 7)
+            full[rows[valid], policy_index[valid]] = 1.0
+        arrays["policy_target_full"] = full
+    for key in ("capture_move_mask", "safe_move_mask", "risky_move_mask"):
+        if key not in arrays:
+            arrays[key] = np.zeros((count, 7), dtype=np.float32)
+    return arrays
 
 
 def build_dataloader(
@@ -26,8 +39,21 @@ def build_dataloader(
     x = torch.from_numpy(data["x"]).float()
     legal_mask = torch.from_numpy(data["legal_mask"]).float()
     policy_index = torch.from_numpy(data["policy_index"]).long()
+    policy_target_full = torch.from_numpy(data["policy_target_full"]).float()
     value_target = torch.from_numpy(data["value_target"]).float()
-    dataset = TensorDataset(x, legal_mask, policy_index, value_target)
+    capture_move_mask = torch.from_numpy(data["capture_move_mask"]).float()
+    safe_move_mask = torch.from_numpy(data["safe_move_mask"]).float()
+    risky_move_mask = torch.from_numpy(data["risky_move_mask"]).float()
+    dataset = TensorDataset(
+        x,
+        legal_mask,
+        policy_index,
+        policy_target_full,
+        value_target,
+        capture_move_mask,
+        safe_move_mask,
+        risky_move_mask,
+    )
     loader_kwargs = {
         "dataset": dataset,
         "batch_size": batch_size,

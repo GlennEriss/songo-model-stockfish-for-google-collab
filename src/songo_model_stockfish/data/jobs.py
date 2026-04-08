@@ -234,6 +234,8 @@ def _register_dataset_source(
     derivation_strategy: str = "",
     derivation_params: dict[str, Any] | None = None,
     dataset_version: str | None = None,
+    source_status: str = "completed",
+    partial_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     resolved_source_dataset_ids = source_dataset_ids or ([source_dataset_id] if source_dataset_id else [])
     payload = {
@@ -252,6 +254,8 @@ def _register_dataset_source(
         "source_dataset_ids": resolved_source_dataset_ids,
         "derivation_strategy": derivation_strategy,
         "derivation_params": derivation_params or {},
+        "source_status": source_status,
+        "partial_summary": partial_summary or {},
         "dataset_version": dataset_version or utc_now_iso(),
         "updated_at": utc_now_iso(),
     }
@@ -285,6 +289,9 @@ def _register_built_dataset(
     build_mode: str = "teacher_label",
     parent_dataset_ids: list[str] | None = None,
     dataset_version: str | None = None,
+    build_status: str = "completed",
+    feature_schema_version: str = "policy_value_tactical_v2",
+    input_dim: int | None = None,
 ) -> dict[str, Any]:
     resolved_source_dataset_ids = source_dataset_ids or ([source_dataset_id] if source_dataset_id else [])
     payload = {
@@ -300,7 +307,13 @@ def _register_built_dataset(
         "labeled_samples": labeled_samples,
         "target_labeled_samples": target_labeled_samples,
         "build_mode": build_mode,
+        "build_status": build_status,
         "parent_dataset_ids": parent_dataset_ids or [],
+        "feature_schema_version": feature_schema_version,
+        "input_dim": int(input_dim) if input_dim is not None else None,
+        "has_policy_target_full": True,
+        "has_tactical_features": True,
+        "has_tactical_move_masks": True,
         "dataset_version": dataset_version or utc_now_iso(),
         "updated_at": utc_now_iso(),
     }
@@ -327,6 +340,179 @@ def _sample_position_signature(sample: dict[str, Any]) -> str:
     }
     encoded = json.dumps(signature_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha1(encoded.encode("utf-8")).hexdigest()
+
+
+def _write_dataset_generation_progress_snapshot(
+    *,
+    job: JobContext,
+    dataset_dir: Path,
+    dataset_source_id: str,
+    source_mode: str,
+    raw_dir: Path,
+    sampled_dir: Path,
+    target_samples: int,
+    games_per_matchup: int,
+    sample_every_n_plies: int,
+    matchups: list[str],
+    source_dataset_id: str,
+    source_dataset_ids: list[str] | None,
+    derivation_strategy: str,
+    derivation_params: dict[str, Any],
+    summaries: list[dict[str, Any]],
+    total_samples: int,
+) -> dict[str, Any]:
+    added_games = sum(int(item.get("games_added", 0)) for item in summaries)
+    added_samples = sum(int(item.get("samples_added", 0)) for item in summaries)
+    metadata = _register_dataset_source(
+        job,
+        dataset_source_id=dataset_source_id,
+        source_mode=source_mode,
+        raw_dir=raw_dir,
+        sampled_dir=sampled_dir,
+        target_samples=target_samples,
+        games_per_matchup=games_per_matchup,
+        sample_every_n_plies=sample_every_n_plies,
+        matchups=matchups,
+        source_dataset_id=source_dataset_id,
+        source_dataset_ids=source_dataset_ids,
+        derivation_strategy=derivation_strategy,
+        derivation_params=derivation_params,
+        source_status="partial",
+        partial_summary={
+            "completed_matchups": len(summaries),
+            "added_games": added_games,
+            "added_samples": added_samples,
+            "total_samples": int(total_samples),
+        },
+    )
+    summary = {
+        "job_id": job.job_id,
+        "dataset_source_id": dataset_source_id,
+        "source_mode": source_mode,
+        "matchups": summaries,
+        "existing_samples": max(0, int(total_samples) - int(added_samples)),
+        "added_games": added_games,
+        "added_samples": added_samples,
+        "total_samples": int(metadata["sampled_positions"]),
+        "target_samples": target_samples,
+    }
+    _write_json(dataset_dir / "dataset_generation_summary.json", summary)
+    return summary
+
+
+def _export_built_dataset_snapshot(
+    *,
+    job: JobContext,
+    dataset_id: str,
+    source_dataset_id: str,
+    source_dataset_ids: list[str],
+    sampled_root: Path,
+    labeled_root: Path,
+    output_root: Path,
+    label_cache_dir: Path,
+    teacher_engine: str,
+    teacher_level: str,
+    sampled_relative_names: list[str],
+    completed_files: set[str],
+    file_sample_counts: dict[str, int],
+    train_ratio: float,
+    validation_ratio: float,
+    labeled_samples_total: int,
+    target_labeled_samples: int,
+    build_status: str,
+) -> tuple[dict[str, dict[str, int]], int]:
+    game_files = [relative_name for relative_name in sampled_relative_names if relative_name in completed_files]
+    split_train_end = int(len(game_files) * train_ratio)
+    split_validation_end = split_train_end + int(len(game_files) * validation_ratio)
+    split_files = {
+        "train": game_files[:split_train_end],
+        "validation": game_files[split_train_end:split_validation_end],
+        "test": game_files[split_validation_end:],
+    }
+
+    split_summary: dict[str, dict[str, int]] = {}
+    exported_input_dim = 17
+    for split_name, selected_files in split_files.items():
+        selected_sample_count = 0
+        for relative_name in selected_files:
+            sample_count = file_sample_counts.get(relative_name)
+            if sample_count is None:
+                labeled_path = labeled_root / relative_name
+                sample_count = _count_jsonl_lines(labeled_path) if labeled_path.exists() else 0
+                file_sample_counts[relative_name] = sample_count
+            selected_sample_count += sample_count
+
+        features_list = []
+        masks_list = []
+        policy_list = []
+        policy_full_list = []
+        value_list = []
+        capture_masks_list = []
+        safe_masks_list = []
+        risky_masks_list = []
+        sample_ids = []
+        game_id_list = []
+        for relative_name in selected_files:
+            labeled_path = labeled_root / relative_name
+            if not labeled_path.exists():
+                continue
+            for sample in _iter_jsonl(labeled_path):
+                features, legal_mask, policy_index, policy_target_full, value, capture_move_mask, safe_move_mask, risky_move_mask = _encode_features(sample)
+                features_list.append(features)
+                masks_list.append(legal_mask)
+                policy_list.append(policy_index)
+                policy_full_list.append(policy_target_full)
+                value_list.append(value)
+                capture_masks_list.append(capture_move_mask)
+                safe_masks_list.append(safe_move_mask)
+                risky_masks_list.append(risky_move_mask)
+                sample_ids.append(str(sample["sample_id"]))
+                game_id_list.append(str(sample["game_id"]))
+
+        x_dim = int(features_list[0].shape[0]) if features_list else exported_input_dim
+        exported_input_dim = x_dim
+        x = np.asarray(features_list, dtype=np.float32) if features_list else np.zeros((0, x_dim), dtype=np.float32)
+        legal_mask = np.asarray(masks_list, dtype=np.float32) if masks_list else np.zeros((0, 7), dtype=np.float32)
+        policy_index = np.asarray(policy_list, dtype=np.int64) if policy_list else np.zeros((0,), dtype=np.int64)
+        policy_target_full = np.asarray(policy_full_list, dtype=np.float32) if policy_full_list else np.zeros((0, 7), dtype=np.float32)
+        value_target = np.asarray(value_list, dtype=np.float32) if value_list else np.zeros((0,), dtype=np.float32)
+        capture_move_mask = np.asarray(capture_masks_list, dtype=np.float32) if capture_masks_list else np.zeros((0, 7), dtype=np.float32)
+        safe_move_mask = np.asarray(safe_masks_list, dtype=np.float32) if safe_masks_list else np.zeros((0, 7), dtype=np.float32)
+        risky_move_mask = np.asarray(risky_masks_list, dtype=np.float32) if risky_masks_list else np.zeros((0, 7), dtype=np.float32)
+        np.savez_compressed(
+            output_root / f"{split_name}.npz",
+            x=x,
+            legal_mask=legal_mask,
+            policy_index=policy_index,
+            policy_target_full=policy_target_full,
+            value_target=value_target,
+            capture_move_mask=capture_move_mask,
+            safe_move_mask=safe_move_mask,
+            risky_move_mask=risky_move_mask,
+            sample_ids=np.asarray(sample_ids, dtype=object),
+            game_ids=np.asarray(game_id_list, dtype=object),
+        )
+        split_summary[split_name] = {"games": len(selected_files), "samples": selected_sample_count}
+
+    _register_built_dataset(
+        job,
+        dataset_id=dataset_id,
+        source_dataset_id=source_dataset_id,
+        source_dataset_ids=source_dataset_ids,
+        sampled_root=sampled_root,
+        output_root=output_root,
+        label_cache_dir=label_cache_dir,
+        teacher_engine=teacher_engine,
+        teacher_level=teacher_level,
+        split_summary=split_summary,
+        labeled_samples=labeled_samples_total,
+        target_labeled_samples=target_labeled_samples,
+        build_mode="teacher_label",
+        parent_dataset_ids=[],
+        build_status=build_status,
+        input_dim=exported_input_dim,
+    )
+    return split_summary, exported_input_dim
 
 
 def _derive_existing_dataset_source(
@@ -720,7 +906,20 @@ def _format_eta_seconds(total_seconds: float | None) -> str:
 
 def _load_npz_arrays(path: Path) -> dict[str, np.ndarray]:
     with np.load(path, allow_pickle=True) as data:
-        return {key: data[key] for key in data.files}
+        arrays = {key: data[key] for key in data.files}
+    count = int(arrays["x"].shape[0]) if "x" in arrays and arrays["x"].ndim >= 1 else 0
+    if "policy_target_full" not in arrays:
+        policy_index = arrays.get("policy_index", np.zeros((count,), dtype=np.int64))
+        full = np.zeros((count, 7), dtype=np.float32)
+        if count > 0:
+            rows = np.arange(count, dtype=np.int64)
+            valid = np.logical_and(policy_index >= 0, policy_index < 7)
+            full[rows[valid], policy_index[valid]] = 1.0
+        arrays["policy_target_full"] = full
+    for key in ("capture_move_mask", "safe_move_mask", "risky_move_mask"):
+        if key not in arrays:
+            arrays[key] = np.zeros((count, 7), dtype=np.float32)
+    return arrays
 
 
 def _merge_npz_splits(
@@ -732,7 +931,11 @@ def _merge_npz_splits(
         "x": [],
         "legal_mask": [],
         "policy_index": [],
+        "policy_target_full": [],
         "value_target": [],
+        "capture_move_mask": [],
+        "safe_move_mask": [],
+        "risky_move_mask": [],
         "sample_ids": [],
         "game_ids": [],
     }
@@ -774,7 +977,11 @@ def _merge_npz_splits(
             "x": np.zeros((0, x_dim or 17), dtype=np.float32),
             "legal_mask": np.zeros((0, 7), dtype=np.float32),
             "policy_index": np.zeros((0,), dtype=np.int64),
+            "policy_target_full": np.zeros((0, 7), dtype=np.float32),
             "value_target": np.zeros((0,), dtype=np.float32),
+            "capture_move_mask": np.zeros((0, 7), dtype=np.float32),
+            "safe_move_mask": np.zeros((0, 7), dtype=np.float32),
+            "risky_move_mask": np.zeros((0, 7), dtype=np.float32),
             "sample_ids": np.asarray([], dtype=object),
             "game_ids": np.asarray([], dtype=object),
         }
@@ -801,7 +1008,11 @@ def _merge_npz_splits_with_source_breakdown(
         "x": [],
         "legal_mask": [],
         "policy_index": [],
+        "policy_target_full": [],
         "value_target": [],
+        "capture_move_mask": [],
+        "safe_move_mask": [],
+        "risky_move_mask": [],
         "sample_ids": [],
         "game_ids": [],
     }
@@ -856,7 +1067,11 @@ def _merge_npz_splits_with_source_breakdown(
             "x": np.zeros((0, x_dim or 17), dtype=np.float32),
             "legal_mask": np.zeros((0, 7), dtype=np.float32),
             "policy_index": np.zeros((0,), dtype=np.int64),
+            "policy_target_full": np.zeros((0, 7), dtype=np.float32),
             "value_target": np.zeros((0,), dtype=np.float32),
+            "capture_move_mask": np.zeros((0, 7), dtype=np.float32),
+            "safe_move_mask": np.zeros((0, 7), dtype=np.float32),
+            "risky_move_mask": np.zeros((0, 7), dtype=np.float32),
             "sample_ids": np.asarray([], dtype=object),
             "game_ids": np.asarray([], dtype=object),
         }
@@ -1166,15 +1381,48 @@ def _label_sample(
     return labeled
 
 
-def _encode_features(sample: dict[str, Any]) -> tuple[np.ndarray, np.ndarray, int, float]:
+def _extract_policy_target_full(sample: dict[str, Any]) -> np.ndarray:
+    distribution = dict(sample.get("policy_target", {}).get("distribution", {}))
+    target = np.zeros(7, dtype=np.float32)
+    for move in range(1, 8):
+        target[move - 1] = float(distribution.get(str(move), 0.0))
+    total = float(np.sum(target))
+    if total > 0:
+        target /= total
+    return target
+
+
+def _extract_tactical_move_mask(sample: dict[str, Any], *, mode: str) -> np.ndarray:
+    mask = np.zeros(7, dtype=np.float32)
+    tactical = sample.get("tactical_analysis", {})
+    per_move = tactical.get("per_move", {}) if isinstance(tactical, dict) else {}
+    legal_moves = set(int(move) for move in sample.get("legal_moves", []))
+    for move in range(1, 8):
+        move_payload = per_move.get(str(move), {})
+        if move not in legal_moves:
+            continue
+        if mode == "capture" and bool(move_payload.get("has_immediate_capture", False)):
+            mask[move - 1] = 1.0
+        elif mode == "risky" and bool(move_payload.get("exposes_to_immediate_capture", False)):
+            mask[move - 1] = 1.0
+        elif mode == "safe" and not bool(move_payload.get("exposes_to_immediate_capture", False)):
+            mask[move - 1] = 1.0
+    return mask
+
+
+def _encode_features(sample: dict[str, Any]) -> tuple[np.ndarray, np.ndarray, int, np.ndarray, float, np.ndarray, np.ndarray, np.ndarray]:
     features, legal_mask = encode_model_features(
         sample["state"],
         sample["legal_moves"],
         tactical_analysis=sample.get("tactical_analysis"),
     )
     policy_index = int(sample["policy_target"]["best_move"]) - 1
+    policy_target_full = _extract_policy_target_full(sample)
     value = float(sample["value_target"])
-    return features, legal_mask, policy_index, value
+    capture_move_mask = _extract_tactical_move_mask(sample, mode="capture")
+    safe_move_mask = _extract_tactical_move_mask(sample, mode="safe")
+    risky_move_mask = _extract_tactical_move_mask(sample, mode="risky")
+    return features, legal_mask, policy_index, policy_target_full, value, capture_move_mask, safe_move_mask, risky_move_mask
 
 
 def _label_samples_from_file(
@@ -1761,6 +2009,7 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
     summaries: list[dict[str, Any]] = []
     initial_total_samples = _count_total_jsonl_lines(sampled_dir)
     total_samples_after_run = initial_total_samples
+    progress_update_every_n_games = max(1, int(job.config.get("dataset_generation", {}).get("progress_update_every_n_games", 25)))
 
     job.logger.info("dataset generation started")
     job.set_phase("dataset_generation")
@@ -1775,6 +2024,24 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
             "existing_samples": initial_total_samples,
             "target_samples": target_samples,
         }
+    )
+    _write_dataset_generation_progress_snapshot(
+        job=job,
+        dataset_dir=dataset_dir,
+        dataset_source_id=dataset_source_id,
+        source_mode=source_mode,
+        raw_dir=raw_dir,
+        sampled_dir=sampled_dir,
+        target_samples=target_samples,
+        games_per_matchup=games,
+        sample_every_n_plies=sample_every_n_plies,
+        matchups=[str(matchup) for matchup in matchups],
+        source_dataset_id=source_dataset_id,
+        source_dataset_ids=source_dataset_ids,
+        derivation_strategy=derivation_strategy,
+        derivation_params=derivation_params,
+        summaries=summaries,
+        total_samples=total_samples_after_run,
     )
 
     if target_samples > 0 and initial_total_samples >= target_samples:
@@ -1976,6 +2243,34 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
                                     "target_samples": target_samples,
                                 }
                             )
+                            if matchup_game_count % progress_update_every_n_games == 0:
+                                _write_dataset_generation_progress_snapshot(
+                                    job=job,
+                                    dataset_dir=dataset_dir,
+                                    dataset_source_id=dataset_source_id,
+                                    source_mode=source_mode,
+                                    raw_dir=raw_dir,
+                                    sampled_dir=sampled_dir,
+                                    target_samples=target_samples,
+                                    games_per_matchup=games,
+                                    sample_every_n_plies=sample_every_n_plies,
+                                    matchups=[str(matchup) for matchup in matchups],
+                                    source_dataset_id=source_dataset_id,
+                                    source_dataset_ids=source_dataset_ids,
+                                    derivation_strategy=derivation_strategy,
+                                    derivation_params=derivation_params,
+                                    summaries=summaries + [{
+                                        "matchup_id": matchup_id,
+                                        "player_a": matchup_a,
+                                        "player_b": matchup_b,
+                                        "existing_games": existing_game_count,
+                                        "games_added": matchup_game_count,
+                                        "samples_added": matchup_sample_count,
+                                        "sample_every_n_plies": sample_every_n_plies,
+                                        "num_workers": num_workers,
+                                    }],
+                                    total_samples=total_samples_after_run,
+                                )
             except concurrent.futures.process.BrokenProcessPool as exc:
                 failed_pending = list(future_map.values()) + list(pending_queue)
                 job.logger.warning(
@@ -2052,6 +2347,24 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
         )
         job.write_metric({"metric_type": "dataset_matchup_completed", **summary_payload})
         job.write_event("dataset_matchup_completed", matchup=matchup_id, samples=matchup_sample_count)
+        _write_dataset_generation_progress_snapshot(
+            job=job,
+            dataset_dir=dataset_dir,
+            dataset_source_id=dataset_source_id,
+            source_mode=source_mode,
+            raw_dir=raw_dir,
+            sampled_dir=sampled_dir,
+            target_samples=target_samples,
+            games_per_matchup=games,
+            sample_every_n_plies=sample_every_n_plies,
+            matchups=[str(matchup) for matchup in matchups],
+            source_dataset_id=source_dataset_id,
+            source_dataset_ids=source_dataset_ids,
+            derivation_strategy=derivation_strategy,
+            derivation_params=derivation_params,
+            summaries=summaries,
+            total_samples=total_samples_after_run,
+        )
 
     added_games = sum(int(item["games_added"]) for item in summaries)
     added_samples = sum(int(item["samples_added"]) for item in summaries)
@@ -2077,8 +2390,11 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
         sample_every_n_plies=sample_every_n_plies,
         matchups=[str(matchup) for matchup in matchups],
         source_dataset_id=source_dataset_id,
+        source_dataset_ids=source_dataset_ids,
         derivation_strategy=derivation_strategy,
         derivation_params=derivation_params,
+        source_status="completed",
+        partial_summary={},
     )
     _write_json(dataset_dir / "dataset_generation_summary.json", summary)
     job.logger.info(
@@ -2118,15 +2434,17 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
     multiprocessing_start_method = str(runtime_cfg.get("multiprocessing_start_method", "spawn")).strip().lower() or "spawn"
     max_tasks_per_child = int(runtime_cfg.get("max_tasks_per_child", 25))
     include_tactical_analysis = bool(cfg.get("include_tactical_analysis", True))
+    export_partial_every_n_files = max(1, int(cfg.get("export_partial_every_n_files", 250)))
 
     job.logger.info(
-        "dataset build startup | dataset=%s | source_dataset_id=%s | configured_input_sampled_dir=%s | workers=%s | max_pending_futures=%s | include_tactical_analysis=%s",
+        "dataset build startup | dataset=%s | source_dataset_id=%s | configured_input_sampled_dir=%s | workers=%s | max_pending_futures=%s | include_tactical_analysis=%s | export_partial_every_n_files=%s",
         dataset_id,
         source_dataset_id or "<auto>",
         str(cfg.get("input_sampled_dir", "")),
         num_workers,
         max_pending_futures,
         include_tactical_analysis,
+        export_partial_every_n_files,
     )
 
     dataset_dir = job.job_dir / "dataset_build"
@@ -2203,6 +2521,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
     log_every_n_files = max(1, int(cfg.get("log_every_n_files", 1)))
     last_logged_progress_count = -1
     build_started_monotonic = time.monotonic()
+    last_partial_export_processed = 0
 
     def _estimate_remaining_seconds() -> float | None:
         if processed_count <= 0:
@@ -2260,6 +2579,56 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
 
     def _target_reached() -> bool:
         return target_labeled_samples > 0 and labeled_samples_total >= target_labeled_samples
+
+    def _export_partial_snapshot_if_needed(*, force: bool = False) -> None:
+        nonlocal last_partial_export_processed
+        if processed_count <= 0:
+            return
+        if not force and (processed_count - last_partial_export_processed) < export_partial_every_n_files:
+            return
+        split_summary, exported_input_dim = _export_built_dataset_snapshot(
+            job=job,
+            dataset_id=dataset_id,
+            source_dataset_id=source_dataset_id,
+            source_dataset_ids=[source_dataset_id] if source_dataset_id else [],
+            sampled_root=sampled_root,
+            labeled_root=labeled_root,
+            output_root=output_root,
+            label_cache_dir=label_cache_dir,
+            teacher_engine=teacher_engine,
+            teacher_level=teacher_level,
+            sampled_relative_names=sampled_relative_names,
+            completed_files=completed_files,
+            file_sample_counts=file_sample_counts,
+            train_ratio=train_ratio,
+            validation_ratio=validation_ratio,
+            labeled_samples_total=labeled_samples_total,
+            target_labeled_samples=target_labeled_samples,
+            build_status="partial",
+        )
+        last_partial_export_processed = processed_count
+        job.logger.info(
+            "dataset build partial snapshot exported | dataset=%s | processed_files=%s/%s | labeled_samples=%s | input_dim=%s | train=%s | validation=%s | test=%s | output_dir=%s",
+            dataset_id,
+            processed_count,
+            len(sampled_files),
+            labeled_samples_total,
+            exported_input_dim,
+            split_summary.get("train", {}).get("samples", 0),
+            split_summary.get("validation", {}).get("samples", 0),
+            split_summary.get("test", {}).get("samples", 0),
+            output_root,
+        )
+        job.write_event(
+            "dataset_build_partial_snapshot_exported",
+            dataset_id=dataset_id,
+            processed_files=processed_count,
+            total_files=len(sampled_files),
+            labeled_samples=labeled_samples_total,
+            output_dir=str(output_root),
+            split_summary=split_summary,
+            input_dim=exported_input_dim,
+        )
 
     job.logger.info(
         "dataset build started | dataset=%s | source_dataset_id=%s | teacher=%s:%s | sampled_root=%s | label_cache=%s | output_dir=%s | files=%s | target_labeled_samples=%s | workers=%s | include_tactical_analysis=%s",
@@ -2403,6 +2772,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         job.write_metric({"metric_type": "dataset_labeled_file_completed", "file": str(file_item["relative_name"]), "samples": len(file_samples)})
         _log_build_progress_if_needed()
         _write_build_state()
+        _export_partial_snapshot_if_needed()
 
     if pending_files:
         if num_workers <= 1:
@@ -2551,71 +2921,26 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
                         )
                         break
 
-    game_files = [relative_name for relative_name in sampled_relative_names if relative_name in completed_files]
-    split_train_end = int(len(game_files) * train_ratio)
-    split_validation_end = split_train_end + int(len(game_files) * validation_ratio)
-    split_files = {
-        "train": game_files[:split_train_end],
-        "validation": game_files[split_train_end:split_validation_end],
-        "test": game_files[split_validation_end:],
-    }
-
-    split_summary: dict[str, dict[str, int]] = {}
-    for split_name, selected_files in split_files.items():
-        selected_sample_count = 0
-        for relative_name in selected_files:
-            sample_count = file_sample_counts.get(relative_name)
-            if sample_count is None:
-                labeled_path = labeled_root / relative_name
-                sample_count = _count_jsonl_lines(labeled_path) if labeled_path.exists() else 0
-                file_sample_counts[relative_name] = sample_count
-            selected_sample_count += sample_count
-        job.logger.info(
-            "dataset build split export started | split=%s | games=%s | samples=%s",
-            split_name,
-            len(selected_files),
-            selected_sample_count,
-        )
-
-        features_list = []
-        masks_list = []
-        policy_list = []
-        value_list = []
-        sample_ids = []
-        game_id_list = []
-        for relative_name in selected_files:
-            labeled_path = labeled_root / relative_name
-            for sample in _iter_jsonl(labeled_path):
-                features, legal_mask, policy_index, value = _encode_features(sample)
-                features_list.append(features)
-                masks_list.append(legal_mask)
-                policy_list.append(policy_index)
-                value_list.append(value)
-                sample_ids.append(str(sample["sample_id"]))
-                game_id_list.append(str(sample["game_id"]))
-
-        x_dim = int(features_list[0].shape[0]) if features_list else 17
-        x = np.asarray(features_list, dtype=np.float32) if features_list else np.zeros((0, x_dim), dtype=np.float32)
-        legal_mask = np.asarray(masks_list, dtype=np.float32) if masks_list else np.zeros((0, 7), dtype=np.float32)
-        policy_index = np.asarray(policy_list, dtype=np.int64) if policy_list else np.zeros((0,), dtype=np.int64)
-        value_target = np.asarray(value_list, dtype=np.float32) if value_list else np.zeros((0,), dtype=np.float32)
-        np.savez_compressed(
-            output_root / f"{split_name}.npz",
-            x=x,
-            legal_mask=legal_mask,
-            policy_index=policy_index,
-            value_target=value_target,
-            sample_ids=np.asarray(sample_ids, dtype=object),
-            game_ids=np.asarray(game_id_list, dtype=object),
-        )
-        split_summary[split_name] = {"games": len(selected_files), "samples": selected_sample_count}
-        job.logger.info(
-            "dataset build split export completed | split=%s | games=%s | samples=%s | path=%s",
-            split_name,
-            len(selected_files),
-            selected_sample_count,
-            output_root / f"{split_name}.npz",
-        )
+    split_summary, exported_input_dim = _export_built_dataset_snapshot(
+        job=job,
+        dataset_id=dataset_id,
+        source_dataset_id=source_dataset_id,
+        source_dataset_ids=[source_dataset_id] if source_dataset_id else [],
+        sampled_root=sampled_root,
+        labeled_root=labeled_root,
+        output_root=output_root,
+        label_cache_dir=label_cache_dir,
+        teacher_engine=teacher_engine,
+        teacher_level=teacher_level,
+        sampled_relative_names=sampled_relative_names,
+        completed_files=completed_files,
+        file_sample_counts=file_sample_counts,
+        train_ratio=train_ratio,
+        validation_ratio=validation_ratio,
+        labeled_samples_total=labeled_samples_total,
+        target_labeled_samples=target_labeled_samples,
+        build_status="completed",
+    )
 
     summary = {
         "job_id": job.job_id,
@@ -2628,25 +2953,11 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         "output_dir": str(output_root),
         "labeled_samples": labeled_samples_total,
         "target_labeled_samples": target_labeled_samples,
+        "input_dim": exported_input_dim,
+        "feature_schema_version": "policy_value_tactical_v2",
         "skipped_terminal_samples": skipped_terminal_samples,
         "skipped_no_legal_samples": skipped_no_legal_samples,
     }
-    _register_built_dataset(
-        job,
-        dataset_id=dataset_id,
-        source_dataset_id=source_dataset_id,
-        source_dataset_ids=[source_dataset_id] if source_dataset_id else [],
-        sampled_root=sampled_root,
-        output_root=output_root,
-        label_cache_dir=label_cache_dir,
-        teacher_engine=teacher_engine,
-        teacher_level=teacher_level,
-        split_summary=split_summary,
-        labeled_samples=labeled_samples_total,
-        target_labeled_samples=target_labeled_samples,
-        build_mode="teacher_label",
-        parent_dataset_ids=[],
-    )
     _write_json(dataset_dir / "dataset_build_summary.json", summary)
     job.logger.info(
         "dataset build completed | dataset=%s | build_mode=teacher_label | source_dataset_id=%s | train=%s | validation=%s | test=%s | skipped_terminal=%s | skipped_no_legal=%s | output_dir=%s",
