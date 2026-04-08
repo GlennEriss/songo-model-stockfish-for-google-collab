@@ -14,7 +14,7 @@ import numpy as np
 from songo_model_stockfish.adapters import songo_ai_game
 from songo_model_stockfish.ops.job import JobContext
 from songo_model_stockfish.ops.logging import utc_now_iso
-from songo_model_stockfish.training.features import encode_raw_state
+from songo_model_stockfish.training.features import encode_model_features
 
 
 def _slugify_matchup(matchup_spec: str) -> str:
@@ -740,9 +740,16 @@ def _merge_npz_splits(
     input_samples = 0
     kept_samples = 0
     duplicate_samples = 0
+    x_dim: int | None = None
 
     for split_path in split_paths:
         arrays = _load_npz_arrays(split_path)
+        current_x = arrays["x"]
+        current_dim = int(current_x.shape[1]) if current_x.ndim == 2 else 0
+        if x_dim is None:
+            x_dim = current_dim
+        elif current_dim != x_dim:
+            raise ValueError(f"Incompatible x feature dimensions while merging splits: expected {x_dim}, got {current_dim} for {split_path}")
         sample_ids = arrays["sample_ids"]
         keep_indices: list[int] = []
         for index, sample_id in enumerate(sample_ids.tolist()):
@@ -764,7 +771,7 @@ def _merge_npz_splits(
 
     if kept_samples == 0:
         merged = {
-            "x": np.zeros((0, 17), dtype=np.float32),
+            "x": np.zeros((0, x_dim or 17), dtype=np.float32),
             "legal_mask": np.zeros((0, 7), dtype=np.float32),
             "policy_index": np.zeros((0,), dtype=np.int64),
             "value_target": np.zeros((0,), dtype=np.float32),
@@ -803,9 +810,18 @@ def _merge_npz_splits_with_source_breakdown(
     input_samples = 0
     kept_samples = 0
     duplicate_samples = 0
+    x_dim: int | None = None
 
     for source_dataset_id, split_path in split_items:
         arrays = _load_npz_arrays(split_path)
+        current_x = arrays["x"]
+        current_dim = int(current_x.shape[1]) if current_x.ndim == 2 else 0
+        if x_dim is None:
+            x_dim = current_dim
+        elif current_dim != x_dim:
+            raise ValueError(
+                f"Incompatible x feature dimensions while merging final datasets: expected {x_dim}, got {current_dim} for {source_dataset_id}:{split_path}"
+            )
         sample_ids = arrays["sample_ids"]
         keep_indices: list[int] = []
         stats = {
@@ -837,7 +853,7 @@ def _merge_npz_splits_with_source_breakdown(
 
     if kept_samples == 0:
         merged = {
-            "x": np.zeros((0, 17), dtype=np.float32),
+            "x": np.zeros((0, x_dim or 17), dtype=np.float32),
             "legal_mask": np.zeros((0, 7), dtype=np.float32),
             "policy_index": np.zeros((0,), dtype=np.int64),
             "value_target": np.zeros((0,), dtype=np.float32),
@@ -1097,9 +1113,13 @@ def _build_tactical_analysis(
         },
         "per_move": per_move,
     }
-
-
-def _label_sample(sample: dict[str, Any], *, teacher_engine: str, teacher_level: str) -> dict[str, Any]:
+def _label_sample(
+    sample: dict[str, Any],
+    *,
+    teacher_engine: str,
+    teacher_level: str,
+    include_tactical_analysis: bool = True,
+) -> dict[str, Any]:
     if bool(sample["state"].get("is_terminal", False)):
         raise ValueError(f"Cannot label terminal sample: {sample['sample_id']}")
 
@@ -1135,18 +1155,23 @@ def _label_sample(sample: dict[str, Any], *, teacher_engine: str, teacher_level:
         "best_move": int(best_move),
         "distribution": _build_policy_distribution_from_scores(legal_moves, move_scores),
     }
-    labeled["tactical_analysis"] = _build_tactical_analysis(
-        runtime_state,
-        legal_moves,
-        move_scores,
-        best_move=int(best_move),
-    )
+    if include_tactical_analysis:
+        labeled["tactical_analysis"] = _build_tactical_analysis(
+            runtime_state,
+            legal_moves,
+            move_scores,
+            best_move=int(best_move),
+        )
     labeled["value_target"] = _normalize_value(teacher_score)
     return labeled
 
 
 def _encode_features(sample: dict[str, Any]) -> tuple[np.ndarray, np.ndarray, int, float]:
-    features, legal_mask = encode_raw_state(sample["state"], sample["legal_moves"])
+    features, legal_mask = encode_model_features(
+        sample["state"],
+        sample["legal_moves"],
+        tactical_analysis=sample.get("tactical_analysis"),
+    )
     policy_index = int(sample["policy_target"]["best_move"]) - 1
     value = float(sample["value_target"])
     return features, legal_mask, policy_index, value
@@ -1157,6 +1182,7 @@ def _label_samples_from_file(
     *,
     teacher_engine: str,
     teacher_level: str,
+    include_tactical_analysis: bool = True,
 ) -> tuple[int, list[dict[str, Any]], int, int]:
     source_samples = list(_iter_jsonl(Path(sampled_file_path)))
     source_count = len(source_samples)
@@ -1170,7 +1196,14 @@ def _label_samples_from_file(
         if not sample["legal_moves"]:
             skipped_no_legal += 1
             continue
-        labeled_samples.append(_label_sample(sample, teacher_engine=teacher_engine, teacher_level=teacher_level))
+        labeled_samples.append(
+            _label_sample(
+                sample,
+                teacher_engine=teacher_engine,
+                teacher_level=teacher_level,
+                include_tactical_analysis=include_tactical_analysis,
+            )
+        )
     return source_count, labeled_samples, skipped_terminal, skipped_no_legal
 
 
@@ -2084,14 +2117,16 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
     max_pending_futures = max(1, int(cfg.get("max_pending_futures", num_workers * 2)))
     multiprocessing_start_method = str(runtime_cfg.get("multiprocessing_start_method", "spawn")).strip().lower() or "spawn"
     max_tasks_per_child = int(runtime_cfg.get("max_tasks_per_child", 25))
+    include_tactical_analysis = bool(cfg.get("include_tactical_analysis", True))
 
     job.logger.info(
-        "dataset build startup | dataset=%s | source_dataset_id=%s | configured_input_sampled_dir=%s | workers=%s | max_pending_futures=%s",
+        "dataset build startup | dataset=%s | source_dataset_id=%s | configured_input_sampled_dir=%s | workers=%s | max_pending_futures=%s | include_tactical_analysis=%s",
         dataset_id,
         source_dataset_id or "<auto>",
         str(cfg.get("input_sampled_dir", "")),
         num_workers,
         max_pending_futures,
+        include_tactical_analysis,
     )
 
     dataset_dir = job.job_dir / "dataset_build"
@@ -2197,6 +2232,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
                 "skipped_terminal_samples": skipped_terminal_samples,
                 "skipped_no_legal_samples": skipped_no_legal_samples,
                 "target_labeled_samples": target_labeled_samples,
+                "include_tactical_analysis": include_tactical_analysis,
                 "contiguous_completed_prefix": contiguous_completed_prefix,
                 "last_completed_file": sampled_relative_names[processed_count - 1] if processed_count > 0 else "",
             }
@@ -2222,8 +2258,11 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         )
         last_logged_progress_count = processed_count
 
+    def _target_reached() -> bool:
+        return target_labeled_samples > 0 and labeled_samples_total >= target_labeled_samples
+
     job.logger.info(
-        "dataset build started | dataset=%s | source_dataset_id=%s | teacher=%s:%s | sampled_root=%s | label_cache=%s | output_dir=%s | files=%s | target_labeled_samples=%s | workers=%s",
+        "dataset build started | dataset=%s | source_dataset_id=%s | teacher=%s:%s | sampled_root=%s | label_cache=%s | output_dir=%s | files=%s | target_labeled_samples=%s | workers=%s | include_tactical_analysis=%s",
         dataset_id,
         source_dataset_id,
         teacher_engine,
@@ -2234,6 +2273,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         len(sampled_files),
         target_labeled_samples,
         num_workers,
+        include_tactical_analysis,
     )
     job.set_phase("dataset_build")
     job.write_event(
@@ -2247,6 +2287,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         sampled_files=len(sampled_files),
         target_labeled_samples=target_labeled_samples,
         num_workers=num_workers,
+        include_tactical_analysis=include_tactical_analysis,
     )
     job.write_metric({"metric_type": "dataset_build_started"})
 
@@ -2295,6 +2336,14 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
 
         _log_build_progress_if_needed()
         _write_build_state()
+        if _target_reached():
+            job.logger.info(
+                "dataset build target reached during scan | labeled_samples=%s | target_labeled_samples=%s | processed_files=%s",
+                labeled_samples_total,
+                target_labeled_samples,
+                processed_count,
+            )
+            break
 
     reused_count = processed_count
     pending_count = len(pending_files)
@@ -2368,6 +2417,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
                     str(file_item["sampled_file"]),
                     teacher_engine=teacher_engine,
                     teacher_level=teacher_level,
+                    include_tactical_analysis=include_tactical_analysis,
                 )
                 _materialize_labeled_file(
                     file_item,
@@ -2377,6 +2427,14 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
                     skipped_no_legal,
                     mode="sequential",
                 )
+                if _target_reached():
+                    job.logger.info(
+                        "dataset build target reached | labeled_samples=%s | target_labeled_samples=%s | processed_files=%s",
+                        labeled_samples_total,
+                        target_labeled_samples,
+                        processed_count,
+                    )
+                    break
         else:
             job.logger.info(
                 "dataset build parallel execution | workers=%s | pending_files=%s | max_pending=%s | start_method=%s | max_tasks_per_child=%s",
@@ -2396,6 +2454,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
             )
             future_map: dict[concurrent.futures.Future, dict[str, Any]] = {}
             pending_queue = list(pending_files)
+            target_reached = False
             try:
                 mp_context = multiprocessing.get_context(multiprocessing_start_method)
                 with concurrent.futures.ProcessPoolExecutor(
@@ -2404,7 +2463,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
                     max_tasks_per_child=max_tasks_per_child,
                 ) as executor:
                     while pending_queue or future_map:
-                        while pending_queue and len(future_map) < max_pending_futures:
+                        while pending_queue and len(future_map) < max_pending_futures and not target_reached:
                             file_item = pending_queue.pop(0)
                             job.logger.info(
                                 "dataset build file started | %s/%s | file=%s | mode=parallel",
@@ -2417,9 +2476,12 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
                                 str(file_item["sampled_file"]),
                                 teacher_engine=teacher_engine,
                                 teacher_level=teacher_level,
+                                include_tactical_analysis=include_tactical_analysis,
                             )
                             future_map[future] = file_item
 
+                        if not future_map:
+                            break
                         done, _not_done = concurrent.futures.wait(
                             future_map.keys(),
                             return_when=concurrent.futures.FIRST_COMPLETED,
@@ -2435,6 +2497,16 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
                                 skipped_no_legal,
                                 mode="parallel",
                             )
+                            if _target_reached() and not target_reached:
+                                target_reached = True
+                                pending_queue.clear()
+                                job.logger.info(
+                                    "dataset build target reached | labeled_samples=%s | target_labeled_samples=%s | processed_files=%s | allowing_inflight_workers_to_finish=%s",
+                                    labeled_samples_total,
+                                    target_labeled_samples,
+                                    processed_count,
+                                    len(future_map),
+                                )
             except concurrent.futures.process.BrokenProcessPool as exc:
                 failed_pending = list(future_map.values()) + list(pending_queue)
                 job.logger.warning(
@@ -2460,6 +2532,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
                         str(file_item["sampled_file"]),
                         teacher_engine=teacher_engine,
                         teacher_level=teacher_level,
+                        include_tactical_analysis=include_tactical_analysis,
                     )
                     _materialize_labeled_file(
                         file_item,
@@ -2469,8 +2542,16 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
                         skipped_no_legal,
                         mode="sequential_fallback",
                     )
+                    if _target_reached():
+                        job.logger.info(
+                            "dataset build target reached | labeled_samples=%s | target_labeled_samples=%s | processed_files=%s",
+                            labeled_samples_total,
+                            target_labeled_samples,
+                            processed_count,
+                        )
+                        break
 
-    game_files = [str(path.relative_to(sampled_root)) for path in sampled_files]
+    game_files = [relative_name for relative_name in sampled_relative_names if relative_name in completed_files]
     split_train_end = int(len(game_files) * train_ratio)
     split_validation_end = split_train_end + int(len(game_files) * validation_ratio)
     split_files = {
@@ -2513,7 +2594,8 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
                 sample_ids.append(str(sample["sample_id"]))
                 game_id_list.append(str(sample["game_id"]))
 
-        x = np.asarray(features_list, dtype=np.float32) if features_list else np.zeros((0, 17), dtype=np.float32)
+        x_dim = int(features_list[0].shape[0]) if features_list else 17
+        x = np.asarray(features_list, dtype=np.float32) if features_list else np.zeros((0, x_dim), dtype=np.float32)
         legal_mask = np.asarray(masks_list, dtype=np.float32) if masks_list else np.zeros((0, 7), dtype=np.float32)
         policy_index = np.asarray(policy_list, dtype=np.int64) if policy_list else np.zeros((0,), dtype=np.int64)
         value_target = np.asarray(value_list, dtype=np.float32) if value_list else np.zeros((0,), dtype=np.float32)

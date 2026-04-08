@@ -5,7 +5,7 @@ from pathlib import Path
 import torch
 
 from songo_model_stockfish.adapters import songo_ai_game
-from songo_model_stockfish.training.features import encode_raw_state
+from songo_model_stockfish.training.features import adapt_feature_dim, encode_model_features
 from songo_model_stockfish.training.jobs import _masked_policy_logits
 from songo_model_stockfish.training.model import PolicyValueMLP
 
@@ -18,8 +18,9 @@ class ModelAgent:
         self._device = torch.device(device if device == "cpu" or torch.cuda.is_available() else "cpu")
         checkpoint = torch.load(self._checkpoint_path, map_location=self._device)
         model_config = checkpoint.get("model_config", {})
+        self._input_dim = int(model_config.get("input_dim", 17))
         self._model = PolicyValueMLP(
-            input_dim=int(model_config.get("input_dim", 17)),
+            input_dim=self._input_dim,
             hidden_sizes=list(model_config.get("hidden_sizes", [256, 256, 128])),
             policy_dim=int(model_config.get("policy_dim", 7)),
         )
@@ -35,7 +36,8 @@ class ModelAgent:
     def choose(self, state):
         raw_state = songo_ai_game.to_raw_state(state)
         legal_moves = songo_ai_game.legal_moves(state)
-        features, legal_mask = encode_raw_state(raw_state, legal_moves)
+        features, legal_mask = encode_model_features(raw_state, legal_moves, tactical_analysis=None)
+        features = adapt_feature_dim(features, self._input_dim)
         x = torch.from_numpy(features).unsqueeze(0).to(self._device)
         mask = torch.from_numpy(legal_mask).unsqueeze(0).to(self._device)
         with torch.no_grad():
