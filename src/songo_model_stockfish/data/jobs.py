@@ -92,6 +92,24 @@ def _count_json_files(root: Path) -> int:
     return sum(1 for path in root.rglob("*.json") if not path.name.startswith("_"))
 
 
+def _resolve_pool_max_tasks_per_child(
+    *,
+    start_method: str,
+    configured_value: int,
+    logger,
+    scope: str,
+) -> int | None:
+    if start_method == "fork":
+        if configured_value > 0:
+            logger.info(
+                "%s | start_method=fork so max_tasks_per_child is disabled automatically | configured_max_tasks_per_child=%s",
+                scope,
+                configured_value,
+            )
+        return None
+    return configured_value if configured_value > 0 else None
+
+
 def _copy_tree_incremental(source_root: Path, target_root: Path, *, pattern: str) -> int:
     copied = 0
     if not source_root.exists():
@@ -1691,6 +1709,12 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
     max_pending_futures = max(1, int(cfg.get("max_pending_futures", num_workers * 2)))
     multiprocessing_start_method = str(runtime_cfg.get("multiprocessing_start_method", "spawn")).strip().lower() or "spawn"
     max_tasks_per_child = int(runtime_cfg.get("max_tasks_per_child", 25))
+    effective_max_tasks_per_child = _resolve_pool_max_tasks_per_child(
+        start_method=multiprocessing_start_method,
+        configured_value=max_tasks_per_child,
+        logger=job.logger,
+        scope="dataset generation pool configuration",
+    )
     target_samples = int(cfg.get("target_samples", 0))
 
     dataset_dir = job.job_dir / "dataset_generation"
@@ -2169,7 +2193,7 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
                 len(pending_games),
                 max_pending_futures,
                 multiprocessing_start_method,
-                max_tasks_per_child,
+                effective_max_tasks_per_child,
             )
             job.write_event(
                 "dataset_parallel_execution_started",
@@ -2178,7 +2202,7 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
                 pending_games=len(pending_games),
                 max_pending_futures=max_pending_futures,
                 multiprocessing_start_method=multiprocessing_start_method,
-                max_tasks_per_child=max_tasks_per_child,
+                max_tasks_per_child=effective_max_tasks_per_child,
             )
 
             future_map: dict[concurrent.futures.Future, dict[str, Any]] = {}
@@ -2188,7 +2212,7 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
                 with concurrent.futures.ProcessPoolExecutor(
                     max_workers=num_workers,
                     mp_context=mp_context,
-                    max_tasks_per_child=max_tasks_per_child,
+                    max_tasks_per_child=effective_max_tasks_per_child,
                 ) as executor:
                     while pending_queue or future_map:
                         while pending_queue and len(future_map) < max_pending_futures:
@@ -2435,6 +2459,12 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
     max_tasks_per_child = int(runtime_cfg.get("max_tasks_per_child", 25))
     include_tactical_analysis = bool(cfg.get("include_tactical_analysis", True))
     export_partial_every_n_files = max(1, int(cfg.get("export_partial_every_n_files", 250)))
+    effective_max_tasks_per_child = _resolve_pool_max_tasks_per_child(
+        start_method=multiprocessing_start_method,
+        configured_value=max_tasks_per_child,
+        logger=job.logger,
+        scope="dataset build pool configuration",
+    )
 
     job.logger.info(
         "dataset build startup | dataset=%s | source_dataset_id=%s | configured_input_sampled_dir=%s | workers=%s | max_pending_futures=%s | include_tactical_analysis=%s | export_partial_every_n_files=%s",
@@ -2812,7 +2842,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
                 len(pending_files),
                 max_pending_futures,
                 multiprocessing_start_method,
-                max_tasks_per_child,
+                effective_max_tasks_per_child,
             )
             job.write_event(
                 "dataset_build_parallel_execution_started",
@@ -2820,7 +2850,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
                 pending_files=len(pending_files),
                 max_pending_futures=max_pending_futures,
                 multiprocessing_start_method=multiprocessing_start_method,
-                max_tasks_per_child=max_tasks_per_child,
+                max_tasks_per_child=effective_max_tasks_per_child,
             )
             future_map: dict[concurrent.futures.Future, dict[str, Any]] = {}
             pending_queue = list(pending_files)
@@ -2830,7 +2860,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
                 with concurrent.futures.ProcessPoolExecutor(
                     max_workers=num_workers,
                     mp_context=mp_context,
-                    max_tasks_per_child=max_tasks_per_child,
+                    max_tasks_per_child=effective_max_tasks_per_child,
                 ) as executor:
                     while pending_queue or future_map:
                         while pending_queue and len(future_map) < max_pending_futures and not target_reached:
