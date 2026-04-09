@@ -81,6 +81,17 @@ def _select_largest_built_dataset(data_root: Path) -> dict[str, Any]:
     return candidates[0]
 
 
+def _resolve_built_dataset_by_id(data_root: Path, dataset_id: str) -> dict[str, Any]:
+    requested_id = str(dataset_id).strip()
+    if not requested_id:
+        raise ValueError("dataset_id vide pour la resolution du built dataset.")
+    registry = _read_dataset_registry(data_root)
+    for entry in registry.get("built_datasets", []):
+        if str(entry.get("dataset_id", "")).strip() == requested_id:
+            return entry
+    raise FileNotFoundError(f"Built dataset introuvable dans le registre: {requested_id}")
+
+
 def _masked_policy_logits(policy_logits: torch.Tensor, legal_mask: torch.Tensor) -> torch.Tensor:
     # Mixed precision safe value for fp16/bf16/fp32.
     mask_value = torch.finfo(policy_logits.dtype).min
@@ -268,12 +279,29 @@ def run_train(job: JobContext) -> dict[str, object]:
         }
     else:
         dataset_id = str(cfg.get("dataset_id", "dataset_v1"))
-        dataset_path = _resolve_storage_path(job.paths.drive_root, cfg.get("dataset_path"), job.job_dir / "train.npz")
-        validation_path = _resolve_storage_path(job.paths.drive_root, cfg.get("validation_path"), job.job_dir / "validation.npz")
-        dataset_resolution = {
-            "selection_mode": dataset_selection_mode,
-            "resolved_from_registry": False,
-        }
+        configured_dataset_path = str(cfg.get("dataset_path", "")).strip()
+        configured_validation_path = str(cfg.get("validation_path", "")).strip()
+        if dataset_id not in {"", "auto"} and not configured_dataset_path and not configured_validation_path:
+            selected_dataset = _resolve_built_dataset_by_id(job.paths.data_root, dataset_id)
+            selected_output_dir = Path(str(selected_dataset["output_dir"]))
+            dataset_path = selected_output_dir / "train.npz"
+            validation_path = selected_output_dir / "validation.npz"
+            dataset_resolution = {
+                "selection_mode": dataset_selection_mode,
+                "resolved_from_registry": True,
+                "selected_labeled_samples": int(selected_dataset.get("labeled_samples", 0)),
+                "selected_build_mode": str(selected_dataset.get("build_mode", "teacher_label")),
+                "selected_teacher_engine": str(selected_dataset.get("teacher_engine", "")),
+                "selected_teacher_level": str(selected_dataset.get("teacher_level", "")),
+                "selected_output_dir": str(selected_output_dir),
+            }
+        else:
+            dataset_path = _resolve_storage_path(job.paths.drive_root, cfg.get("dataset_path"), job.job_dir / "train.npz")
+            validation_path = _resolve_storage_path(job.paths.drive_root, cfg.get("validation_path"), job.job_dir / "validation.npz")
+            dataset_resolution = {
+                "selection_mode": dataset_selection_mode,
+                "resolved_from_registry": False,
+            }
     checkpoint_dir = _resolve_storage_path(job.paths.drive_root, cfg.get("checkpoint_dir"), job.job_dir / "checkpoints")
     final_dir = _resolve_storage_path(job.paths.drive_root, cfg.get("final_dir"), job.job_dir / "final")
     init_checkpoint_path_cfg = cfg.get("init_checkpoint_path")

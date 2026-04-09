@@ -21,6 +21,7 @@ from songo_model_stockfish.ops.model_registry import (
 from songo_model_stockfish.training.data import build_dataloader
 from songo_model_stockfish.training.jobs import (
     _masked_policy_logits,
+    _resolve_built_dataset_by_id,
     _select_largest_built_dataset,
     _soft_policy_loss,
     _tactical_mask_regularization,
@@ -99,12 +100,27 @@ def run_evaluation(job: JobContext) -> dict[str, object]:
             "selected_output_dir": str(selected_output_dir),
         }
     else:
-        test_dataset_path = _resolve_storage_path(job.paths.drive_root, cfg.get("test_dataset_path"), job.job_dir / "test.npz")
         dataset_id = str(cfg.get("dataset_id", "dataset_v1"))
-        dataset_resolution = {
-            "selection_mode": dataset_selection_mode,
-            "resolved_from_registry": False,
-        }
+        configured_test_dataset_path = str(cfg.get("test_dataset_path", "")).strip()
+        if dataset_id not in {"", "auto"} and not configured_test_dataset_path:
+            selected_dataset = _resolve_built_dataset_by_id(job.paths.data_root, dataset_id)
+            selected_output_dir = Path(str(selected_dataset["output_dir"]))
+            test_dataset_path = selected_output_dir / "test.npz"
+            dataset_resolution = {
+                "selection_mode": dataset_selection_mode,
+                "resolved_from_registry": True,
+                "selected_labeled_samples": int(selected_dataset.get("labeled_samples", 0)),
+                "selected_build_mode": str(selected_dataset.get("build_mode", "teacher_label")),
+                "selected_teacher_engine": str(selected_dataset.get("teacher_engine", "")),
+                "selected_teacher_level": str(selected_dataset.get("teacher_level", "")),
+                "selected_output_dir": str(selected_output_dir),
+            }
+        else:
+            test_dataset_path = _resolve_storage_path(job.paths.drive_root, cfg.get("test_dataset_path"), job.job_dir / "test.npz")
+            dataset_resolution = {
+                "selection_mode": dataset_selection_mode,
+                "resolved_from_registry": False,
+            }
     output_dir = _resolve_storage_path(job.paths.drive_root, cfg.get("output_dir"), job.job_dir / "reports")
     batch_size = int(cfg.get("batch_size", 128))
     soft_policy_loss_weight = float(cfg.get("soft_policy_loss_weight", 0.35))
