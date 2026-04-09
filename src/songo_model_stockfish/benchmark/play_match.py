@@ -59,6 +59,12 @@ def play_match(agent_a: AgentLike, agent_b: AgentLike, *, max_moves: int = 300, 
         moves += 1
 
     raw_winner = songo_ai_game.winner(state)
+    if raw_winner is None and end_reason == "no_legal_moves_available":
+        south_score, north_score = songo_ai_game.scores(state)
+        if south_score > north_score:
+            raw_winner = 0
+        elif north_score > south_score:
+            raw_winner = 1
     logical_winner = raw_winner
     if starter == 1 and raw_winner is not None:
         logical_winner = 0 if raw_winner == 1 else 1
