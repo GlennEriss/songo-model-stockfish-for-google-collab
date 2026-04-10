@@ -5,6 +5,7 @@ import functools
 import hashlib
 import json
 import multiprocessing
+import os
 import shutil
 import time
 from pathlib import Path
@@ -44,6 +45,108 @@ def _default_raw_dir_name_for_dataset_source(dataset_source_id: str) -> str:
         leaf = Path(dataset_source_id).name
         return _default_raw_dir_name_for_dataset_source(leaf)
     return f"raw_{dataset_source_id}"
+
+
+def _read_json_file(path: Path, default: dict[str, Any]) -> dict[str, Any]:
+    if not path.exists():
+        return dict(default)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return dict(default)
+    if not isinstance(payload, dict):
+        return dict(default)
+    return payload
+
+
+def _acquire_lock_dir(lock_dir: Path, timeout_seconds: float = 30.0, poll_seconds: float = 0.1) -> bool:
+    deadline = time.time() + max(1.0, float(timeout_seconds))
+    while time.time() < deadline:
+        try:
+            lock_dir.mkdir(parents=True, exist_ok=False)
+            return True
+        except FileExistsError:
+            time.sleep(max(0.01, float(poll_seconds)))
+    return False
+
+
+def _release_lock_dir(lock_dir: Path) -> None:
+    try:
+        lock_dir.rmdir()
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
+
+
+def _update_global_generation_progress(
+    *,
+    progress_path: Path,
+    lock_dir: Path,
+    global_target_id: str,
+    target_samples: int,
+    job_id: str,
+    dataset_source_id: str,
+    delta_samples: int = 0,
+    delta_games: int = 0,
+) -> dict[str, Any]:
+    lock_ok = _acquire_lock_dir(lock_dir)
+    if not lock_ok:
+        return {}
+    try:
+        state = _read_json_file(
+            progress_path,
+            {
+                "global_target_id": global_target_id,
+                "target_samples": int(target_samples),
+                "total_samples": 0,
+                "total_games": 0,
+                "workers": {},
+                "updated_at": utc_now_iso(),
+            },
+        )
+        state["global_target_id"] = str(state.get("global_target_id") or global_target_id)
+        state["target_samples"] = int(state.get("target_samples") or target_samples)
+        state["total_samples"] = int(state.get("total_samples", 0)) + int(max(0, delta_samples))
+        state["total_games"] = int(state.get("total_games", 0)) + int(max(0, delta_games))
+        workers = state.get("workers")
+        if not isinstance(workers, dict):
+            workers = {}
+        worker_payload = workers.get(job_id, {})
+        if not isinstance(worker_payload, dict):
+            worker_payload = {}
+        worker_payload["dataset_source_id"] = dataset_source_id
+        worker_payload["contributed_samples"] = int(worker_payload.get("contributed_samples", 0)) + int(max(0, delta_samples))
+        worker_payload["contributed_games"] = int(worker_payload.get("contributed_games", 0)) + int(max(0, delta_games))
+        worker_payload["updated_at"] = utc_now_iso()
+        workers[job_id] = worker_payload
+        state["workers"] = workers
+        state["updated_at"] = utc_now_iso()
+        progress_path.parent.mkdir(parents=True, exist_ok=True)
+        progress_path.write_text(json.dumps(state, indent=2, ensure_ascii=True), encoding="utf-8")
+        return state
+    finally:
+        _release_lock_dir(lock_dir)
+
+
+def _read_global_generation_progress(progress_path: Path, global_target_id: str, target_samples: int) -> dict[str, Any]:
+    state = _read_json_file(
+        progress_path,
+        {
+            "global_target_id": global_target_id,
+            "target_samples": int(target_samples),
+            "total_samples": 0,
+            "total_games": 0,
+            "workers": {},
+            "updated_at": utc_now_iso(),
+        },
+    )
+    state.setdefault("global_target_id", global_target_id)
+    state.setdefault("target_samples", int(target_samples))
+    state.setdefault("total_samples", 0)
+    state.setdefault("total_games", 0)
+    state.setdefault("workers", {})
+    return state
 
 
 def _dataset_registry_path(job: JobContext) -> Path:
@@ -1769,6 +1872,15 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
     )
     target_samples = int(cfg.get("target_samples", 0))
     model_agent_device = str(cfg.get("model_agent_device", "cpu")).strip().lower() or "cpu"
+    global_target_enabled = bool(cfg.get("global_target_enabled", False))
+    global_target_id = str(cfg.get("global_target_id", "")).strip() or dataset_source_id
+    global_target_samples = int(cfg.get("global_target_samples", target_samples or 0))
+    global_progress_path = _resolve_storage_path(
+        job.paths.drive_root,
+        cfg.get("global_progress_path"),
+        job.paths.data_root / "global_generation_progress" / f"{global_target_id}.json",
+    )
+    global_progress_lock_dir = Path(str(global_progress_path) + ".lock")
 
     dataset_dir = job.job_dir / "dataset_generation"
     configured_output_raw_dir = cfg.get("output_raw_dir")
@@ -1810,6 +1922,24 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
         num_workers,
         max_pending_futures,
     )
+    if global_target_enabled and source_mode == "benchmatch":
+        state = _update_global_generation_progress(
+            progress_path=global_progress_path,
+            lock_dir=global_progress_lock_dir,
+            global_target_id=global_target_id,
+            target_samples=global_target_samples,
+            job_id=job.job_id,
+            dataset_source_id=dataset_source_id,
+            delta_samples=0,
+            delta_games=0,
+        )
+        job.logger.info(
+            "dataset generation global target enabled | global_target_id=%s | target_samples=%s | current_global_samples=%s | progress_path=%s",
+            global_target_id,
+            global_target_samples,
+            int(state.get("total_samples", 0)),
+            global_progress_path,
+        )
 
     if source_mode not in {"benchmatch", "clone_existing", "derive_existing", "augment_existing", "merge_existing"}:
         raise ValueError(f"Unsupported dataset generation source_mode: {source_mode}")
@@ -2179,6 +2309,7 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
 
         matchup_game_count = 0
         matchup_sample_count = 0
+        global_stop_requested = False
         existing_numbers = _existing_game_numbers(raw_dir, sampled_dir, matchup_id)
         existing_game_count = len(existing_numbers)
         job.logger.info(
@@ -2252,6 +2383,16 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
                 }
             )
 
+        def _global_target_reached() -> bool:
+            if not (global_target_enabled and source_mode == "benchmatch" and global_target_samples > 0):
+                return False
+            state = _read_global_generation_progress(
+                global_progress_path,
+                global_target_id=global_target_id,
+                target_samples=global_target_samples,
+            )
+            return int(state.get("total_samples", 0)) >= int(global_target_samples)
+
         def _make_sequential_progress_callback(base_games: int, base_samples: int) -> Callable[[dict[str, Any], int, int], None]:
             def _on_sequential_game_completed(pending: dict[str, Any], completed_games_so_far: int, completed_samples_so_far: int) -> None:
                 nonlocal matchup_game_count, matchup_sample_count, total_samples_after_run
@@ -2279,6 +2420,17 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
             )
             matchup_game_count = int(completed_games)
             matchup_sample_count = int(completed_samples)
+            if global_target_enabled and source_mode == "benchmatch":
+                _update_global_generation_progress(
+                    progress_path=global_progress_path,
+                    lock_dir=global_progress_lock_dir,
+                    global_target_id=global_target_id,
+                    target_samples=global_target_samples,
+                    job_id=job.job_id,
+                    dataset_source_id=dataset_source_id,
+                    delta_samples=int(completed_samples),
+                    delta_games=int(completed_games),
+                )
             if pending_games:
                 _update_benchmatch_progress(str(pending_games[-1]["game_id"]))
         else:
@@ -2311,7 +2463,14 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
                     max_tasks_per_child=effective_max_tasks_per_child,
                 ) as executor:
                     while pending_queue or future_map:
+                        if _global_target_reached():
+                            global_stop_requested = True
+                            pending_queue.clear()
                         while pending_queue and len(future_map) < max_pending_futures:
+                            if _global_target_reached():
+                                global_stop_requested = True
+                                pending_queue.clear()
+                                break
                             pending = pending_queue.pop(0)
                             job.logger.info(
                                 "dataset game scheduled | matchup=%s | game=%s/%s | seed=%s | starter=%s | mode=parallel",
@@ -2355,6 +2514,20 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
                             matchup_game_count += games_inc
                             matchup_sample_count += samples_inc
                             total_samples_after_run += samples_inc
+                            if global_target_enabled and source_mode == "benchmatch":
+                                global_state = _update_global_generation_progress(
+                                    progress_path=global_progress_path,
+                                    lock_dir=global_progress_lock_dir,
+                                    global_target_id=global_target_id,
+                                    target_samples=global_target_samples,
+                                    job_id=job.job_id,
+                                    dataset_source_id=dataset_source_id,
+                                    delta_samples=int(samples_inc),
+                                    delta_games=int(games_inc),
+                                )
+                                if int(global_state.get("total_samples", 0)) >= int(global_target_samples or 0) > 0:
+                                    global_stop_requested = True
+                                    pending_queue.clear()
                             if matchup_game_count % progress_update_every_n_games == 0:
                                 _update_benchmatch_progress(str(pending["game_id"]))
             except concurrent.futures.process.BrokenProcessPool as exc:
@@ -2399,6 +2572,12 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
                             "target_samples": target_samples,
                         }
                     )
+        if global_stop_requested:
+            job.logger.info(
+                "dataset generation global target reached, stopping early | global_target_id=%s | target_samples=%s",
+                global_target_id,
+                global_target_samples,
+            )
 
         summary_payload = {
             "matchup_id": matchup_id,
@@ -2449,6 +2628,8 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
             summaries=summaries,
             total_samples=total_samples_after_run,
         )
+        if global_stop_requested:
+            break
 
     added_games = sum(int(item["games_added"]) for item in summaries)
     added_samples = sum(int(item["samples_added"]) for item in summaries)
