@@ -59,17 +59,20 @@ def _read_dataset_registry(data_root: Path, firestore_cfg: dict[str, Any] | None
             api_key = str(cfg.get("api_key", "")).strip()
             credentials = None
             client_options = None
+            use_api_key_mode = False
             if credentials_path:
                 from google.oauth2 import service_account
 
                 credentials = service_account.Credentials.from_service_account_file(credentials_path)
             elif api_key:
-                from google.auth.credentials import AnonymousCredentials
                 from google.api_core.client_options import ClientOptions
 
-                credentials = AnonymousCredentials()
                 client_options = ClientOptions(api_key=api_key)
-            client = firestore.Client(project=(project_id or None), credentials=credentials, client_options=client_options)
+                use_api_key_mode = True
+            if use_api_key_mode:
+                client = firestore.Client(project=(project_id or None), client_options=client_options)
+            else:
+                client = firestore.Client(project=(project_id or None), credentials=credentials, client_options=client_options)
             snap = client.collection(collection).document(document).get()
             payload = snap.to_dict() if snap.exists else {"dataset_sources": [], "built_datasets": []}
         except Exception:

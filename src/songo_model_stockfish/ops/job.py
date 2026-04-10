@@ -71,16 +71,18 @@ def _build_firestore_job_client(*, project_id: str, credentials_path: str, api_k
 
     credentials = None
     client_options = None
+    use_api_key_mode = False
     if credentials_path:
         from google.oauth2 import service_account
 
         credentials = service_account.Credentials.from_service_account_file(credentials_path)
     elif api_key:
-        from google.auth.credentials import AnonymousCredentials
         from google.api_core.client_options import ClientOptions
 
-        credentials = AnonymousCredentials()
         client_options = ClientOptions(api_key=api_key)
+        use_api_key_mode = True
+    if use_api_key_mode:
+        return firestore.Client(project=(project_id or None), client_options=client_options)
     return firestore.Client(project=(project_id or None), credentials=credentials, client_options=client_options)
 
 

@@ -258,6 +258,7 @@ def _build_firestore_progress_endpoint(
 
     credentials = None
     client_options = None
+    use_api_key_mode = False
     if credentials_path:
         if not Path(credentials_path).exists():
             raise FileNotFoundError(f"Fichier credentials Firestore introuvable: {credentials_path}")
@@ -269,15 +270,17 @@ def _build_firestore_progress_endpoint(
             raise RuntimeError(f"Chargement credentials Firestore impossible: {credentials_path}") from exc
     elif api_key:
         try:
-            from google.auth.credentials import AnonymousCredentials
             from google.api_core.client_options import ClientOptions
 
-            credentials = AnonymousCredentials()
             client_options = ClientOptions(api_key=api_key)
+            use_api_key_mode = True
         except Exception as exc:
             raise RuntimeError("Initialisation Firestore en mode API key impossible.") from exc
     try:
-        client = firestore.Client(project=(project_id or None), credentials=credentials, client_options=client_options)
+        if use_api_key_mode:
+            client = firestore.Client(project=(project_id or None), client_options=client_options)
+        else:
+            client = firestore.Client(project=(project_id or None), credentials=credentials, client_options=client_options)
     except Exception as exc:
         raise RuntimeError("Creation client Firestore impossible.") from exc
     doc_ref = client.collection(collection).document(document)

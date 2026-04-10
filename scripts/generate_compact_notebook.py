@@ -220,7 +220,6 @@ cells = [
             worker_count = max(1, int(worker_count))
             try:
                 from google.cloud import firestore
-                from google.auth.credentials import AnonymousCredentials
                 from google.api_core.client_options import ClientOptions
                 credentials_path = str(FIRESTORE_CREDENTIALS_PATH).strip()
                 project_id = str(FIRESTORE_PROJECT_ID).strip()
@@ -231,10 +230,8 @@ cells = [
                     creds = service_account.Credentials.from_service_account_file(credentials_path)
                     client = firestore.Client(project=(project_id or None), credentials=creds)
                 elif str(FIRESTORE_API_KEY).strip():
-                    creds = AnonymousCredentials()
                     client = firestore.Client(
                         project=(project_id or None),
-                        credentials=creds,
                         client_options=ClientOptions(api_key=str(FIRESTORE_API_KEY).strip()),
                     )
                 else:
@@ -365,7 +362,6 @@ cells = [
                 debug_context = _firestore_monitor_debug_context(global_target_id=str(global_target_id))
                 try:
                     from google.cloud import firestore
-                    from google.auth.credentials import AnonymousCredentials
                     from google.api_core.client_options import ClientOptions
                     credentials_path = str(FIRESTORE_CREDENTIALS_PATH).strip()
                     project_id = str(FIRESTORE_PROJECT_ID).strip()
@@ -378,10 +374,8 @@ cells = [
                         creds = service_account.Credentials.from_service_account_file(credentials_path)
                         client = firestore.Client(project=(project_id or None), credentials=creds)
                     elif str(FIRESTORE_API_KEY).strip():
-                        creds = AnonymousCredentials()
                         client = firestore.Client(
                             project=(project_id or None),
-                            credentials=creds,
                             client_options=ClientOptions(api_key=str(FIRESTORE_API_KEY).strip()),
                         )
                     else:
@@ -404,7 +398,6 @@ cells = [
 
         def _get_firestore_client():
             from google.cloud import firestore
-            from google.auth.credentials import AnonymousCredentials
             from google.api_core.client_options import ClientOptions
             credentials_path = str(FIRESTORE_CREDENTIALS_PATH).strip()
             project_id = str(FIRESTORE_PROJECT_ID).strip()
@@ -413,10 +406,8 @@ cells = [
                 creds = service_account.Credentials.from_service_account_file(credentials_path)
                 return firestore.Client(project=(project_id or None), credentials=creds)
             if str(FIRESTORE_API_KEY).strip():
-                creds = AnonymousCredentials()
                 return firestore.Client(
                     project=(project_id or None),
-                    credentials=creds,
                     client_options=ClientOptions(api_key=str(FIRESTORE_API_KEY).strip()),
                 )
             return firestore.Client(project=(project_id or None))
