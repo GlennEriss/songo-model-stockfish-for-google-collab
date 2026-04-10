@@ -211,7 +211,12 @@ def _run_epoch(
                 loss_total.backward()
                 if gradient_clip_norm > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
-                optimizer.step()
+                if device.type == "xla":
+                    import torch_xla.core.xla_model as xm  # type: ignore[import-not-found]
+
+                    xm.optimizer_step(optimizer, barrier=False)
+                else:
+                    optimizer.step()
 
         preds = _masked_policy_logits(policy_logits, legal_mask).argmax(dim=1)
         total_correct += int((preds == policy_index).sum().item())
@@ -330,10 +335,23 @@ def run_train(job: JobContext) -> dict[str, object]:
     log_every_n_batches = max(1, int(cfg.get("log_every_n_batches", 1)))
     gradient_clip_norm = float(cfg.get("gradient_clip_norm", 0.0))
     early_stopping_patience = max(0, int(cfg.get("early_stopping_patience", 0)))
-    requested_device = str(runtime_cfg.get("device", "cpu"))
-    device = torch.device(requested_device if requested_device == "cpu" or torch.cuda.is_available() else "cpu")
+    requested_device = str(runtime_cfg.get("device", "cpu")).strip().lower() or "cpu"
+    if requested_device in {"tpu", "xla"}:
+        try:
+            import torch_xla.core.xla_model as xm  # type: ignore[import-not-found]
+
+            device = xm.xla_device()
+        except Exception:
+            job.logger.warning("TPU/XLA requested but unavailable, falling back to CPU")
+            device = torch.device("cpu")
+    elif requested_device == "cuda" and torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
     num_workers = int(runtime_cfg.get("num_workers", 0))
     pin_memory = bool(runtime_cfg.get("pin_memory", device.type == "cuda"))
+    if device.type == "xla":
+        pin_memory = False
     persistent_workers = bool(runtime_cfg.get("persistent_workers", num_workers > 0))
     prefetch_factor = runtime_cfg.get("prefetch_factor")
     amp_enabled = bool(runtime_cfg.get("mixed_precision", False) and device.type == "cuda")

@@ -128,6 +128,11 @@ cells = [
         BENCHMATCH_ORDERED_MATCHUPS = True
         BENCHMATCH_MODEL_AGENT_DEVICE = 'cpu'
         SOURCE_POLL_INTERVAL_SECONDS = 20
+        DATASET_GENERATE_WORKERS = 16
+        DATASET_GENERATE_MAX_PENDING_FUTURES = 32
+        DATASET_BUILD_WORKERS = 16
+        DATASET_BUILD_MAX_PENDING_FUTURES = 32
+        AUTO_TUNE_RESOURCES = True
 
         CPU_SAFE_NUM_WORKERS = 2
         CPU_SAFE_PREFETCH_FACTOR = 2
@@ -138,6 +143,12 @@ cells = [
         TRAIN_SCRATCH_CPU_CONFIG_PATH = f'{WORKTREE}/config/generated/train.full_matrix.colab_pro.scratch.cpu.yaml'
         EVALUATION_CPU_CONFIG_PATH = f'{WORKTREE}/config/generated/evaluation.full_matrix.colab_pro.cpu.yaml'
         BENCHMARK_CPU_CONFIG_PATH = f'{WORKTREE}/config/generated/benchmark.colab_pro.cpu.yaml'
+        TRAIN_CONTINUE_TPU_CONFIG_PATH = f'{WORKTREE}/config/generated/train.full_matrix.colab_pro.tpu.yaml'
+        TRAIN_SCRATCH_TPU_CONFIG_PATH = f'{WORKTREE}/config/generated/train.full_matrix.colab_pro.scratch.tpu.yaml'
+        EVALUATION_TPU_CONFIG_PATH = f'{WORKTREE}/config/generated/evaluation.full_matrix.colab_pro.tpu.yaml'
+        BENCHMARK_TPU_CONFIG_PATH = f'{WORKTREE}/config/generated/benchmark.colab_pro.tpu.yaml'
+        TRAIN_CONTINUE_20M_CONFIG_ACTIVE_PATH = f'{WORKTREE}/config/generated/train.full_matrix.colab_pro.continue.dataset20m.active.yaml'
+        TRAIN_SCRATCH_20M_CONFIG_ACTIVE_PATH = f'{WORKTREE}/config/generated/train.full_matrix.colab_pro.scratch.dataset20m.active.yaml'
 
         DATASET_LIST_KIND = 'all'       # 'sources', 'built', 'all'
         DATASET_LIST_SORT_BY = 'size'   # 'size', 'created_at', 'updated_at'
@@ -163,6 +174,9 @@ cells = [
         print('DATASET_BUILD_ID        =', DATASET_BUILD_ID)
         print('TARGET_SAMPLES          =', TARGET_SAMPLES)
         print('TARGET_LABELED_SAMPLES  =', TARGET_LABELED_SAMPLES)
+        print('AUTO_TUNE_RESOURCES     =', AUTO_TUNE_RESOURCES)
+        print('DATASET_GENERATE_WORKERS =', DATASET_GENERATE_WORKERS)
+        print('DATASET_BUILD_WORKERS    =', DATASET_BUILD_WORKERS)
         print('DATASET_GENERATE_JOB_ID =', DATASET_GENERATE_JOB_ID)
         print('DATASET_BUILD_JOB_ID    =', DATASET_BUILD_JOB_ID)
         print('TRAIN_CONTINUE_JOB_ID   =', TRAIN_CONTINUE_JOB_ID)
@@ -175,19 +189,42 @@ cells = [
     code(
         """
         import json
+        import os
         import re
+        import math
+        import subprocess
         from pathlib import Path
 
         import torch
         import yaml
 
+        RUNTIME_PROFILE = 'cpu'
+        TPU_ENV_PRESENT = bool(os.environ.get('COLAB_TPU_ADDR'))
+        TPU_RUNTIME_READY = False
+        if TPU_ENV_PRESENT:
+            try:
+                import torch_xla.core.xla_model as xm  # type: ignore[import-not-found]
+                _ = xm.xla_device()
+                TPU_RUNTIME_READY = True
+            except Exception:
+                TPU_RUNTIME_READY = False
+
         RUNTIME_HAS_CUDA = bool(torch.cuda.is_available())
+        if TPU_RUNTIME_READY:
+            RUNTIME_PROFILE = 'tpu'
+        elif RUNTIME_HAS_CUDA:
+            RUNTIME_PROFILE = 'gpu'
+        else:
+            RUNTIME_PROFILE = 'cpu'
+
         TRAIN_CONTINUE_CONFIG_ACTIVE = TRAIN_CONTINUE_CONFIG
         TRAIN_SCRATCH_CONFIG_ACTIVE = TRAIN_SCRATCH_CONFIG
         EVALUATION_CONFIG_ACTIVE = EVALUATION_CONFIG
         BENCHMARK_CONFIG_ACTIVE = BENCHMARK_CONFIG
         DATASET_GENERATE_CONFIG_ACTIVE = DATASET_GENERATE_CONFIG_ACTIVE_PATH
         DATASET_BUILD_CONFIG_ACTIVE = DATASET_BUILD_CONFIG_ACTIVE_PATH
+        TRAIN_CONTINUE_20M_CONFIG_ACTIVE = TRAIN_CONTINUE_20M_CONFIG_ACTIVE_PATH
+        TRAIN_SCRATCH_20M_CONFIG_ACTIVE = TRAIN_SCRATCH_20M_CONFIG_ACTIVE_PATH
 
         def _version_sort_key(model_id: str):
             match = re.search(r'_v(\\d+)$', model_id)
@@ -204,13 +241,107 @@ cells = [
             cfg['runtime'] = runtime_cfg
             return cfg
 
+        def _make_tpu_runtime_cfg(cfg: dict) -> dict:
+            runtime_cfg = dict(cfg.get('runtime', {}) or {})
+            runtime_cfg['device'] = 'xla'
+            runtime_cfg['num_workers'] = int(max(2, CPU_SAFE_NUM_WORKERS))
+            runtime_cfg['pin_memory'] = False
+            runtime_cfg['persistent_workers'] = bool(runtime_cfg['num_workers'] > 0)
+            runtime_cfg['prefetch_factor'] = int(max(2, CPU_SAFE_PREFETCH_FACTOR)) if runtime_cfg['num_workers'] > 0 else 0
+            runtime_cfg['mixed_precision'] = False
+            cfg['runtime'] = runtime_cfg
+            return cfg
+
         def _write_yaml(payload: dict, target_path_str: str) -> str:
             target_path = Path(target_path_str)
             target_path.parent.mkdir(parents=True, exist_ok=True)
             target_path.write_text(yaml.safe_dump(payload, sort_keys=False, allow_unicode=True), encoding='utf-8')
             return str(target_path)
 
-        if not RUNTIME_HAS_CUDA:
+        def _detect_ram_gb() -> float:
+            try:
+                import psutil  # type: ignore[import-not-found]
+                return float(psutil.virtual_memory().total) / (1024 ** 3)
+            except Exception:
+                try:
+                    pages = os.sysconf('SC_PHYS_PAGES')
+                    page_size = os.sysconf('SC_PAGE_SIZE')
+                    return float(pages * page_size) / (1024 ** 3)
+                except Exception:
+                    return 0.0
+
+        def _detect_gpu_mem_gb() -> float:
+            if not torch.cuda.is_available():
+                return 0.0
+            try:
+                return float(torch.cuda.get_device_properties(0).total_memory) / (1024 ** 3)
+            except Exception:
+                return 0.0
+
+        def _safe_loadavg() -> float:
+            try:
+                return float(os.getloadavg()[0])
+            except Exception:
+                return 0.0
+
+        cpu_count = int(os.cpu_count() or 2)
+        ram_gb = _detect_ram_gb()
+        gpu_mem_gb = _detect_gpu_mem_gb()
+        load1 = _safe_loadavg()
+
+        runtime_summary = {
+            'cpu_count': cpu_count,
+            'ram_gb': round(ram_gb, 2),
+            'loadavg_1m': round(load1, 2),
+            'runtime_profile': RUNTIME_PROFILE,
+            'gpu_available': bool(RUNTIME_HAS_CUDA),
+            'gpu_mem_gb': round(gpu_mem_gb, 2),
+            'tpu_env_present': bool(TPU_ENV_PRESENT),
+            'tpu_runtime_ready': bool(TPU_RUNTIME_READY),
+        }
+
+        if AUTO_TUNE_RESOURCES:
+            if RUNTIME_PROFILE == 'tpu':
+                suggested_workers = max(8, min(24, cpu_count))
+                suggested_train_workers = max(4, min(12, cpu_count // 2 if cpu_count > 1 else 1))
+                suggested_batch_size = 4096
+                BENCHMATCH_MODEL_AGENT_DEVICE = 'cpu'
+            elif RUNTIME_PROFILE == 'gpu':
+                suggested_workers = max(8, min(24, cpu_count))
+                suggested_train_workers = max(4, min(12, cpu_count // 2 if cpu_count > 1 else 1))
+                if gpu_mem_gb >= 30:
+                    suggested_batch_size = 8192
+                elif gpu_mem_gb >= 15:
+                    suggested_batch_size = 4096
+                else:
+                    suggested_batch_size = 2048
+                BENCHMATCH_MODEL_AGENT_DEVICE = 'cuda'
+            else:
+                if load1 > 0 and cpu_count > 0 and (load1 / float(cpu_count)) > 0.85:
+                    cpu_budget = max(4, int(math.floor(cpu_count * 0.6)))
+                else:
+                    cpu_budget = max(4, int(math.floor(cpu_count * 0.8)))
+                mem_cap = max(4, int(ram_gb // 0.8)) if ram_gb > 0 else 8
+                suggested_workers = max(4, min(24, cpu_budget, mem_cap))
+                suggested_train_workers = max(2, min(8, suggested_workers // 2))
+                if ram_gb >= 24:
+                    suggested_batch_size = 4096
+                elif ram_gb >= 12:
+                    suggested_batch_size = 2048
+                else:
+                    suggested_batch_size = 1024
+                BENCHMATCH_MODEL_AGENT_DEVICE = 'cpu'
+
+            DATASET_GENERATE_WORKERS = int(suggested_workers)
+            DATASET_BUILD_WORKERS = int(suggested_workers)
+            DATASET_GENERATE_MAX_PENDING_FUTURES = int(DATASET_GENERATE_WORKERS * 2)
+            DATASET_BUILD_MAX_PENDING_FUTURES = int(DATASET_BUILD_WORKERS * 2)
+            CPU_SAFE_NUM_WORKERS = int(suggested_train_workers)
+            tuned_batch_size = int(suggested_batch_size)
+        else:
+            tuned_batch_size = None
+
+        if RUNTIME_PROFILE == 'cpu':
             for base_relative, target_path, assign_name in [
                 (TRAIN_CONTINUE_CONFIG, TRAIN_CONTINUE_CPU_CONFIG_PATH, 'TRAIN_CONTINUE_CONFIG_ACTIVE'),
                 (TRAIN_SCRATCH_CONFIG, TRAIN_SCRATCH_CPU_CONFIG_PATH, 'TRAIN_SCRATCH_CONFIG_ACTIVE'),
@@ -219,6 +350,40 @@ cells = [
             ]:
                 base_cfg = yaml.safe_load((Path(WORKTREE) / base_relative).read_text(encoding='utf-8')) or {}
                 globals()[assign_name] = _write_yaml(_make_cpu_safe_runtime_cfg(base_cfg), target_path)
+        elif RUNTIME_PROFILE == 'tpu':
+            for base_relative, target_path, assign_name in [
+                (TRAIN_CONTINUE_CONFIG, TRAIN_CONTINUE_TPU_CONFIG_PATH, 'TRAIN_CONTINUE_CONFIG_ACTIVE'),
+                (TRAIN_SCRATCH_CONFIG, TRAIN_SCRATCH_TPU_CONFIG_PATH, 'TRAIN_SCRATCH_CONFIG_ACTIVE'),
+                (EVALUATION_CONFIG, EVALUATION_TPU_CONFIG_PATH, 'EVALUATION_CONFIG_ACTIVE'),
+                (BENCHMARK_CONFIG, BENCHMARK_TPU_CONFIG_PATH, 'BENCHMARK_CONFIG_ACTIVE'),
+            ]:
+                base_cfg = yaml.safe_load((Path(WORKTREE) / base_relative).read_text(encoding='utf-8')) or {}
+                globals()[assign_name] = _write_yaml(_make_tpu_runtime_cfg(base_cfg), target_path)
+
+        if AUTO_TUNE_RESOURCES and tuned_batch_size is not None:
+            for key_name in ['TRAIN_CONTINUE_CONFIG_ACTIVE', 'TRAIN_SCRATCH_CONFIG_ACTIVE']:
+                current_path = Path(str(globals()[key_name]))
+                cfg_payload = yaml.safe_load(current_path.read_text(encoding='utf-8')) or {}
+                runtime_payload = dict(cfg_payload.get('runtime', {}) or {})
+                runtime_payload['num_workers'] = int(CPU_SAFE_NUM_WORKERS)
+                runtime_payload['persistent_workers'] = bool(CPU_SAFE_NUM_WORKERS > 0)
+                runtime_payload['prefetch_factor'] = int(max(2, CPU_SAFE_PREFETCH_FACTOR)) if CPU_SAFE_NUM_WORKERS > 0 else 0
+                runtime_payload['pin_memory'] = bool(runtime_payload.get('device', 'cpu') == 'cuda')
+                cfg_payload['runtime'] = runtime_payload
+                train_payload = dict(cfg_payload.get('train', {}) or {})
+                train_payload['batch_size'] = int(tuned_batch_size)
+                cfg_payload['train'] = train_payload
+                current_path.write_text(yaml.safe_dump(cfg_payload, sort_keys=False, allow_unicode=True), encoding='utf-8')
+
+            eval_path = Path(str(EVALUATION_CONFIG_ACTIVE))
+            eval_cfg_payload = yaml.safe_load(eval_path.read_text(encoding='utf-8')) or {}
+            eval_runtime_payload = dict(eval_cfg_payload.get('runtime', {}) or {})
+            eval_runtime_payload['num_workers'] = int(max(1, CPU_SAFE_NUM_WORKERS))
+            eval_runtime_payload['persistent_workers'] = bool(eval_runtime_payload['num_workers'] > 0)
+            eval_runtime_payload['prefetch_factor'] = int(max(2, CPU_SAFE_PREFETCH_FACTOR)) if eval_runtime_payload['num_workers'] > 0 else 0
+            eval_runtime_payload['pin_memory'] = bool(eval_runtime_payload.get('device', 'cpu') == 'cuda')
+            eval_cfg_payload['runtime'] = eval_runtime_payload
+            eval_path.write_text(yaml.safe_dump(eval_cfg_payload, sort_keys=False, allow_unicode=True), encoding='utf-8')
 
         model_registry_path = Path(DRIVE_ROOT) / 'models' / 'model_registry.json'
         model_registry = json.loads(model_registry_path.read_text(encoding='utf-8')) if model_registry_path.exists() else {'models': []}
@@ -276,6 +441,8 @@ cells = [
         generate_block['target_samples'] = int(TARGET_SAMPLES)
         generate_block['output_sampled_dir'] = output_sampled_dir
         generate_block['output_raw_dir'] = output_raw_dir
+        generate_block['workers'] = int(DATASET_GENERATE_WORKERS)
+        generate_block['max_pending_futures'] = int(DATASET_GENERATE_MAX_PENDING_FUTURES)
         generate_block['games'] = int(BENCHMATCH_GAMES)
         generate_block['matchups'] = matchups
         generate_block['model_agent_device'] = str(BENCHMATCH_MODEL_AGENT_DEVICE)
@@ -291,15 +458,37 @@ cells = [
         build_block['target_labeled_samples'] = int(TARGET_LABELED_SAMPLES)
         build_block['follow_source_updates'] = True
         build_block['source_poll_interval_seconds'] = float(SOURCE_POLL_INTERVAL_SECONDS)
+        build_block['workers'] = int(DATASET_BUILD_WORKERS)
+        build_block['max_pending_futures'] = int(DATASET_BUILD_MAX_PENDING_FUTURES)
         build_block['export_partial_every_n_files'] = int(min(20, int(build_block.get('export_partial_every_n_files', 100) or 100)))
         build_cfg['dataset_build'] = build_block
         DATASET_BUILD_CONFIG_ACTIVE = _write_yaml(build_cfg, DATASET_BUILD_CONFIG_ACTIVE_PATH)
 
+        train_continue_cfg = yaml.safe_load(Path(TRAIN_CONTINUE_CONFIG_ACTIVE).read_text(encoding='utf-8')) or {}
+        train_continue_block = dict(train_continue_cfg.get('train', {}) or {})
+        train_continue_block['dataset_selection_mode'] = 'configured'
+        train_continue_block['dataset_id'] = DATASET_BUILD_ID
+        train_continue_cfg['train'] = train_continue_block
+        TRAIN_CONTINUE_20M_CONFIG_ACTIVE = _write_yaml(train_continue_cfg, TRAIN_CONTINUE_20M_CONFIG_ACTIVE_PATH)
+
+        train_scratch_cfg = yaml.safe_load(Path(TRAIN_SCRATCH_CONFIG_ACTIVE).read_text(encoding='utf-8')) or {}
+        train_scratch_block = dict(train_scratch_cfg.get('train', {}) or {})
+        train_scratch_block['dataset_selection_mode'] = 'configured'
+        train_scratch_block['dataset_id'] = DATASET_BUILD_ID
+        train_scratch_cfg['train'] = train_scratch_block
+        TRAIN_SCRATCH_20M_CONFIG_ACTIVE = _write_yaml(train_scratch_cfg, TRAIN_SCRATCH_20M_CONFIG_ACTIVE_PATH)
+
+        print('RUNTIME_PROFILE                =', RUNTIME_PROFILE)
+        print('TPU_ENV_PRESENT                =', TPU_ENV_PRESENT)
+        print('TPU_RUNTIME_READY              =', TPU_RUNTIME_READY)
         print('RUNTIME_HAS_CUDA               =', RUNTIME_HAS_CUDA)
+        print('RUNTIME_SUMMARY                =', runtime_summary)
         print('DATASET_GENERATE_CONFIG_ACTIVE =', DATASET_GENERATE_CONFIG_ACTIVE)
         print('DATASET_BUILD_CONFIG_ACTIVE    =', DATASET_BUILD_CONFIG_ACTIVE)
         print('TRAIN_CONTINUE_CONFIG_ACTIVE   =', TRAIN_CONTINUE_CONFIG_ACTIVE)
         print('TRAIN_SCRATCH_CONFIG_ACTIVE    =', TRAIN_SCRATCH_CONFIG_ACTIVE)
+        print('TRAIN_CONTINUE_20M_CONFIG_ACTIVE =', TRAIN_CONTINUE_20M_CONFIG_ACTIVE)
+        print('TRAIN_SCRATCH_20M_CONFIG_ACTIVE  =', TRAIN_SCRATCH_20M_CONFIG_ACTIVE)
         print('EVALUATION_CONFIG_ACTIVE       =', EVALUATION_CONFIG_ACTIVE)
         print('BENCHMARK_CONFIG_ACTIVE        =', BENCHMARK_CONFIG_ACTIVE)
         print('output_raw_dir                 =', output_raw_dir)
@@ -308,6 +497,10 @@ cells = [
         print('total_agents                   =', len(bench_agents))
         print('total_matchups                 =', len(matchups))
         print('export_partial_every_n_files   =', build_block.get('export_partial_every_n_files'))
+        print('autotuned_generate_workers     =', DATASET_GENERATE_WORKERS)
+        print('autotuned_build_workers        =', DATASET_BUILD_WORKERS)
+        print('autotuned_train_workers        =', CPU_SAFE_NUM_WORKERS)
+        print('autotuned_train_batch_size     =', tuned_batch_size)
         """
     ),
     md("## 5. Lancer le pipeline dataset en parallele"),
@@ -651,12 +844,16 @@ cells = [
     md("## 7. Entrainement"),
     code(
         """
-        !bash -lc "cd $WORKTREE && PYTHONPATH=$WORKTREE/src $PYTHON_BIN -m songo_model_stockfish.cli.main train --config $TRAIN_CONTINUE_CONFIG_ACTIVE --job-id $TRAIN_CONTINUE_JOB_ID"
+        print('Cellule A: continue depuis best sur dataset 20M partiel')
+        print('config =', TRAIN_CONTINUE_20M_CONFIG_ACTIVE)
+        !bash -lc "cd $WORKTREE && PYTHONPATH=$WORKTREE/src $PYTHON_BIN -m songo_model_stockfish.cli.main train --config $TRAIN_CONTINUE_20M_CONFIG_ACTIVE --job-id $TRAIN_CONTINUE_JOB_ID"
         """
     ),
     code(
         """
-        !bash -lc "cd $WORKTREE && PYTHONPATH=$WORKTREE/src $PYTHON_BIN -m songo_model_stockfish.cli.main train --config $TRAIN_SCRATCH_CONFIG_ACTIVE --job-id $TRAIN_SCRATCH_JOB_ID"
+        print('Cellule B: from scratch sur dataset 20M partiel')
+        print('config =', TRAIN_SCRATCH_20M_CONFIG_ACTIVE)
+        !bash -lc "cd $WORKTREE && PYTHONPATH=$WORKTREE/src $PYTHON_BIN -m songo_model_stockfish.cli.main train --config $TRAIN_SCRATCH_20M_CONFIG_ACTIVE --job-id $TRAIN_SCRATCH_JOB_ID"
         """
     ),
     md("## 8. Evaluation"),
