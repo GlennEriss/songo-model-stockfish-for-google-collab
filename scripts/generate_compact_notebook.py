@@ -1320,13 +1320,79 @@ cells = [
         runtime_eval_cfg_path = Path(EVALUATION_20M_RUNTIME_CONFIG_PATH)
         eval_cfg = yaml.safe_load(base_eval_cfg_path.read_text(encoding='utf-8')) or {}
         eval_block = dict(eval_cfg.get('evaluation', {}) or {})
-        dataset_id = str(eval_block.get('dataset_id', DATASET_BUILD_ID))
+        requested_dataset_id = str(eval_block.get('dataset_id', DATASET_BUILD_ID))
+        dataset_id = requested_dataset_id
 
         registry_path = Path(DRIVE_ROOT) / 'data' / 'dataset_registry.json'
         registry = json.loads(registry_path.read_text(encoding='utf-8')) if registry_path.exists() else {'built_datasets': []}
-        built = next((item for item in registry.get('built_datasets', []) if str(item.get('dataset_id', '')) == dataset_id), None)
+        built_entries = [item for item in registry.get('built_datasets', []) if isinstance(item, dict)]
+
+        def _entry_output_dir(entry: dict) -> Path:
+            return Path(str(entry.get('output_dir', '')).strip())
+
+        def _has_test_npz(entry: dict) -> bool:
+            output_dir = _entry_output_dir(entry)
+            return output_dir.exists() and (output_dir / 'test.npz').exists()
+
+        built = next(
+            (
+                item
+                for item in built_entries
+                if str(item.get('dataset_id', '')).strip() == dataset_id and _has_test_npz(item)
+            ),
+            None,
+        )
+
         if built is None:
-            raise ValueError(f'Dataset introuvable dans le registre: {dataset_id}')
+            prefix = f'{BASE_DATASET_BUILD_ID}_'
+            shard_candidates = [
+                item
+                for item in built_entries
+                if _has_test_npz(item)
+                and (
+                    str(item.get('dataset_id', '')).strip() == BASE_DATASET_BUILD_ID
+                    or str(item.get('dataset_id', '')).strip().startswith(prefix)
+                )
+            ]
+            if shard_candidates:
+                shard_candidates = sorted(
+                    shard_candidates,
+                    key=lambda item: (
+                        int(item.get('labeled_samples', 0) or 0),
+                        str(item.get('updated_at', '')),
+                    ),
+                    reverse=True,
+                )
+                built = shard_candidates[0]
+                dataset_id = str(built.get('dataset_id', dataset_id)).strip() or dataset_id
+
+        if built is None:
+            datasets_root = Path(DRIVE_ROOT) / 'data' / 'datasets'
+            dir_candidates = []
+            if datasets_root.exists():
+                for path in datasets_root.iterdir():
+                    if not path.is_dir():
+                        continue
+                    name = path.name
+                    if name == requested_dataset_id or name == BASE_DATASET_BUILD_ID or name.startswith(f'{BASE_DATASET_BUILD_ID}_'):
+                        if (path / 'test.npz').exists():
+                            dir_candidates.append(path)
+            if dir_candidates:
+                selected_dir = sorted(dir_candidates, key=lambda p: p.stat().st_mtime, reverse=True)[0]
+                built = {
+                    'dataset_id': selected_dir.name,
+                    'output_dir': str(selected_dir),
+                    'input_dim': 0,
+                    'labeled_samples': 0,
+                    'updated_at': '',
+                }
+                dataset_id = selected_dir.name
+
+        if built is None:
+            raise ValueError(
+                f'Dataset introuvable pour evaluation (requested={requested_dataset_id}, base={BASE_DATASET_BUILD_ID}). '
+                'Attends un snapshot build avec test.npz ou relance la cellule de configuration.'
+            )
 
         dataset_input_dim = int(built.get('input_dim') or 0)
         test_npz_path = Path(str(built.get('output_dir', ''))) / 'test.npz'
@@ -1364,6 +1430,9 @@ cells = [
                 'Entraine d abord un modele sur ce dataset/schema.'
             )
 
+        eval_block['dataset_selection_mode'] = 'configured'
+        eval_block['dataset_id'] = dataset_id
+        eval_block['test_dataset_path'] = str(test_npz_path)
         eval_block['model_id'] = selected['model_id']
         eval_block['checkpoint_path'] = selected['checkpoint_path']
         eval_cfg['evaluation'] = eval_block
