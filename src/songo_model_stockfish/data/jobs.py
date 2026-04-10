@@ -120,18 +120,6 @@ def _resolve_global_progress_backend_config(
             cfg.get("global_target_progress_firestore_api_key", os.environ.get("FIREBASE_API_KEY", "")),
         )
     ).strip()
-    fallback_to_file = bool(
-        cfg.get(
-            "global_progress_firestore_fallback_to_file",
-            cfg.get("global_target_progress_firestore_fallback_to_file", True),
-        )
-    )
-    strict = bool(
-        cfg.get(
-            "global_progress_firestore_strict",
-            cfg.get("global_target_progress_firestore_strict", False),
-        )
-    )
     return {
         "backend": "firestore" if use_firestore else "file",
         "global_target_id": str(global_target_id),
@@ -141,8 +129,6 @@ def _resolve_global_progress_backend_config(
         "firestore_document": document,
         "firestore_credentials_path": credentials_path,
         "firestore_api_key": api_key,
-        "firestore_fallback_to_file": fallback_to_file,
-        "firestore_strict": strict,
     }
 
 
@@ -178,6 +164,85 @@ def _normalize_global_generation_state_payload(
     return state
 
 
+def _firestore_backend_diagnostics(progress_backend: dict[str, Any] | None) -> dict[str, Any]:
+    backend = progress_backend if isinstance(progress_backend, dict) else {}
+    credentials_path = str(backend.get("firestore_credentials_path", "")).strip()
+    api_key = str(backend.get("firestore_api_key", "")).strip()
+    auth_mode = "adc"
+    if credentials_path:
+        auth_mode = "service_account_file"
+    elif api_key:
+        auth_mode = "api_key_anonymous"
+    return {
+        "backend": str(backend.get("backend", "file")).strip().lower() or "file",
+        "project_id": str(backend.get("firestore_project_id", "")).strip(),
+        "collection": str(backend.get("firestore_collection", "")).strip(),
+        "document": str(backend.get("firestore_document", "")).strip(),
+        "global_target_id": str(backend.get("global_target_id", "")).strip(),
+        "auth_mode": auth_mode,
+        "credentials_path": credentials_path,
+        "credentials_path_exists": bool(Path(credentials_path).exists()) if credentials_path else False,
+        "api_key_set": bool(api_key),
+    }
+
+
+def _firestore_error_hint(*, exc: Exception | None, diagnostics: dict[str, Any]) -> str:
+    exc_text = ""
+    if exc is not None:
+        exc_text = f"{type(exc).__name__}: {exc}".lower()
+    auth_mode = str(diagnostics.get("auth_mode", "")).strip().lower()
+    if auth_mode == "adc" and ("metadata.google.internal" in exc_text or "compute engine metadata" in exc_text):
+        return (
+            "Auth ADC indisponible dans ce runtime; configure `global_progress_firestore_api_key` "
+            "ou `global_progress_firestore_credentials_path`."
+        )
+    if "permissiondenied" in exc_text or "permission denied" in exc_text:
+        return "Acces refuse par les regles Firestore (verifie Rules et role du compte)."
+    if "unauthenticated" in exc_text or "invalid authentication credentials" in exc_text:
+        return "Authentification Firestore invalide (api key / credentials)."
+    if "deadlineexceeded" in exc_text or "timeout" in exc_text:
+        return "Timeout reseau vers Firestore (latence/reseau)."
+    if "serviceunavailable" in exc_text or "temporarily unavailable" in exc_text:
+        return "Service Firestore indisponible temporairement; reessayer."
+    if "notfound" in exc_text and "project" in exc_text:
+        return "Projet Firestore introuvable (verifie `firestore_project_id`)."
+    if diagnostics.get("auth_mode") == "service_account_file" and not diagnostics.get("credentials_path_exists"):
+        return "Le fichier credentials n'existe pas au chemin configure."
+    return ""
+
+
+def _raise_firestore_progress_error(
+    *,
+    stage: str,
+    progress_backend: dict[str, Any] | None,
+    exc: Exception | None = None,
+    details: str = "",
+) -> None:
+    diagnostics = _firestore_backend_diagnostics(progress_backend)
+    message_parts = [
+        f"Firestore global progress error",
+        f"stage={stage}",
+        f"backend={diagnostics.get('backend', '')}",
+        f"project_id={diagnostics.get('project_id', '') or '<empty>'}",
+        f"collection={diagnostics.get('collection', '') or '<empty>'}",
+        f"document={diagnostics.get('document', '') or '<empty>'}",
+        f"auth_mode={diagnostics.get('auth_mode', '') or '<unknown>'}",
+        f"credentials_path_exists={diagnostics.get('credentials_path_exists', False)}",
+        f"api_key_set={diagnostics.get('api_key_set', False)}",
+    ]
+    if details:
+        message_parts.append(f"details={details}")
+    if exc is not None:
+        message_parts.append(f"cause={type(exc).__name__}: {exc}")
+    hint = _firestore_error_hint(exc=exc, diagnostics=diagnostics)
+    if hint:
+        message_parts.append(f"hint={hint}")
+    message = " | ".join(message_parts)
+    if exc is not None:
+        raise RuntimeError(message) from exc
+    raise RuntimeError(message)
+
+
 @functools.lru_cache(maxsize=16)
 def _build_firestore_progress_endpoint(
     project_id: str,
@@ -186,21 +251,35 @@ def _build_firestore_progress_endpoint(
     collection: str,
     document: str,
 ) -> tuple[Any, Any, Any]:
-    from google.cloud import firestore
+    try:
+        from google.cloud import firestore
+    except Exception as exc:
+        raise RuntimeError("Import `google.cloud.firestore` impossible.") from exc
 
     credentials = None
     client_options = None
     if credentials_path:
-        from google.oauth2 import service_account
+        if not Path(credentials_path).exists():
+            raise FileNotFoundError(f"Fichier credentials Firestore introuvable: {credentials_path}")
+        try:
+            from google.oauth2 import service_account
 
-        credentials = service_account.Credentials.from_service_account_file(credentials_path)
+            credentials = service_account.Credentials.from_service_account_file(credentials_path)
+        except Exception as exc:
+            raise RuntimeError(f"Chargement credentials Firestore impossible: {credentials_path}") from exc
     elif api_key:
-        from google.auth.credentials import AnonymousCredentials
-        from google.api_core.client_options import ClientOptions
+        try:
+            from google.auth.credentials import AnonymousCredentials
+            from google.api_core.client_options import ClientOptions
 
-        credentials = AnonymousCredentials()
-        client_options = ClientOptions(api_key=api_key)
-    client = firestore.Client(project=(project_id or None), credentials=credentials, client_options=client_options)
+            credentials = AnonymousCredentials()
+            client_options = ClientOptions(api_key=api_key)
+        except Exception as exc:
+            raise RuntimeError("Initialisation Firestore en mode API key impossible.") from exc
+    try:
+        client = firestore.Client(project=(project_id or None), credentials=credentials, client_options=client_options)
+    except Exception as exc:
+        raise RuntimeError("Creation client Firestore impossible.") from exc
     doc_ref = client.collection(collection).document(document)
     return client, doc_ref, firestore
 
@@ -215,8 +294,19 @@ def _resolve_firestore_progress_endpoint(progress_backend: dict[str, Any] | None
     credentials_path = str(backend.get("firestore_credentials_path", "")).strip()
     api_key = str(backend.get("firestore_api_key", "")).strip()
     if not document:
-        return None
-    return _build_firestore_progress_endpoint(project_id, credentials_path, api_key, collection, document)
+        _raise_firestore_progress_error(
+            stage="resolve_endpoint",
+            progress_backend=backend,
+            details="firestore_document vide",
+        )
+    try:
+        return _build_firestore_progress_endpoint(project_id, credentials_path, api_key, collection, document)
+    except Exception as exc:
+        _raise_firestore_progress_error(
+            stage="resolve_endpoint",
+            progress_backend=backend,
+            exc=exc,
+        )
 
 
 def _mirror_global_generation_progress_state(progress_path: Path, state: dict[str, Any]) -> None:
@@ -238,9 +328,14 @@ def _update_global_generation_progress_firestore(
     delta_games: int = 0,
     progress_backend: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    endpoint = _resolve_firestore_progress_endpoint(progress_backend)
+    backend = progress_backend if isinstance(progress_backend, dict) else {}
+    endpoint = _resolve_firestore_progress_endpoint(backend)
     if endpoint is None:
-        return {}
+        _raise_firestore_progress_error(
+            stage="resolve_endpoint",
+            progress_backend=backend,
+            details="endpoint introuvable (backend invalide)",
+        )
     client, doc_ref, firestore_mod = endpoint
     transaction = client.transaction()
 
@@ -283,7 +378,15 @@ def _update_global_generation_progress_firestore(
         tx.set(doc_ref, state)
         return state
 
-    state = _tx(transaction)
+    try:
+        state = _tx(transaction)
+    except Exception as exc:
+        _raise_firestore_progress_error(
+            stage="update_progress_transaction",
+            progress_backend=backend,
+            exc=exc,
+            details=f"job_id={job_id} dataset_source_id={dataset_source_id}",
+        )
     _mirror_global_generation_progress_state(progress_path, state)
     return state
 
@@ -299,9 +402,14 @@ def _reserve_global_generation_budget_firestore(
     requested_games: int = 1,
     progress_backend: dict[str, Any] | None = None,
 ) -> tuple[int, int, dict[str, Any]]:
-    endpoint = _resolve_firestore_progress_endpoint(progress_backend)
+    backend = progress_backend if isinstance(progress_backend, dict) else {}
+    endpoint = _resolve_firestore_progress_endpoint(backend)
     if endpoint is None:
-        return 0, 0, {}
+        _raise_firestore_progress_error(
+            stage="resolve_endpoint",
+            progress_backend=backend,
+            details="endpoint introuvable (backend invalide)",
+        )
     client, doc_ref, firestore_mod = endpoint
     transaction = client.transaction()
 
@@ -355,7 +463,18 @@ def _reserve_global_generation_budget_firestore(
         tx.set(doc_ref, state)
         return int(allowed_samples), int(allowed_games), state
 
-    allowed_samples, allowed_games, state = _tx(transaction)
+    try:
+        allowed_samples, allowed_games, state = _tx(transaction)
+    except Exception as exc:
+        _raise_firestore_progress_error(
+            stage="reserve_budget_transaction",
+            progress_backend=backend,
+            exc=exc,
+            details=(
+                f"job_id={job_id} dataset_source_id={dataset_source_id} "
+                f"requested_samples={requested_samples} requested_games={requested_games}"
+            ),
+        )
     _mirror_global_generation_progress_state(progress_path, state)
     return allowed_samples, allowed_games, state
 
@@ -367,11 +486,23 @@ def _read_global_generation_progress_firestore(
     target_samples: int,
     progress_backend: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    endpoint = _resolve_firestore_progress_endpoint(progress_backend)
+    backend = progress_backend if isinstance(progress_backend, dict) else {}
+    endpoint = _resolve_firestore_progress_endpoint(backend)
     if endpoint is None:
-        return {}
+        _raise_firestore_progress_error(
+            stage="resolve_endpoint",
+            progress_backend=backend,
+            details="endpoint introuvable (backend invalide)",
+        )
     _client, doc_ref, _firestore_mod = endpoint
-    snap = doc_ref.get()
+    try:
+        snap = doc_ref.get()
+    except Exception as exc:
+        _raise_firestore_progress_error(
+            stage="read_progress_document",
+            progress_backend=backend,
+            exc=exc,
+        )
     state = _normalize_global_generation_state_payload(
         payload=(snap.to_dict() if snap.exists else {}),
         global_target_id=global_target_id,
@@ -547,22 +678,16 @@ def _update_global_generation_progress(
 ) -> dict[str, Any]:
     backend = progress_backend if isinstance(progress_backend, dict) else {}
     if str(backend.get("backend", "file")).strip().lower() == "firestore":
-        try:
-            return _update_global_generation_progress_firestore(
-                progress_path=progress_path,
-                global_target_id=global_target_id,
-                target_samples=target_samples,
-                job_id=job_id,
-                dataset_source_id=dataset_source_id,
-                delta_samples=delta_samples,
-                delta_games=delta_games,
-                progress_backend=backend,
-            )
-        except Exception:
-            if bool(backend.get("firestore_strict", False)):
-                raise
-            if not bool(backend.get("firestore_fallback_to_file", True)):
-                raise
+        return _update_global_generation_progress_firestore(
+            progress_path=progress_path,
+            global_target_id=global_target_id,
+            target_samples=target_samples,
+            job_id=job_id,
+            dataset_source_id=dataset_source_id,
+            delta_samples=delta_samples,
+            delta_games=delta_games,
+            progress_backend=backend,
+        )
 
     lock_ok = _acquire_lock_dir(lock_dir)
     if not lock_ok:
@@ -623,22 +748,16 @@ def _reserve_global_generation_budget(
 ) -> tuple[int, int, dict[str, Any]]:
     backend = progress_backend if isinstance(progress_backend, dict) else {}
     if str(backend.get("backend", "file")).strip().lower() == "firestore":
-        try:
-            return _reserve_global_generation_budget_firestore(
-                progress_path=progress_path,
-                global_target_id=global_target_id,
-                target_samples=target_samples,
-                job_id=job_id,
-                dataset_source_id=dataset_source_id,
-                requested_samples=requested_samples,
-                requested_games=requested_games,
-                progress_backend=backend,
-            )
-        except Exception:
-            if bool(backend.get("firestore_strict", False)):
-                raise
-            if not bool(backend.get("firestore_fallback_to_file", True)):
-                raise
+        return _reserve_global_generation_budget_firestore(
+            progress_path=progress_path,
+            global_target_id=global_target_id,
+            target_samples=target_samples,
+            job_id=job_id,
+            dataset_source_id=dataset_source_id,
+            requested_samples=requested_samples,
+            requested_games=requested_games,
+            progress_backend=backend,
+        )
 
     lock_ok = _acquire_lock_dir(lock_dir)
     if not lock_ok:
@@ -705,20 +824,12 @@ def _read_global_generation_progress(
 ) -> dict[str, Any]:
     backend = progress_backend if isinstance(progress_backend, dict) else {}
     if str(backend.get("backend", "file")).strip().lower() == "firestore":
-        try:
-            state = _read_global_generation_progress_firestore(
-                progress_path=progress_path,
-                global_target_id=global_target_id,
-                target_samples=target_samples,
-                progress_backend=backend,
-            )
-            if state:
-                return state
-        except Exception:
-            if bool(backend.get("firestore_strict", False)):
-                raise
-            if not bool(backend.get("firestore_fallback_to_file", True)):
-                raise
+        return _read_global_generation_progress_firestore(
+            progress_path=progress_path,
+            global_target_id=global_target_id,
+            target_samples=target_samples,
+            progress_backend=backend,
+        )
 
     state = _sync_global_generation_progress_state(
         progress_path=progress_path,
@@ -2611,6 +2722,17 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
         max_pending_futures,
     )
     if global_target_enabled and source_mode == "benchmatch":
+        firestore_diag = _firestore_backend_diagnostics(global_progress_backend)
+        job.logger.info(
+            "dataset generation global target backend config | backend=%s | project_id=%s | collection=%s | document=%s | auth_mode=%s | credentials_path_exists=%s | api_key_set=%s",
+            str(firestore_diag.get("backend", "file")),
+            str(firestore_diag.get("project_id", "")) or "<empty>",
+            str(firestore_diag.get("collection", "")) or "<empty>",
+            str(firestore_diag.get("document", "")) or "<empty>",
+            str(firestore_diag.get("auth_mode", "")) or "<unknown>",
+            bool(firestore_diag.get("credentials_path_exists", False)),
+            bool(firestore_diag.get("api_key_set", False)),
+        )
         state = _update_global_generation_progress(
             progress_path=global_progress_path,
             lock_dir=global_progress_lock_dir,
@@ -3522,6 +3644,17 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         source_poll_interval_seconds,
         adaptive_source_polling,
         str(global_progress_backend.get("backend", "file")),
+    )
+    global_firestore_diag = _firestore_backend_diagnostics(global_progress_backend)
+    job.logger.info(
+        "dataset build global target backend config | backend=%s | project_id=%s | collection=%s | document=%s | auth_mode=%s | credentials_path_exists=%s | api_key_set=%s",
+        str(global_firestore_diag.get("backend", "file")),
+        str(global_firestore_diag.get("project_id", "")) or "<empty>",
+        str(global_firestore_diag.get("collection", "")) or "<empty>",
+        str(global_firestore_diag.get("document", "")) or "<empty>",
+        str(global_firestore_diag.get("auth_mode", "")) or "<unknown>",
+        bool(global_firestore_diag.get("credentials_path_exists", False)),
+        bool(global_firestore_diag.get("api_key_set", False)),
     )
 
     dataset_dir = job.job_dir / "dataset_build"

@@ -142,13 +142,14 @@ cells = [
         GLOBAL_TARGET_ID = 'bench_models_20m_global'
         GLOBAL_TARGET_SAMPLES = 20000000
         GLOBAL_PROGRESS_PATH = f'data/global_generation_progress/{GLOBAL_TARGET_ID}.json'
-        GLOBAL_PROGRESS_BACKEND = 'file'  # 'file' ou 'firestore' (mettre 'firestore' quand l'auth sera en place)
+        GLOBAL_PROGRESS_BACKEND = 'firestore'  # Firestore est la source de verite
         FIRESTORE_PROJECT_ID = 'songo-model-ai'
         FIRESTORE_COLLECTION = 'global_generation_progress'
         FIRESTORE_DOCUMENT = GLOBAL_TARGET_ID
         FIRESTORE_CREDENTIALS_PATH = ''  # Optionnel: chemin JSON service account
         FIRESTORE_API_KEY = 'AIzaSyA0I4zJMpBElpwyae0tLlNpnMG0fnF07ys'
-        FIRESTORE_FALLBACK_TO_FILE = True
+        if str(GLOBAL_PROGRESS_BACKEND).strip().lower() != 'firestore':
+            raise ValueError("GLOBAL_PROGRESS_BACKEND doit rester 'firestore' (fallback fichier desactive).")
         SOURCE_POLL_INTERVAL_SECONDS = 20
         DATASET_GENERATE_WORKERS = 16
         DATASET_GENERATE_MAX_PENDING_FUTURES = 32
@@ -297,6 +298,40 @@ cells = [
                 'updated_at': str(raw.get('updated_at', '<none>') or '<none>'),
             }
 
+        def _firestore_monitor_debug_context(*, global_target_id: str) -> dict:
+            credentials_path = str(FIRESTORE_CREDENTIALS_PATH).strip()
+            api_key = str(FIRESTORE_API_KEY).strip()
+            auth_mode = 'adc'
+            if credentials_path:
+                auth_mode = 'service_account_file'
+            elif api_key:
+                auth_mode = 'api_key_anonymous'
+            return {
+                'backend': str(GLOBAL_PROGRESS_BACKEND).strip().lower(),
+                'project_id': str(FIRESTORE_PROJECT_ID).strip(),
+                'collection': str(FIRESTORE_COLLECTION).strip() or 'global_generation_progress',
+                'document': str(FIRESTORE_DOCUMENT).strip() or str(global_target_id),
+                'auth_mode': auth_mode,
+                'credentials_path': credentials_path,
+                'credentials_path_exists': bool(Path(credentials_path).exists()) if credentials_path else False,
+                'api_key_set': bool(api_key),
+            }
+
+        def _firestore_monitor_error_hint(exc: Exception, debug_context: dict) -> str:
+            text = f'{type(exc).__name__}: {exc}'.lower()
+            auth_mode = str(debug_context.get('auth_mode', '')).strip().lower()
+            if auth_mode == 'adc' and ('metadata.google.internal' in text or 'compute engine metadata' in text):
+                return 'ADC indisponible ici; renseigne FIRESTORE_API_KEY ou FIRESTORE_CREDENTIALS_PATH.'
+            if 'permissiondenied' in text or 'permission denied' in text:
+                return 'Acces refuse par les regles Firestore.'
+            if 'unauthenticated' in text or 'invalid authentication credentials' in text:
+                return 'Authentification Firestore invalide.'
+            if 'deadlineexceeded' in text or 'timeout' in text:
+                return 'Timeout reseau vers Firestore.'
+            if 'serviceunavailable' in text:
+                return 'Service Firestore temporairement indisponible.'
+            return ''
+
         def _load_global_progress_payload(*, drive_root: str, global_target_id: str, target_samples: int) -> dict:
             fallback_payload = {
                 'global_target_id': str(global_target_id),
@@ -308,6 +343,7 @@ cells = [
             }
             backend = str(GLOBAL_PROGRESS_BACKEND).strip().lower()
             if backend == 'firestore':
+                debug_context = _firestore_monitor_debug_context(global_target_id=str(global_target_id))
                 try:
                     from google.cloud import firestore
                     from google.auth.credentials import AnonymousCredentials
@@ -317,6 +353,8 @@ cells = [
                     collection = str(FIRESTORE_COLLECTION).strip() or 'global_generation_progress'
                     document = str(FIRESTORE_DOCUMENT).strip() or str(global_target_id)
                     if credentials_path:
+                        if not Path(credentials_path).exists():
+                            raise FileNotFoundError(f'Credentials introuvables: {credentials_path}')
                         from google.oauth2 import service_account
                         creds = service_account.Credentials.from_service_account_file(credentials_path)
                         client = firestore.Client(project=(project_id or None), credentials=creds)
@@ -332,13 +370,18 @@ cells = [
                     snap = client.collection(collection).document(document).get()
                     if snap.exists:
                         return _normalize_global_payload(snap.to_dict(), int(target_samples))
-                except Exception:
-                    if not bool(FIRESTORE_FALLBACK_TO_FILE):
-                        return fallback_payload
-            progress_path = Path(drive_root) / 'data' / 'global_generation_progress' / f'{global_target_id}.json'
-            if progress_path.exists():
-                return _normalize_global_payload(_load_json_retry(progress_path, default=fallback_payload), int(target_samples))
-            return fallback_payload
+                    return fallback_payload
+                except Exception as exc:
+                    hint = _firestore_monitor_error_hint(exc, debug_context)
+                    context_text = json.dumps(debug_context, ensure_ascii=True, sort_keys=True)
+                    message = (
+                        f'Lecture Firestore impossible pour global progress (fallback fichier desactive) | '
+                        f'context={context_text} | cause={type(exc).__name__}: {exc}'
+                    )
+                    if hint:
+                        message = f'{message} | hint={hint}'
+                    raise RuntimeError(message) from exc
+            raise RuntimeError(f'GLOBAL_PROGRESS_BACKEND non supporte: {backend} (mode firestore requis).')
 
         def _active_worker_tags_from_global_progress(
             *,
@@ -552,7 +595,6 @@ cells = [
         print('FIRESTORE_COLLECTION     =', FIRESTORE_COLLECTION)
         print('FIRESTORE_DOCUMENT       =', FIRESTORE_DOCUMENT)
         print('FIRESTORE_API_KEY_SET    =', bool(str(FIRESTORE_API_KEY).strip()))
-        print('FIRESTORE_FALLBACK_TO_FILE =', FIRESTORE_FALLBACK_TO_FILE)
         print('DATASET_GENERATE_JOB_ID =', DATASET_GENERATE_JOB_ID)
         print('DATASET_BUILD_JOB_ID    =', DATASET_BUILD_JOB_ID)
         print('TRAIN_CONTINUE_JOB_ID   =', TRAIN_CONTINUE_JOB_ID)
@@ -922,7 +964,6 @@ cells = [
         generate_block['global_progress_firestore_document'] = str(FIRESTORE_DOCUMENT)
         generate_block['global_progress_firestore_credentials_path'] = str(FIRESTORE_CREDENTIALS_PATH)
         generate_block['global_progress_firestore_api_key'] = str(FIRESTORE_API_KEY)
-        generate_block['global_progress_firestore_fallback_to_file'] = bool(FIRESTORE_FALLBACK_TO_FILE)
         generate_block['progress_update_every_n_games'] = 1
         generate_cfg['dataset_generation'] = generate_block
         DATASET_GENERATE_CONFIG_ACTIVE = _write_yaml(generate_cfg, DATASET_GENERATE_CONFIG_ACTIVE_PATH)
@@ -949,7 +990,6 @@ cells = [
         build_block['global_target_progress_firestore_document'] = str(FIRESTORE_DOCUMENT)
         build_block['global_target_progress_firestore_credentials_path'] = str(FIRESTORE_CREDENTIALS_PATH)
         build_block['global_target_progress_firestore_api_key'] = str(FIRESTORE_API_KEY)
-        build_block['global_target_progress_firestore_fallback_to_file'] = bool(FIRESTORE_FALLBACK_TO_FILE)
         build_block['global_target_samples'] = int(GLOBAL_TARGET_SAMPLES)
         build_block['global_target_stabilization_polls'] = int(GLOBAL_TARGET_STABILIZATION_POLLS)
         build_block['workers'] = int(DATASET_BUILD_WORKERS)
