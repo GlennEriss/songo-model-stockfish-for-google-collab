@@ -112,6 +112,9 @@ cells = [
         BASE_DATASET_BUILD_ID = 'dataset_v5_full_matrix_colab_pro_insane_20m'
         MULTI_COLAB_SAFE_MODE = True
         WORKER_TAG = ''  # Laisse vide pour auto, ou fixe manuellement: 'w1', 'w2', etc.
+        WORKER_COUNT = 1  # Mets 2,3,4... quand tu lances plusieurs Colab
+        WORKER_INDEX = -1  # -1 => auto assignment
+        AUTO_ASSIGN_WORKER_INDEX = True
         TARGET_SAMPLES = 20000000
         TARGET_LABELED_SAMPLES = 20000000
         BENCHMATCH_GAMES = 400
@@ -166,11 +169,88 @@ cells = [
         EVALUATION_JOB_ID = 'eval_colab_pro_compact_001'
         BENCHMARK_JOB_ID = 'benchmark_colab_pro_compact_001'
 
+        import json
         import re
         import socket
+        import time
+        from pathlib import Path
+
+        def _acquire_lock_dir(lock_dir: Path, timeout_seconds: float = 20.0, poll_seconds: float = 0.1) -> bool:
+            deadline = time.time() + max(1.0, float(timeout_seconds))
+            while time.time() < deadline:
+                try:
+                    lock_dir.mkdir(parents=True, exist_ok=False)
+                    return True
+                except FileExistsError:
+                    time.sleep(max(0.01, float(poll_seconds)))
+            return False
+
+        def _release_lock_dir(lock_dir: Path) -> None:
+            try:
+                lock_dir.rmdir()
+            except Exception:
+                pass
+
+        def _auto_assign_worker_index(*, drive_root: str, global_target_id: str, worker_tag: str, worker_count: int) -> int:
+            worker_count = max(1, int(worker_count))
+            leases_path = Path(drive_root) / 'data' / 'global_generation_progress' / f'{global_target_id}.worker_leases.json'
+            lock_dir = Path(str(leases_path) + '.lock')
+            lock_ok = _acquire_lock_dir(lock_dir)
+            if not lock_ok:
+                return abs(hash(worker_tag)) % worker_count
+            try:
+                payload = {}
+                if leases_path.exists():
+                    try:
+                        payload = json.loads(leases_path.read_text(encoding='utf-8'))
+                    except Exception:
+                        payload = {}
+                if not isinstance(payload, dict):
+                    payload = {}
+                leases = payload.get('leases', {})
+                if not isinstance(leases, dict):
+                    leases = {}
+
+                existing = leases.get(worker_tag, {})
+                if isinstance(existing, dict):
+                    existing_index = existing.get('index')
+                    if isinstance(existing_index, int) and 0 <= existing_index < worker_count:
+                        leases[worker_tag] = {'index': existing_index, 'updated_at': time.time()}
+                        payload['leases'] = leases
+                        leases_path.parent.mkdir(parents=True, exist_ok=True)
+                        leases_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding='utf-8')
+                        return int(existing_index)
+
+                used = set()
+                for info in leases.values():
+                    if isinstance(info, dict):
+                        idx = info.get('index')
+                        if isinstance(idx, int) and 0 <= idx < worker_count:
+                            used.add(idx)
+                assigned = next((idx for idx in range(worker_count) if idx not in used), None)
+                if assigned is None:
+                    assigned = abs(hash(worker_tag)) % worker_count
+                leases[worker_tag] = {'index': int(assigned), 'updated_at': time.time()}
+                payload['leases'] = leases
+                leases_path.parent.mkdir(parents=True, exist_ok=True)
+                leases_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding='utf-8')
+                return int(assigned)
+            finally:
+                _release_lock_dir(lock_dir)
+
         if not WORKER_TAG:
             WORKER_TAG = socket.gethostname().strip().lower().replace('-', '_')
             WORKER_TAG = re.sub(r'[^a-z0-9_]+', '_', WORKER_TAG).strip('_') or 'worker'
+
+        if AUTO_ASSIGN_WORKER_INDEX and int(WORKER_COUNT) > 1 and int(WORKER_INDEX) < 0:
+            WORKER_INDEX = _auto_assign_worker_index(
+                drive_root=DRIVE_ROOT,
+                global_target_id=GLOBAL_TARGET_ID,
+                worker_tag=WORKER_TAG,
+                worker_count=int(WORKER_COUNT),
+            )
+        elif int(WORKER_INDEX) < 0:
+            WORKER_INDEX = 0
 
         if MULTI_COLAB_SAFE_MODE:
             DATASET_SOURCE_ID = f'{BASE_DATASET_SOURCE_ID}_{WORKER_TAG}'
@@ -200,6 +280,9 @@ cells = [
         print('DATASET_BUILD_ID        =', DATASET_BUILD_ID)
         print('MULTI_COLAB_SAFE_MODE   =', MULTI_COLAB_SAFE_MODE)
         print('WORKER_TAG              =', WORKER_TAG)
+        print('WORKER_COUNT            =', WORKER_COUNT)
+        print('WORKER_INDEX            =', WORKER_INDEX)
+        print('AUTO_ASSIGN_WORKER_INDEX =', AUTO_ASSIGN_WORKER_INDEX)
         print('PIPELINE_MANIFEST_PATH  =', PIPELINE_MANIFEST_PATH)
         print('TARGET_SAMPLES          =', TARGET_SAMPLES)
         print('TARGET_LABELED_SAMPLES  =', TARGET_LABELED_SAMPLES)
@@ -445,20 +528,33 @@ cells = [
             selected_model_ids = selected_model_ids[:BENCHMATCH_MODEL_LIMIT]
 
         bench_agents = list(BENCHMATCH_CLASSIC_AGENTS) + [f'model:{model_id}' for model_id in selected_model_ids]
-        matchups = []
+        all_matchups = []
         if BENCHMATCH_ORDERED_MATCHUPS:
             for agent_a in bench_agents:
                 for agent_b in bench_agents:
                     if not BENCHMATCH_INCLUDE_SELF_PLAY and agent_a == agent_b:
                         continue
-                    matchups.append(f'{agent_a} vs {agent_b}')
+                    all_matchups.append(f'{agent_a} vs {agent_b}')
         else:
             for idx, agent_a in enumerate(bench_agents):
                 start = idx if BENCHMATCH_INCLUDE_SELF_PLAY else idx + 1
                 for agent_b in bench_agents[start:]:
                     if not BENCHMATCH_INCLUDE_SELF_PLAY and agent_a == agent_b:
                         continue
-                    matchups.append(f'{agent_a} vs {agent_b}')
+                    all_matchups.append(f'{agent_a} vs {agent_b}')
+
+        worker_count = max(1, int(WORKER_COUNT))
+        worker_index = int(WORKER_INDEX)
+        if worker_count > 1:
+            if worker_index < 0 or worker_index >= worker_count:
+                raise ValueError(f'WORKER_INDEX doit etre dans [0, {worker_count - 1}], recu={worker_index}')
+            matchups = [spec for idx, spec in enumerate(all_matchups) if (idx % worker_count) == worker_index]
+            if not matchups:
+                raise ValueError(
+                    f'Ce worker n a recu aucun matchup (worker_index={worker_index}, worker_count={worker_count}, total_matchups={len(all_matchups)}).'
+                )
+        else:
+            matchups = list(all_matchups)
 
         generate_cfg = yaml.safe_load((Path(WORKTREE) / DATASET_GENERATE_CONFIG).read_text(encoding='utf-8')) or {}
         generate_block = dict(generate_cfg.get('dataset_generation', {}) or {})
@@ -539,7 +635,8 @@ cells = [
         print('output_sampled_dir             =', output_sampled_dir)
         print('selected_model_ids             =', selected_model_ids)
         print('total_agents                   =', len(bench_agents))
-        print('total_matchups                 =', len(matchups))
+        print('total_matchups_all             =', len(all_matchups))
+        print('total_matchups_worker          =', len(matchups))
         print('export_partial_every_n_files   =', build_block.get('export_partial_every_n_files'))
         print('autotuned_generate_workers     =', DATASET_GENERATE_WORKERS)
         print('autotuned_build_workers        =', DATASET_BUILD_WORKERS)
@@ -766,6 +863,78 @@ cells = [
             ts = time.strftime('%Y-%m-%d %H:%M:%S')
             print(f'[{ts}] source_samples={source_samples}/{TARGET_SAMPLES} ({_safe_pct(source_samples, int(TARGET_SAMPLES)):.2f}%) | source_files={source_files} | source_status={source_status}')
             print(f'[{ts}] played_games={played_games} | build_samples={build_samples}/{build_target} ({_safe_pct(build_samples, build_target):.2f}%) | build_status={build_status}')
+            print('-' * 120)
+
+            if loop_idx >= (MAX_LOOPS - 1):
+                break
+            time.sleep(REFRESH_SECONDS)
+        """
+    ),
+    code(
+        """
+        # KPI global: progression agregee de tous les workers
+        import json
+        import time
+        from pathlib import Path
+
+        REFRESH_SECONDS = 15
+        MAX_LOOPS = 40
+
+        global_progress_path = Path(DRIVE_ROOT) / 'data' / 'global_generation_progress' / f'{GLOBAL_TARGET_ID}.json'
+        registry_path = Path(DRIVE_ROOT) / 'data' / 'dataset_registry.json'
+
+        def _load_json_retry(path: Path, retries: int = 6, wait_seconds: float = 0.25):
+            last_exc = None
+            for _ in range(retries):
+                try:
+                    return json.loads(path.read_text(encoding='utf-8'))
+                except json.JSONDecodeError as exc:
+                    last_exc = exc
+                    time.sleep(wait_seconds)
+            raise last_exc
+
+        def _safe_pct(value: int, target: int) -> float:
+            if target <= 0:
+                return 0.0
+            return (100.0 * float(value)) / float(target)
+
+        for loop_idx in range(MAX_LOOPS):
+            global_payload = {
+                'total_samples': 0,
+                'total_games': 0,
+                'target_samples': int(GLOBAL_TARGET_SAMPLES),
+                'workers': {},
+                'updated_at': '<none>',
+            }
+            if global_progress_path.exists():
+                global_payload = _load_json_retry(global_progress_path)
+
+            global_total_samples = int(global_payload.get('total_samples', 0))
+            global_total_games = int(global_payload.get('total_games', 0))
+            global_target_samples = int(global_payload.get('target_samples', GLOBAL_TARGET_SAMPLES))
+            workers_payload = global_payload.get('workers', {})
+            if not isinstance(workers_payload, dict):
+                workers_payload = {}
+            global_workers = len(workers_payload)
+
+            built_total_samples = 0
+            built_worker_datasets = 0
+            if registry_path.exists():
+                registry = _load_json_retry(registry_path)
+                for item in registry.get('built_datasets', []):
+                    dataset_id = str(item.get('dataset_id', ''))
+                    if dataset_id == BASE_DATASET_BUILD_ID or dataset_id.startswith(f'{BASE_DATASET_BUILD_ID}_'):
+                        built_total_samples += int(item.get('labeled_samples', 0))
+                        built_worker_datasets += 1
+
+            ts = time.strftime('%Y-%m-%d %H:%M:%S')
+            print(
+                f'[{ts}] GLOBAL generate_samples={global_total_samples}/{global_target_samples} '
+                f'({_safe_pct(global_total_samples, global_target_samples):.2f}%) | '
+                f'global_games={global_total_games} | workers={global_workers} | '
+                f'updated_at={global_payload.get("updated_at", "<none>")}'
+            )
+            print(f'[{ts}] GLOBAL build_labeled_samples_sum={built_total_samples} | build_worker_datasets={built_worker_datasets}')
             print('-' * 120)
 
             if loop_idx >= (MAX_LOOPS - 1):
