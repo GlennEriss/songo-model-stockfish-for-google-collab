@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import shutil
 import time
 from pathlib import Path
@@ -10,6 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
 
+from songo_model_stockfish.ops.io_utils import read_json_dict, write_json_atomic
 from songo_model_stockfish.ops.job import JobContext
 from songo_model_stockfish.ops.logging import utc_now_iso
 from songo_model_stockfish.ops.model_registry import next_model_version, promote_best_model, promoted_best_dir, upsert_model_record
@@ -47,9 +47,7 @@ def _resolve_storage_path(base: Path, configured: str | None, fallback: Path) ->
 
 def _read_dataset_registry(data_root: Path) -> dict[str, Any]:
     registry_path = data_root / "dataset_registry.json"
-    if not registry_path.exists():
-        return {"dataset_sources": [], "built_datasets": []}
-    payload = json.loads(registry_path.read_text(encoding="utf-8"))
+    payload = read_json_dict(registry_path, default={"dataset_sources": [], "built_datasets": []})
     if not isinstance(payload, dict):
         return {"dataset_sources": [], "built_datasets": []}
     payload.setdefault("dataset_sources", [])
@@ -259,20 +257,24 @@ def _save_checkpoint(path: Path, payload: dict) -> None:
 
 
 def _write_json(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+    write_json_atomic(path, payload, ensure_ascii=True, indent=2)
 
 
 def run_train(job: JobContext) -> dict[str, object]:
     cfg = job.config.get("train", {})
     runtime_cfg = job.config.get("runtime", {})
     dataset_selection_mode = str(cfg.get("dataset_selection_mode", "configured")).strip().lower() or "configured"
+    expected_dataset_input_dim: int | None = None
+    selected_dataset_feature_schema_version = ""
     if dataset_selection_mode == "largest_built":
         selected_dataset = _select_largest_built_dataset(job.paths.data_root)
         dataset_id = str(selected_dataset.get("dataset_id", "dataset_v1"))
         selected_output_dir = Path(str(selected_dataset["output_dir"]))
         dataset_path = selected_output_dir / "train.npz"
         validation_path = selected_output_dir / "validation.npz"
+        if selected_dataset.get("input_dim") is not None:
+            expected_dataset_input_dim = int(selected_dataset.get("input_dim", 0) or 0) or None
+        selected_dataset_feature_schema_version = str(selected_dataset.get("feature_schema_version", "")).strip()
         dataset_resolution = {
             "selection_mode": dataset_selection_mode,
             "resolved_from_registry": True,
@@ -281,6 +283,8 @@ def run_train(job: JobContext) -> dict[str, object]:
             "selected_teacher_engine": str(selected_dataset.get("teacher_engine", "")),
             "selected_teacher_level": str(selected_dataset.get("teacher_level", "")),
             "selected_output_dir": str(selected_output_dir),
+            "selected_input_dim": expected_dataset_input_dim,
+            "selected_feature_schema_version": selected_dataset_feature_schema_version,
         }
     else:
         dataset_id = str(cfg.get("dataset_id", "dataset_v1"))
@@ -291,6 +295,9 @@ def run_train(job: JobContext) -> dict[str, object]:
             selected_output_dir = Path(str(selected_dataset["output_dir"]))
             dataset_path = selected_output_dir / "train.npz"
             validation_path = selected_output_dir / "validation.npz"
+            if selected_dataset.get("input_dim") is not None:
+                expected_dataset_input_dim = int(selected_dataset.get("input_dim", 0) or 0) or None
+            selected_dataset_feature_schema_version = str(selected_dataset.get("feature_schema_version", "")).strip()
             dataset_resolution = {
                 "selection_mode": dataset_selection_mode,
                 "resolved_from_registry": True,
@@ -299,6 +306,8 @@ def run_train(job: JobContext) -> dict[str, object]:
                 "selected_teacher_engine": str(selected_dataset.get("teacher_engine", "")),
                 "selected_teacher_level": str(selected_dataset.get("teacher_level", "")),
                 "selected_output_dir": str(selected_output_dir),
+                "selected_input_dim": expected_dataset_input_dim,
+                "selected_feature_schema_version": selected_dataset_feature_schema_version,
             }
         else:
             dataset_path = _resolve_storage_path(job.paths.drive_root, cfg.get("dataset_path"), job.job_dir / "train.npz")
@@ -377,6 +386,13 @@ def run_train(job: JobContext) -> dict[str, object]:
         prefetch_factor=prefetch_factor,
     )
 
+    if expected_dataset_input_dim is not None and int(expected_dataset_input_dim) != int(input_dim):
+        raise ValueError(
+            "Incoherence de schema detectee entre le registre dataset et le NPZ charge "
+            f"(dataset_id={dataset_id}, expected_input_dim={expected_dataset_input_dim}, loaded_input_dim={input_dim}, "
+            f"feature_schema_version={selected_dataset_feature_schema_version or '<unknown>'})."
+        )
+
     model = PolicyValueMLP(
         input_dim=input_dim,
         hidden_sizes=hidden_sizes,
@@ -410,6 +426,14 @@ def run_train(job: JobContext) -> dict[str, object]:
         checkpoint_path = Path(str(checkpoint_path_value))
         if checkpoint_path.exists():
             checkpoint = torch.load(checkpoint_path, map_location=device)
+            checkpoint_model_config = checkpoint.get("model_config", {})
+            checkpoint_input_dim = int(checkpoint_model_config.get("input_dim", input_dim))
+            if checkpoint_input_dim != int(input_dim):
+                raise ValueError(
+                    "Checkpoint de reprise incompatible avec le dataset courant "
+                    f"(checkpoint_input_dim={checkpoint_input_dim}, dataset_input_dim={input_dim}, "
+                    f"checkpoint={checkpoint_path}, dataset_id={dataset_id})."
+                )
             model.load_state_dict(checkpoint["model_state"])
             optimizer.load_state_dict(checkpoint["optimizer_state"])
             if scheduler is not None and checkpoint.get("scheduler_state") is not None:
@@ -909,6 +933,7 @@ def run_train(job: JobContext) -> dict[str, object]:
         "architecture": {
             "family": str(cfg.get("model_family", "policy_value")),
             "backbone": str(cfg.get("backbone", "mlp")),
+            "input_dim": int(input_dim),
             "hidden_sizes": hidden_sizes,
             "use_layer_norm": use_layer_norm,
             "dropout": dropout,
@@ -939,6 +964,8 @@ def run_train(job: JobContext) -> dict[str, object]:
             "model_id": model_id,
             "sort_ts": time.time(),
             "dataset_id": dataset_id,
+            "input_dim": int(input_dim),
+            "dataset_feature_schema_version": selected_dataset_feature_schema_version,
             "training_job_id": job.job_id,
             "checkpoint_path": str(final_model_path),
             "best_validation_metric": best_metric,

@@ -133,6 +133,7 @@ cells = [
         BENCHMATCH_MODEL_LIMIT = 0
         BENCHMATCH_INCLUDE_SELF_PLAY = True
         BENCHMATCH_ORDERED_MATCHUPS = True
+        BENCHMATCH_SHUFFLE_MATCHUPS = True
         BENCHMATCH_MODEL_AGENT_DEVICE = 'cpu'
         GLOBAL_TARGET_ENABLED = True
         GLOBAL_TARGET_ID = 'bench_models_20m_global'
@@ -143,6 +144,9 @@ cells = [
         DATASET_GENERATE_MAX_PENDING_FUTURES = 32
         DATASET_BUILD_WORKERS = 16
         DATASET_BUILD_MAX_PENDING_FUTURES = 32
+        DATASET_BUILD_DEDUPE_SAMPLE_IDS = True
+        DATASET_BUILD_ADAPTIVE_POLLING = True
+        GLOBAL_TARGET_STABILIZATION_POLLS = 3
         AUTO_TUNE_RESOURCES = True
 
         CPU_SAFE_NUM_WORKERS = 2
@@ -161,6 +165,7 @@ cells = [
         TRAIN_CONTINUE_20M_CONFIG_ACTIVE_PATH = f'{WORKTREE}/config/generated/train.full_matrix.colab_pro.continue.dataset20m.active.yaml'
         TRAIN_SCRATCH_20M_CONFIG_ACTIVE_PATH = f'{WORKTREE}/config/generated/train.full_matrix.colab_pro.scratch.dataset20m.active.yaml'
         EVALUATION_20M_CONFIG_ACTIVE_PATH = f'{WORKTREE}/config/generated/evaluation.full_matrix.colab_pro.dataset20m.active.yaml'
+        EVALUATION_20M_RUNTIME_CONFIG_PATH = f'{WORKTREE}/config/generated/evaluation.full_matrix.colab_pro.dataset20m.runtime.active.yaml'
 
         DATASET_LIST_KIND = 'all'       # 'sources', 'built', 'all'
         DATASET_LIST_SORT_BY = 'size'   # 'size', 'created_at', 'updated_at'
@@ -171,6 +176,7 @@ cells = [
         EVALUATION_JOB_ID = 'eval_colab_pro_compact_001'
         BENCHMARK_JOB_ID = 'benchmark_colab_pro_compact_001'
 
+        import hashlib
         import json
         import re
         import socket
@@ -395,6 +401,9 @@ cells = [
         print('AUTO_TUNE_RESOURCES     =', AUTO_TUNE_RESOURCES)
         print('DATASET_GENERATE_WORKERS =', DATASET_GENERATE_WORKERS)
         print('DATASET_BUILD_WORKERS    =', DATASET_BUILD_WORKERS)
+        print('BENCHMATCH_SHUFFLE_MATCHUPS =', BENCHMATCH_SHUFFLE_MATCHUPS)
+        print('DATASET_BUILD_DEDUPE_SAMPLE_IDS =', DATASET_BUILD_DEDUPE_SAMPLE_IDS)
+        print('DATASET_BUILD_ADAPTIVE_POLLING =', DATASET_BUILD_ADAPTIVE_POLLING)
         print('GLOBAL_TARGET_ENABLED    =', GLOBAL_TARGET_ENABLED)
         print('GLOBAL_TARGET_ID         =', GLOBAL_TARGET_ID)
         print('GLOBAL_TARGET_SAMPLES    =', GLOBAL_TARGET_SAMPLES)
@@ -648,6 +657,12 @@ cells = [
                     if not BENCHMATCH_INCLUDE_SELF_PLAY and agent_a == agent_b:
                         continue
                     all_matchups.append(f'{agent_a} vs {agent_b}')
+        if BENCHMATCH_SHUFFLE_MATCHUPS:
+            shuffle_seed = int(hashlib.sha1(f'{GLOBAL_TARGET_ID}:matchups'.encode('utf-8')).hexdigest()[:8], 16)
+            all_matchups = sorted(
+                all_matchups,
+                key=lambda spec: hashlib.sha1(f'{shuffle_seed}:{spec}'.encode('utf-8')).hexdigest(),
+            )
 
         worker_count = max(1, int(WORKER_COUNT))
         worker_index = int(WORKER_INDEX)
@@ -696,6 +711,14 @@ cells = [
         build_block['target_labeled_samples'] = int(TARGET_LABELED_SAMPLES)
         build_block['follow_source_updates'] = True
         build_block['source_poll_interval_seconds'] = float(SOURCE_POLL_INTERVAL_SECONDS)
+        build_block['dedupe_sample_ids'] = bool(DATASET_BUILD_DEDUPE_SAMPLE_IDS)
+        build_block['adaptive_source_polling'] = bool(DATASET_BUILD_ADAPTIVE_POLLING)
+        build_block['source_poll_interval_min_seconds'] = float(max(5.0, SOURCE_POLL_INTERVAL_SECONDS / 2.0))
+        build_block['source_poll_interval_max_seconds'] = float(max(60.0, SOURCE_POLL_INTERVAL_SECONDS * 4.0))
+        build_block['stop_when_global_target_reached'] = bool(GLOBAL_TARGET_ENABLED)
+        build_block['global_target_progress_path'] = str(GLOBAL_PROGRESS_PATH)
+        build_block['global_target_samples'] = int(GLOBAL_TARGET_SAMPLES)
+        build_block['global_target_stabilization_polls'] = int(GLOBAL_TARGET_STABILIZATION_POLLS)
         build_block['workers'] = int(DATASET_BUILD_WORKERS)
         build_block['max_pending_futures'] = int(DATASET_BUILD_MAX_PENDING_FUTURES)
         build_block['export_partial_every_n_files'] = int(min(20, int(build_block.get('export_partial_every_n_files', 100) or 100)))
@@ -744,6 +767,8 @@ cells = [
         print('total_matchups_all             =', len(all_matchups))
         print('total_matchups_worker          =', len(matchups))
         print('export_partial_every_n_files   =', build_block.get('export_partial_every_n_files'))
+        print('dedupe_sample_ids              =', build_block.get('dedupe_sample_ids'))
+        print('adaptive_source_polling        =', build_block.get('adaptive_source_polling'))
         print('autotuned_generate_workers     =', DATASET_GENERATE_WORKERS)
         print('autotuned_build_workers        =', DATASET_BUILD_WORKERS)
         print('autotuned_train_workers        =', CPU_SAFE_NUM_WORKERS)
@@ -1256,9 +1281,74 @@ cells = [
     md("## 8. Evaluation"),
     code(
         """
+        # Selection automatique d'un modele compatible avec le dataset cible (input_dim identique)
+        import json
+        from pathlib import Path
+        import numpy as np
+        import torch
+        import yaml
+
+        base_eval_cfg_path = Path(EVALUATION_20M_CONFIG_ACTIVE)
+        runtime_eval_cfg_path = Path(EVALUATION_20M_RUNTIME_CONFIG_PATH)
+        eval_cfg = yaml.safe_load(base_eval_cfg_path.read_text(encoding='utf-8')) or {}
+        eval_block = dict(eval_cfg.get('evaluation', {}) or {})
+        dataset_id = str(eval_block.get('dataset_id', DATASET_BUILD_ID))
+
+        registry_path = Path(DRIVE_ROOT) / 'data' / 'dataset_registry.json'
+        registry = json.loads(registry_path.read_text(encoding='utf-8')) if registry_path.exists() else {'built_datasets': []}
+        built = next((item for item in registry.get('built_datasets', []) if str(item.get('dataset_id', '')) == dataset_id), None)
+        if built is None:
+            raise ValueError(f'Dataset introuvable dans le registre: {dataset_id}')
+
+        dataset_input_dim = int(built.get('input_dim') or 0)
+        test_npz_path = Path(str(built.get('output_dir', ''))) / 'test.npz'
+        if dataset_input_dim <= 0:
+            with np.load(test_npz_path, allow_pickle=True) as test_npz:
+                dataset_input_dim = int(test_npz['x'].shape[1])
+
+        models_root = Path(DRIVE_ROOT) / 'models'
+        model_registry_path = models_root / 'model_registry.json'
+        model_registry = json.loads(model_registry_path.read_text(encoding='utf-8')) if model_registry_path.exists() else {'models': []}
+        candidates = sorted(model_registry.get('models', []), key=lambda item: float(item.get('sort_ts', 0.0)), reverse=True)
+
+        selected = None
+        for item in candidates:
+            checkpoint_path = Path(str(item.get('checkpoint_path', '')).strip())
+            if not checkpoint_path.exists():
+                continue
+            try:
+                checkpoint = torch.load(checkpoint_path, map_location='cpu')
+            except Exception:
+                continue
+            model_config = checkpoint.get('model_config', {})
+            model_input_dim = int(model_config.get('input_dim', 0) or 0)
+            if model_input_dim == dataset_input_dim:
+                selected = {
+                    'model_id': str(item.get('model_id', '')),
+                    'checkpoint_path': str(checkpoint_path),
+                    'input_dim': model_input_dim,
+                }
+                break
+
+        if selected is None:
+            raise ValueError(
+                f'Aucun checkpoint compatible trouve pour dataset_id={dataset_id} (dataset_input_dim={dataset_input_dim}). '
+                'Entraine d abord un modele sur ce dataset/schema.'
+            )
+
+        eval_block['model_id'] = selected['model_id']
+        eval_block['checkpoint_path'] = selected['checkpoint_path']
+        eval_cfg['evaluation'] = eval_block
+        runtime_eval_cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        runtime_eval_cfg_path.write_text(yaml.safe_dump(eval_cfg, sort_keys=False), encoding='utf-8')
+
         print('Evaluation sur dataset 20M partiel configure')
-        print('config =', EVALUATION_20M_CONFIG_ACTIVE)
-        !bash -lc "cd $WORKTREE && PYTHONPATH=$WORKTREE/src $PYTHON_BIN -m songo_model_stockfish.cli.main evaluate --config $EVALUATION_20M_CONFIG_ACTIVE --job-id $EVALUATION_JOB_ID"
+        print('dataset_id =', dataset_id)
+        print('dataset_input_dim =', dataset_input_dim)
+        print('selected_model_id =', selected['model_id'])
+        print('selected_checkpoint =', selected['checkpoint_path'])
+        print('runtime config =', runtime_eval_cfg_path)
+        !bash -lc "cd $WORKTREE && PYTHONPATH=$WORKTREE/src $PYTHON_BIN -m songo_model_stockfish.cli.main evaluate --config $EVALUATION_20M_RUNTIME_CONFIG_PATH --job-id $EVALUATION_JOB_ID"
         """
     ),
     code(

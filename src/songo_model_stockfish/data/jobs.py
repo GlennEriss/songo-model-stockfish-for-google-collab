@@ -5,7 +5,6 @@ import functools
 import hashlib
 import json
 import multiprocessing
-import os
 import shutil
 import time
 from pathlib import Path
@@ -14,6 +13,13 @@ from typing import Any, Callable
 import numpy as np
 
 from songo_model_stockfish.adapters import songo_ai_game
+from songo_model_stockfish.ops.io_utils import (
+    acquire_lock_dir,
+    read_json_dict,
+    release_lock_dir,
+    write_json_atomic,
+    write_jsonl_atomic,
+)
 from songo_model_stockfish.ops.job import JobContext
 from songo_model_stockfish.ops.logging import utc_now_iso
 from songo_model_stockfish.ops.model_registry import latest_model_record, load_registry, promoted_best_metadata
@@ -25,8 +31,7 @@ def _slugify_matchup(matchup_spec: str) -> str:
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+    write_json_atomic(path, payload, ensure_ascii=True, indent=2)
 
 
 def _resolve_storage_path(base: Path, configured: str | None, fallback: Path) -> Path:
@@ -48,35 +53,15 @@ def _default_raw_dir_name_for_dataset_source(dataset_source_id: str) -> str:
 
 
 def _read_json_file(path: Path, default: dict[str, Any]) -> dict[str, Any]:
-    if not path.exists():
-        return dict(default)
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return dict(default)
-    if not isinstance(payload, dict):
-        return dict(default)
-    return payload
+    return read_json_dict(path, default=default, retries=8, wait_seconds=0.05)
 
 
 def _acquire_lock_dir(lock_dir: Path, timeout_seconds: float = 30.0, poll_seconds: float = 0.1) -> bool:
-    deadline = time.time() + max(1.0, float(timeout_seconds))
-    while time.time() < deadline:
-        try:
-            lock_dir.mkdir(parents=True, exist_ok=False)
-            return True
-        except FileExistsError:
-            time.sleep(max(0.01, float(poll_seconds)))
-    return False
+    return acquire_lock_dir(lock_dir, timeout_seconds=timeout_seconds, poll_seconds=poll_seconds)
 
 
 def _release_lock_dir(lock_dir: Path) -> None:
-    try:
-        lock_dir.rmdir()
-    except FileNotFoundError:
-        return
-    except OSError:
-        return
+    release_lock_dir(lock_dir)
 
 
 def _update_global_generation_progress(
@@ -122,9 +107,69 @@ def _update_global_generation_progress(
         workers[job_id] = worker_payload
         state["workers"] = workers
         state["updated_at"] = utc_now_iso()
-        progress_path.parent.mkdir(parents=True, exist_ok=True)
-        progress_path.write_text(json.dumps(state, indent=2, ensure_ascii=True), encoding="utf-8")
+        write_json_atomic(progress_path, state, ensure_ascii=True, indent=2)
         return state
+    finally:
+        _release_lock_dir(lock_dir)
+
+
+def _reserve_global_generation_budget(
+    *,
+    progress_path: Path,
+    lock_dir: Path,
+    global_target_id: str,
+    target_samples: int,
+    job_id: str,
+    dataset_source_id: str,
+    requested_samples: int,
+    requested_games: int = 1,
+) -> tuple[int, int, dict[str, Any]]:
+    lock_ok = _acquire_lock_dir(lock_dir)
+    if not lock_ok:
+        return 0, 0, {}
+    try:
+        state = _read_json_file(
+            progress_path,
+            {
+                "global_target_id": global_target_id,
+                "target_samples": int(target_samples),
+                "total_samples": 0,
+                "total_games": 0,
+                "workers": {},
+                "updated_at": utc_now_iso(),
+            },
+        )
+        state["global_target_id"] = str(state.get("global_target_id") or global_target_id)
+        state_target = int(state.get("target_samples") or target_samples or 0)
+        state["target_samples"] = state_target
+        state_total_samples = int(state.get("total_samples", 0))
+
+        requested_samples = max(0, int(requested_samples))
+        allowed_samples = requested_samples
+        if state_target > 0:
+            remaining = max(0, state_target - state_total_samples)
+            allowed_samples = min(requested_samples, remaining)
+        allowed_games = int(requested_games) if allowed_samples > 0 else 0
+
+        state["total_samples"] = state_total_samples + allowed_samples
+        state["total_games"] = int(state.get("total_games", 0)) + int(max(0, allowed_games))
+
+        workers = state.get("workers")
+        if not isinstance(workers, dict):
+            workers = {}
+        worker_payload = workers.get(job_id, {})
+        if not isinstance(worker_payload, dict):
+            worker_payload = {}
+        worker_payload["dataset_source_id"] = dataset_source_id
+        worker_payload["contributed_samples"] = int(worker_payload.get("contributed_samples", 0)) + int(max(0, allowed_samples))
+        worker_payload["contributed_games"] = int(worker_payload.get("contributed_games", 0)) + int(max(0, allowed_games))
+        worker_payload["updated_at"] = utc_now_iso()
+        workers[job_id] = worker_payload
+        state["workers"] = workers
+        state["updated_at"] = utc_now_iso()
+
+        write_json_atomic(progress_path, state, ensure_ascii=True, indent=2)
+        return allowed_samples, allowed_games, state
     finally:
         _release_lock_dir(lock_dir)
 
@@ -153,11 +198,12 @@ def _dataset_registry_path(job: JobContext) -> Path:
     return job.paths.data_root / "dataset_registry.json"
 
 
+def _dataset_registry_lock_dir(job: JobContext) -> Path:
+    return job.paths.data_root / "dataset_registry.lock"
+
+
 def _read_dataset_registry(job: JobContext) -> dict[str, Any]:
-    path = _dataset_registry_path(job)
-    if not path.exists():
-        return {"dataset_sources": [], "built_datasets": []}
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload = _read_json_file(_dataset_registry_path(job), {"dataset_sources": [], "built_datasets": []})
     if not isinstance(payload, dict):
         return {"dataset_sources": [], "built_datasets": []}
     payload.setdefault("dataset_sources", [])
@@ -167,8 +213,21 @@ def _read_dataset_registry(job: JobContext) -> dict[str, Any]:
 
 def _write_dataset_registry(job: JobContext, payload: dict[str, Any]) -> None:
     path = _dataset_registry_path(job)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+    write_json_atomic(path, payload, ensure_ascii=True, indent=2)
+
+
+def _mutate_dataset_registry(job: JobContext, updater: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
+    lock_dir = _dataset_registry_lock_dir(job)
+    lock_ok = _acquire_lock_dir(lock_dir, timeout_seconds=45.0, poll_seconds=0.1)
+    if not lock_ok:
+        raise TimeoutError("Impossible d'acquerir le verrou du dataset_registry.")
+    try:
+        registry = _read_dataset_registry(job)
+        updater(registry)
+        _write_dataset_registry(job, registry)
+        return registry
+    finally:
+        _release_lock_dir(lock_dir)
 
 
 def _upsert_registry_entry(entries: list[dict[str, Any]], *, key: str, value: str, payload: dict[str, Any]) -> None:
@@ -280,14 +339,15 @@ def _discover_legacy_dataset_source(job: JobContext, dataset_source_id: str) -> 
         metadata_path = sampled_dir / "_dataset_source_metadata.json"
         if metadata_path.exists():
             payload = json.loads(metadata_path.read_text(encoding="utf-8"))
-            registry = _read_dataset_registry(job)
-            _upsert_registry_entry(
-                registry["dataset_sources"],
-                key="dataset_source_id",
-                value=str(payload.get("dataset_source_id", dataset_source_id)),
-                payload=payload,
-            )
-            _write_dataset_registry(job, registry)
+            def _upsert_metadata(registry: dict[str, Any]) -> None:
+                _upsert_registry_entry(
+                    registry["dataset_sources"],
+                    key="dataset_source_id",
+                    value=str(payload.get("dataset_source_id", dataset_source_id)),
+                    payload=payload,
+                )
+
+            _mutate_dataset_registry(job, _upsert_metadata)
             return payload
 
         raw_dir_name = dataset_source_id
@@ -318,14 +378,15 @@ def _discover_legacy_dataset_source(job: JobContext, dataset_source_id: str) -> 
             "dataset_version": utc_now_iso(),
             "updated_at": utc_now_iso(),
         }
-        registry = _read_dataset_registry(job)
-        _upsert_registry_entry(
-            registry["dataset_sources"],
-            key="dataset_source_id",
-            value=dataset_source_id,
-            payload=payload,
-        )
-        _write_dataset_registry(job, registry)
+        def _upsert_payload(registry: dict[str, Any]) -> None:
+            _upsert_registry_entry(
+                registry["dataset_sources"],
+                key="dataset_source_id",
+                value=dataset_source_id,
+                payload=payload,
+            )
+
+        _mutate_dataset_registry(job, _upsert_payload)
         _write_json(sampled_dir / "_dataset_source_metadata.json", payload)
         if raw_dir.exists():
             _write_json(raw_dir / "_dataset_source_metadata.json", payload)
@@ -385,14 +446,15 @@ def _register_dataset_source(
         "dataset_version": dataset_version or utc_now_iso(),
         "updated_at": utc_now_iso(),
     }
-    registry = _read_dataset_registry(job)
-    _upsert_registry_entry(
-        registry["dataset_sources"],
-        key="dataset_source_id",
-        value=dataset_source_id,
-        payload=payload,
-    )
-    _write_dataset_registry(job, registry)
+    def _upsert_source(registry: dict[str, Any]) -> None:
+        _upsert_registry_entry(
+            registry["dataset_sources"],
+            key="dataset_source_id",
+            value=dataset_source_id,
+            payload=payload,
+        )
+
+    _mutate_dataset_registry(job, _upsert_source)
     _write_json(sampled_dir / "_dataset_source_metadata.json", payload)
     _write_json(raw_dir / "_dataset_source_metadata.json", payload)
     return payload
@@ -418,6 +480,8 @@ def _register_built_dataset(
     build_status: str = "completed",
     feature_schema_version: str = "policy_value_tactical_v3",
     input_dim: int | None = None,
+    dedupe_sample_ids: bool = True,
+    duplicate_samples_removed: int = 0,
 ) -> dict[str, Any]:
     resolved_source_dataset_ids = source_dataset_ids or ([source_dataset_id] if source_dataset_id else [])
     payload = {
@@ -437,6 +501,8 @@ def _register_built_dataset(
         "parent_dataset_ids": parent_dataset_ids or [],
         "feature_schema_version": feature_schema_version,
         "input_dim": int(input_dim) if input_dim is not None else None,
+        "dedupe_sample_ids": bool(dedupe_sample_ids),
+        "duplicate_samples_removed": int(duplicate_samples_removed),
         "has_policy_target_full": True,
         "has_tactical_features": True,
         "has_tactical_move_masks": True,
@@ -444,14 +510,15 @@ def _register_built_dataset(
         "dataset_version": dataset_version or utc_now_iso(),
         "updated_at": utc_now_iso(),
     }
-    registry = _read_dataset_registry(job)
-    _upsert_registry_entry(
-        registry["built_datasets"],
-        key="dataset_id",
-        value=dataset_id,
-        payload=payload,
-    )
-    _write_dataset_registry(job, registry)
+    def _upsert_built(registry: dict[str, Any]) -> None:
+        _upsert_registry_entry(
+            registry["built_datasets"],
+            key="dataset_id",
+            value=dataset_id,
+            payload=payload,
+        )
+
+    _mutate_dataset_registry(job, _upsert_built)
     _write_json(output_root / "dataset_metadata.json", payload)
     return payload
 
@@ -609,7 +676,8 @@ def _export_built_dataset_snapshot(
     labeled_samples_total: int,
     target_labeled_samples: int,
     build_status: str,
-) -> tuple[dict[str, dict[str, int]], int]:
+    dedupe_sample_ids: bool,
+) -> tuple[dict[str, dict[str, int]], int, int]:
     game_files = [relative_name for relative_name in sampled_relative_names if relative_name in completed_files]
     split_train_end = int(len(game_files) * train_ratio)
     split_validation_end = split_train_end + int(len(game_files) * validation_ratio)
@@ -621,8 +689,11 @@ def _export_built_dataset_snapshot(
 
     split_summary: dict[str, dict[str, int]] = {}
     exported_input_dim = 17
+    seen_sample_ids: set[str] = set()
+    duplicate_samples_removed_total = 0
     for split_name, selected_files in split_files.items():
         selected_sample_count = 0
+        split_duplicate_samples = 0
         for relative_name in selected_files:
             sample_count = file_sample_counts.get(relative_name)
             if sample_count is None:
@@ -646,6 +717,13 @@ def _export_built_dataset_snapshot(
             if not labeled_path.exists():
                 continue
             for sample in _iter_jsonl(labeled_path):
+                sample_id = str(sample.get("sample_id", ""))
+                if dedupe_sample_ids and sample_id:
+                    if sample_id in seen_sample_ids:
+                        split_duplicate_samples += 1
+                        duplicate_samples_removed_total += 1
+                        continue
+                    seen_sample_ids.add(sample_id)
                 features, legal_mask, policy_index, policy_target_full, value, capture_move_mask, safe_move_mask, risky_move_mask = _encode_features(sample)
                 features_list.append(features)
                 masks_list.append(legal_mask)
@@ -655,7 +733,7 @@ def _export_built_dataset_snapshot(
                 capture_masks_list.append(capture_move_mask)
                 safe_masks_list.append(safe_move_mask)
                 risky_masks_list.append(risky_move_mask)
-                sample_ids.append(str(sample["sample_id"]))
+                sample_ids.append(sample_id or str(sample["sample_id"]))
                 game_id_list.append(str(sample["game_id"]))
 
         x_dim = int(features_list[0].shape[0]) if features_list else exported_input_dim
@@ -681,7 +759,11 @@ def _export_built_dataset_snapshot(
             sample_ids=np.asarray(sample_ids, dtype=object),
             game_ids=np.asarray(game_id_list, dtype=object),
         )
-        split_summary[split_name] = {"games": len(selected_files), "samples": selected_sample_count}
+        split_summary[split_name] = {
+            "games": len(selected_files),
+            "samples": selected_sample_count,
+            "duplicate_samples_removed": split_duplicate_samples,
+        }
 
     _register_built_dataset(
         job,
@@ -700,8 +782,10 @@ def _export_built_dataset_snapshot(
         parent_dataset_ids=[],
         build_status=build_status,
         input_dim=exported_input_dim,
+        dedupe_sample_ids=dedupe_sample_ids,
+        duplicate_samples_removed=duplicate_samples_removed_total,
     )
-    return split_summary, exported_input_dim
+    return split_summary, exported_input_dim, duplicate_samples_removed_total
 
 
 def _derive_existing_dataset_source(
@@ -1750,15 +1834,26 @@ def _materialize_completed_game(
     matchup_id: str,
     games: int,
     execution_mode: str,
+    max_samples_to_write: int | None = None,
 ) -> tuple[int, int]:
+    if max_samples_to_write is not None:
+        capped = max(0, int(max_samples_to_write))
+        samples = samples[:capped]
+    sample_count = len(samples)
+    if sample_count <= 0:
+        job.logger.info(
+            "dataset game skipped at materialization | matchup=%s | game=%s/%s | reason=no_admitted_samples | mode=%s",
+            matchup_id,
+            pending["game_no"],
+            games,
+            execution_mode,
+        )
+        return 0, 0
+
     _write_json(Path(pending["raw_game_path"]), raw_payload)
     sampled_game_path = Path(pending["sampled_game_path"])
-    sampled_game_path.parent.mkdir(parents=True, exist_ok=True)
-    with sampled_game_path.open("w", encoding="utf-8") as handle:
-        for sample in samples:
-            handle.write(json.dumps(sample, ensure_ascii=True) + "\n")
+    write_jsonl_atomic(sampled_game_path, samples, ensure_ascii=True)
 
-    sample_count = len(samples)
     job.logger.info(
         "dataset game completed | matchup=%s | game=%s/%s | moves=%s | samples=%s | winner=%s | mode=%s",
         matchup_id,
@@ -1803,6 +1898,7 @@ def _run_pending_games_sequential(
     models_root: Path,
     model_agent_device: str,
     on_game_completed: Callable[[dict[str, Any], int, int], None] | None = None,
+    sample_cap_resolver: Callable[[dict[str, Any], int], int] | None = None,
 ) -> tuple[int, int, str]:
     agent_a = _build_external_agent(matchup_a, models_root=models_root, device=model_agent_device)
     agent_b = _build_external_agent(matchup_b, models_root=models_root, device=model_agent_device)
@@ -1827,6 +1923,9 @@ def _run_pending_games_sequential(
             sample_every_n_plies=sample_every_n_plies,
             max_moves=max_moves,
         )
+        max_samples_to_write = len(samples)
+        if sample_cap_resolver is not None:
+            max_samples_to_write = max(0, int(sample_cap_resolver(pending, len(samples))))
         games_inc, samples_inc = _materialize_completed_game(
             job,
             pending=pending,
@@ -1835,6 +1934,7 @@ def _run_pending_games_sequential(
             matchup_id=matchup_id,
             games=games,
             execution_mode="sequential",
+            max_samples_to_write=max_samples_to_write,
         )
         completed_games += games_inc
         completed_samples += samples_inc
@@ -2393,6 +2493,32 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
             )
             return int(state.get("total_samples", 0)) >= int(global_target_samples)
 
+        def _local_target_remaining() -> int:
+            if target_samples <= 0:
+                return 1_000_000_000
+            return max(0, int(target_samples) - int(total_samples_after_run))
+
+        def _resolve_admitted_samples(requested_samples: int) -> int:
+            requested = max(0, int(requested_samples))
+            if requested <= 0:
+                return 0
+            admitted = min(requested, _local_target_remaining())
+            if admitted <= 0:
+                return 0
+            if not (global_target_enabled and source_mode == "benchmatch" and global_target_samples > 0):
+                return admitted
+            admitted_samples, _admitted_games, _state = _reserve_global_generation_budget(
+                progress_path=global_progress_path,
+                lock_dir=global_progress_lock_dir,
+                global_target_id=global_target_id,
+                target_samples=global_target_samples,
+                job_id=job.job_id,
+                dataset_source_id=dataset_source_id,
+                requested_samples=admitted,
+                requested_games=1,
+            )
+            return int(admitted_samples)
+
         def _make_sequential_progress_callback(base_games: int, base_samples: int) -> Callable[[dict[str, Any], int, int], None]:
             def _on_sequential_game_completed(pending: dict[str, Any], completed_games_so_far: int, completed_samples_so_far: int) -> None:
                 nonlocal matchup_game_count, matchup_sample_count, total_samples_after_run
@@ -2417,20 +2543,10 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
                 models_root=job.paths.models_root,
                 model_agent_device=model_agent_device,
                 on_game_completed=_make_sequential_progress_callback(0, 0),
+                sample_cap_resolver=lambda _pending, sample_count: _resolve_admitted_samples(sample_count),
             )
             matchup_game_count = int(completed_games)
             matchup_sample_count = int(completed_samples)
-            if global_target_enabled and source_mode == "benchmatch":
-                _update_global_generation_progress(
-                    progress_path=global_progress_path,
-                    lock_dir=global_progress_lock_dir,
-                    global_target_id=global_target_id,
-                    target_samples=global_target_samples,
-                    job_id=job.job_id,
-                    dataset_source_id=dataset_source_id,
-                    delta_samples=int(completed_samples),
-                    delta_games=int(completed_games),
-                )
             if pending_games:
                 _update_benchmatch_progress(str(pending_games[-1]["game_id"]))
         else:
@@ -2502,6 +2618,7 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
                         for future in done:
                             pending = future_map.pop(future)
                             raw_payload, samples = future.result()
+                            admitted_samples = _resolve_admitted_samples(len(samples))
                             games_inc, samples_inc = _materialize_completed_game(
                                 job,
                                 pending=pending,
@@ -2510,24 +2627,14 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
                                 matchup_id=matchup_id,
                                 games=games,
                                 execution_mode="parallel",
+                                max_samples_to_write=admitted_samples,
                             )
                             matchup_game_count += games_inc
                             matchup_sample_count += samples_inc
                             total_samples_after_run += samples_inc
-                            if global_target_enabled and source_mode == "benchmatch":
-                                global_state = _update_global_generation_progress(
-                                    progress_path=global_progress_path,
-                                    lock_dir=global_progress_lock_dir,
-                                    global_target_id=global_target_id,
-                                    target_samples=global_target_samples,
-                                    job_id=job.job_id,
-                                    dataset_source_id=dataset_source_id,
-                                    delta_samples=int(samples_inc),
-                                    delta_games=int(games_inc),
-                                )
-                                if int(global_state.get("total_samples", 0)) >= int(global_target_samples or 0) > 0:
-                                    global_stop_requested = True
-                                    pending_queue.clear()
+                            if _global_target_reached():
+                                global_stop_requested = True
+                                pending_queue.clear()
                             if matchup_game_count % progress_update_every_n_games == 0:
                                 _update_benchmatch_progress(str(pending["game_id"]))
             except concurrent.futures.process.BrokenProcessPool as exc:
@@ -2558,6 +2665,7 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
                     models_root=job.paths.models_root,
                     model_agent_device=model_agent_device,
                     on_game_completed=_make_sequential_progress_callback(matchup_game_count, matchup_sample_count),
+                    sample_cap_resolver=lambda _pending, sample_count: _resolve_admitted_samples(sample_count),
                 )
                 matchup_game_count = int(matchup_game_count)
                 matchup_sample_count = int(matchup_sample_count)
@@ -2704,7 +2812,21 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
     multiprocessing_start_method = str(runtime_cfg.get("multiprocessing_start_method", "spawn")).strip().lower() or "spawn"
     max_tasks_per_child = int(runtime_cfg.get("max_tasks_per_child", 25))
     include_tactical_analysis = bool(cfg.get("include_tactical_analysis", True))
+    dedupe_sample_ids = bool(cfg.get("dedupe_sample_ids", True))
     export_partial_every_n_files = max(1, int(cfg.get("export_partial_every_n_files", 250)))
+    adaptive_source_polling = bool(cfg.get("adaptive_source_polling", True))
+    source_poll_interval_min_seconds = max(1.0, float(cfg.get("source_poll_interval_min_seconds", max(1.0, source_poll_interval_seconds / 2.0))))
+    source_poll_interval_max_seconds = max(source_poll_interval_min_seconds, float(cfg.get("source_poll_interval_max_seconds", max(source_poll_interval_seconds * 4.0, source_poll_interval_min_seconds))))
+    current_poll_interval_seconds = source_poll_interval_seconds
+    stop_when_global_target_reached = bool(cfg.get("stop_when_global_target_reached", True))
+    global_target_progress_path = _resolve_storage_path(
+        job.paths.drive_root,
+        cfg.get("global_target_progress_path"),
+        job.paths.data_root / "global_generation_progress" / "bench_models_20m_global.json",
+    )
+    global_target_samples_cfg = int(cfg.get("global_target_samples", 0))
+    global_target_stabilization_polls = max(1, int(cfg.get("global_target_stabilization_polls", 3)))
+    global_target_reached_polls = 0
     effective_max_tasks_per_child = _resolve_pool_max_tasks_per_child(
         start_method=multiprocessing_start_method,
         configured_value=max_tasks_per_child,
@@ -2713,16 +2835,18 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
     )
 
     job.logger.info(
-        "dataset build startup | dataset=%s | source_dataset_id=%s | configured_input_sampled_dir=%s | workers=%s | max_pending_futures=%s | include_tactical_analysis=%s | export_partial_every_n_files=%s | follow_source_updates=%s | source_poll_interval_seconds=%.1f",
+        "dataset build startup | dataset=%s | source_dataset_id=%s | configured_input_sampled_dir=%s | workers=%s | max_pending_futures=%s | include_tactical_analysis=%s | dedupe_sample_ids=%s | export_partial_every_n_files=%s | follow_source_updates=%s | source_poll_interval_seconds=%.1f | adaptive_source_polling=%s",
         dataset_id,
         source_dataset_id or "<auto>",
         str(cfg.get("input_sampled_dir", "")),
         num_workers,
         max_pending_futures,
         include_tactical_analysis,
+        dedupe_sample_ids,
         export_partial_every_n_files,
         configured_follow_source_updates,
         source_poll_interval_seconds,
+        adaptive_source_polling,
     )
 
     dataset_dir = job.job_dir / "dataset_build"
@@ -2737,18 +2861,22 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
                 job.logger.info(
                     "dataset build waiting for source registration | source_dataset_id=%s | poll_interval_seconds=%.1f",
                     source_dataset_id,
-                    source_poll_interval_seconds,
+                    current_poll_interval_seconds,
                 )
                 job.write_event(
                     "dataset_build_waiting_for_source_registration",
                     source_dataset_id=source_dataset_id,
-                    poll_interval_seconds=source_poll_interval_seconds,
+                    poll_interval_seconds=current_poll_interval_seconds,
                 )
-                time.sleep(source_poll_interval_seconds)
+                time.sleep(current_poll_interval_seconds)
+                if adaptive_source_polling:
+                    current_poll_interval_seconds = min(source_poll_interval_max_seconds, current_poll_interval_seconds * 1.5)
         sampled_root = Path(str(source_entry["sampled_dir"]))
     else:
         sampled_root = _resolve_storage_path(job.paths.drive_root, cfg.get("input_sampled_dir"), dataset_dir.parent / "dataset_generation" / "sampled_positions")
         source_dataset_id = Path(sampled_root).name
+    if adaptive_source_polling:
+        current_poll_interval_seconds = source_poll_interval_min_seconds
     follow_source_updates = bool(configured_follow_source_updates and source_dataset_id)
     configured_label_cache_dir = cfg.get("label_cache_dir")
     if configured_label_cache_dir:
@@ -2804,23 +2932,78 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
                 source_status = "completed"
         return sorted(sampled_root.rglob("*.jsonl")), source_status
 
+    def _global_generation_target_reached_for_build() -> bool:
+        if not stop_when_global_target_reached:
+            return False
+        payload = _read_json_file(
+            global_target_progress_path,
+            {
+                "total_samples": 0,
+                "target_samples": int(global_target_samples_cfg),
+            },
+        )
+        total = int(payload.get("total_samples", 0))
+        target = int(payload.get("target_samples") or global_target_samples_cfg or 0)
+        return target > 0 and total >= target
+
     sampled_files, latest_source_status = _refresh_source_inventory()
     while not sampled_files and follow_source_updates and latest_source_status != "completed":
         job.logger.info(
             "dataset build waiting for first sampled files | source_dataset_id=%s | source_status=%s | poll_interval_seconds=%.1f",
             source_dataset_id,
             latest_source_status,
-            source_poll_interval_seconds,
+            current_poll_interval_seconds,
         )
         job.write_event(
             "dataset_build_waiting_for_first_sampled_files",
             source_dataset_id=source_dataset_id,
             source_status=latest_source_status,
-            poll_interval_seconds=source_poll_interval_seconds,
+            poll_interval_seconds=current_poll_interval_seconds,
         )
-        time.sleep(source_poll_interval_seconds)
+        if _global_generation_target_reached_for_build():
+            global_target_reached_polls += 1
+            if global_target_reached_polls >= global_target_stabilization_polls:
+                break
+        else:
+            global_target_reached_polls = 0
+        time.sleep(current_poll_interval_seconds)
+        if adaptive_source_polling:
+            current_poll_interval_seconds = min(source_poll_interval_max_seconds, current_poll_interval_seconds * 1.5)
         sampled_files, latest_source_status = _refresh_source_inventory()
+    if sampled_files:
+        global_target_reached_polls = 0
     if not sampled_files:
+        if _global_generation_target_reached_for_build():
+            summary = {
+                "job_id": job.job_id,
+                "dataset_id": dataset_id,
+                "teacher_engine": teacher_engine,
+                "teacher_level": teacher_level,
+                "source_dataset_id": source_dataset_id,
+                "label_cache_dir": str(label_cache_dir),
+                "splits": {
+                    "train": {"games": 0, "samples": 0, "duplicate_samples_removed": 0},
+                    "validation": {"games": 0, "samples": 0, "duplicate_samples_removed": 0},
+                    "test": {"games": 0, "samples": 0, "duplicate_samples_removed": 0},
+                },
+                "output_dir": str(output_root),
+                "labeled_samples": 0,
+                "target_labeled_samples": target_labeled_samples,
+                "input_dim": 17,
+                "feature_schema_version": "policy_value_tactical_v3",
+                "dedupe_sample_ids": dedupe_sample_ids,
+                "duplicate_samples_removed": 0,
+                "skipped_terminal_samples": 0,
+                "skipped_no_legal_samples": 0,
+                "build_status": "completed_empty_global_target_reached",
+            }
+            _write_json(dataset_dir / "dataset_build_summary.json", summary)
+            job.logger.info(
+                "dataset build completed empty | dataset=%s | source_dataset_id=%s | reason=global_target_reached_before_first_source_file",
+                dataset_id,
+                source_dataset_id,
+            )
+            return summary
         raise FileNotFoundError(f"Aucun fichier sampled_positions trouve dans {sampled_root}")
 
     state = job.read_state()
@@ -2877,7 +3060,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
                 "include_tactical_analysis": include_tactical_analysis,
                 "contiguous_completed_prefix": contiguous_completed_prefix,
                 "follow_source_updates": follow_source_updates,
-                "source_poll_interval_seconds": source_poll_interval_seconds,
+                "source_poll_interval_seconds": current_poll_interval_seconds,
                 "last_completed_file": last_completed_file_name,
             }
         )
@@ -2911,7 +3094,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
             return
         if not force and (processed_count - last_partial_export_processed) < export_partial_every_n_files:
             return
-        split_summary, exported_input_dim = _export_built_dataset_snapshot(
+        split_summary, exported_input_dim, duplicate_samples_removed = _export_built_dataset_snapshot(
             job=job,
             dataset_id=dataset_id,
             source_dataset_id=source_dataset_id,
@@ -2930,14 +3113,16 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
             labeled_samples_total=labeled_samples_total,
             target_labeled_samples=target_labeled_samples,
             build_status="partial",
+            dedupe_sample_ids=dedupe_sample_ids,
         )
         last_partial_export_processed = processed_count
         job.logger.info(
-            "dataset build partial snapshot exported | dataset=%s | processed_files=%s/%s | labeled_samples=%s | input_dim=%s | train=%s | validation=%s | test=%s | output_dir=%s",
+            "dataset build partial snapshot exported | dataset=%s | processed_files=%s/%s | labeled_samples=%s | duplicate_samples_removed=%s | input_dim=%s | train=%s | validation=%s | test=%s | output_dir=%s",
             dataset_id,
             processed_count,
             len(sampled_files),
             labeled_samples_total,
+            duplicate_samples_removed,
             exported_input_dim,
             split_summary.get("train", {}).get("samples", 0),
             split_summary.get("validation", {}).get("samples", 0),
@@ -2952,11 +3137,13 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
             labeled_samples=labeled_samples_total,
             output_dir=str(output_root),
             split_summary=split_summary,
+            duplicate_samples_removed=duplicate_samples_removed,
+            dedupe_sample_ids=dedupe_sample_ids,
             input_dim=exported_input_dim,
         )
 
     job.logger.info(
-        "dataset build started | dataset=%s | source_dataset_id=%s | teacher=%s:%s | sampled_root=%s | label_cache=%s | output_dir=%s | files=%s | target_labeled_samples=%s | workers=%s | include_tactical_analysis=%s",
+        "dataset build started | dataset=%s | source_dataset_id=%s | teacher=%s:%s | sampled_root=%s | label_cache=%s | output_dir=%s | files=%s | target_labeled_samples=%s | workers=%s | include_tactical_analysis=%s | dedupe_sample_ids=%s",
         dataset_id,
         source_dataset_id,
         teacher_engine,
@@ -2968,6 +3155,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         target_labeled_samples,
         num_workers,
         include_tactical_analysis,
+        dedupe_sample_ids,
     )
     job.set_phase("dataset_build")
     job.write_event(
@@ -2982,6 +3170,8 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         target_labeled_samples=target_labeled_samples,
         num_workers=num_workers,
         include_tactical_analysis=include_tactical_analysis,
+        dedupe_sample_ids=dedupe_sample_ids,
+        adaptive_source_polling=adaptive_source_polling,
     )
     job.write_metric({"metric_type": "dataset_build_started"})
 
@@ -3074,9 +3264,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         nonlocal processed_count, skipped_terminal_samples, skipped_no_legal_samples, labeled_samples_total, last_completed_file_name
         output_labeled = Path(file_item["output_labeled"])
         output_labeled.parent.mkdir(parents=True, exist_ok=True)
-        with output_labeled.open("w", encoding="utf-8") as handle:
-            for sample in file_samples:
-                handle.write(json.dumps(sample, ensure_ascii=True) + "\n")
+        write_jsonl_atomic(output_labeled, file_samples, ensure_ascii=True)
 
         skipped_terminal_samples += skipped_terminal
         skipped_no_legal_samples += skipped_no_legal
@@ -3301,6 +3489,9 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         if reused_new_files > 0:
             _export_partial_snapshot_if_needed(force=True)
         if new_pending_files:
+            global_target_reached_polls = 0
+            if adaptive_source_polling:
+                current_poll_interval_seconds = source_poll_interval_min_seconds
             job.logger.info(
                 "dataset build source refresh detected new files | dataset=%s | source_dataset_id=%s | source_status=%s | new_pending_files=%s | reused_new_files=%s | total_known_files=%s",
                 dataset_id,
@@ -3323,6 +3514,18 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
             continue
         if latest_source_status == "completed":
             break
+        if _global_generation_target_reached_for_build():
+            global_target_reached_polls += 1
+            if global_target_reached_polls >= global_target_stabilization_polls:
+                job.logger.info(
+                    "dataset build global target reached with no new files, finalizing | dataset=%s | source_dataset_id=%s | polls=%s",
+                    dataset_id,
+                    source_dataset_id,
+                    global_target_reached_polls,
+                )
+                break
+        else:
+            global_target_reached_polls = 0
         job.logger.info(
             "dataset build waiting for source updates | dataset=%s | source_dataset_id=%s | source_status=%s | processed_files=%s | known_files=%s | poll_interval_seconds=%.1f",
             dataset_id,
@@ -3330,7 +3533,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
             latest_source_status,
             processed_count,
             len(sampled_files),
-            source_poll_interval_seconds,
+            current_poll_interval_seconds,
         )
         job.write_event(
             "dataset_build_waiting_for_source_updates",
@@ -3339,11 +3542,13 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
             source_status=latest_source_status,
             processed_files=processed_count,
             known_files=len(sampled_files),
-            poll_interval_seconds=source_poll_interval_seconds,
+            poll_interval_seconds=current_poll_interval_seconds,
         )
-        time.sleep(source_poll_interval_seconds)
+        time.sleep(current_poll_interval_seconds)
+        if adaptive_source_polling:
+            current_poll_interval_seconds = min(source_poll_interval_max_seconds, current_poll_interval_seconds * 1.5)
 
-    split_summary, exported_input_dim = _export_built_dataset_snapshot(
+    split_summary, exported_input_dim, duplicate_samples_removed = _export_built_dataset_snapshot(
         job=job,
         dataset_id=dataset_id,
         source_dataset_id=source_dataset_id,
@@ -3362,6 +3567,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         labeled_samples_total=labeled_samples_total,
         target_labeled_samples=target_labeled_samples,
         build_status="completed",
+        dedupe_sample_ids=dedupe_sample_ids,
     )
 
     summary = {
@@ -3377,23 +3583,38 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         "target_labeled_samples": target_labeled_samples,
         "input_dim": exported_input_dim,
         "feature_schema_version": "policy_value_tactical_v3",
+        "dedupe_sample_ids": dedupe_sample_ids,
+        "duplicate_samples_removed": duplicate_samples_removed,
         "skipped_terminal_samples": skipped_terminal_samples,
         "skipped_no_legal_samples": skipped_no_legal_samples,
     }
     _write_json(dataset_dir / "dataset_build_summary.json", summary)
     job.logger.info(
-        "dataset build completed | dataset=%s | build_mode=teacher_label | source_dataset_id=%s | train=%s | validation=%s | test=%s | skipped_terminal=%s | skipped_no_legal=%s | output_dir=%s",
+        "dataset build completed | dataset=%s | build_mode=teacher_label | source_dataset_id=%s | train=%s | validation=%s | test=%s | duplicate_samples_removed=%s | skipped_terminal=%s | skipped_no_legal=%s | output_dir=%s",
         dataset_id,
         source_dataset_id,
         split_summary.get("train", {}).get("samples", 0),
         split_summary.get("validation", {}).get("samples", 0),
         split_summary.get("test", {}).get("samples", 0),
+        duplicate_samples_removed,
         skipped_terminal_samples,
         skipped_no_legal_samples,
         output_root,
     )
-    job.write_metric({"metric_type": "dataset_build_completed", "dataset_id": dataset_id})
-    job.write_event("dataset_build_completed", dataset_id=dataset_id)
+    job.write_metric(
+        {
+            "metric_type": "dataset_build_completed",
+            "dataset_id": dataset_id,
+            "duplicate_samples_removed": duplicate_samples_removed,
+            "dedupe_sample_ids": dedupe_sample_ids,
+        }
+    )
+    job.write_event(
+        "dataset_build_completed",
+        dataset_id=dataset_id,
+        duplicate_samples_removed=duplicate_samples_removed,
+        dedupe_sample_ids=dedupe_sample_ids,
+    )
     return summary
 
 

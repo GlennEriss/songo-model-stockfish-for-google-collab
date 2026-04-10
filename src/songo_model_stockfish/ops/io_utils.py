@@ -1,0 +1,81 @@
+from __future__ import annotations
+
+import json
+import os
+import time
+from pathlib import Path
+from typing import Any, Mapping
+
+
+def read_json_dict(
+    path: Path,
+    *,
+    default: Mapping[str, Any] | None = None,
+    retries: int = 6,
+    wait_seconds: float = 0.05,
+) -> dict[str, Any]:
+    fallback = dict(default or {})
+    if not path.exists():
+        return fallback
+    attempts = max(1, int(retries))
+    for attempt in range(attempts):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            if attempt + 1 >= attempts:
+                return fallback
+            time.sleep(max(0.01, float(wait_seconds) * (attempt + 1)))
+            continue
+        if not isinstance(payload, dict):
+            return fallback
+        return payload
+    return fallback
+
+
+def write_text_atomic(path: Path, text: str, *, encoding: str = "utf-8") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.tmp.{os.getpid()}.{time.time_ns()}")
+    try:
+        with tmp_path.open("w", encoding=encoding) as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+
+
+def write_json_atomic(path: Path, payload: Mapping[str, Any], *, ensure_ascii: bool = True, indent: int = 2) -> None:
+    write_text_atomic(path, json.dumps(dict(payload), indent=indent, ensure_ascii=ensure_ascii), encoding="utf-8")
+
+
+def write_jsonl_atomic(path: Path, payloads: list[dict[str, Any]], *, ensure_ascii: bool = True) -> None:
+    lines = [json.dumps(payload, ensure_ascii=ensure_ascii) for payload in payloads]
+    text = "\n".join(lines)
+    if text:
+        text += "\n"
+    write_text_atomic(path, text, encoding="utf-8")
+
+
+def acquire_lock_dir(lock_dir: Path, *, timeout_seconds: float = 30.0, poll_seconds: float = 0.1) -> bool:
+    deadline = time.time() + max(1.0, float(timeout_seconds))
+    while time.time() < deadline:
+        try:
+            lock_dir.mkdir(parents=True, exist_ok=False)
+            return True
+        except FileExistsError:
+            time.sleep(max(0.01, float(poll_seconds)))
+    return False
+
+
+def release_lock_dir(lock_dir: Path) -> None:
+    try:
+        lock_dir.rmdir()
+    except FileNotFoundError:
+        return
+    except OSError:
+        return

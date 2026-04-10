@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 import time
@@ -9,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch.amp import autocast
 
+from songo_model_stockfish.ops.io_utils import read_json_dict, write_json_atomic
 from songo_model_stockfish.ops.job import JobContext
 from songo_model_stockfish.ops.logging import utc_now_iso
 from songo_model_stockfish.ops.model_registry import (
@@ -39,8 +39,7 @@ def _resolve_storage_path(base: Path, configured: str | None, fallback: Path) ->
 
 
 def _write_json(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+    write_json_atomic(path, payload, ensure_ascii=True, indent=2)
 
 
 def _resolve_evaluation_target(job: JobContext, cfg: dict[str, Any]) -> tuple[str, Path]:
@@ -71,13 +70,15 @@ def _update_model_card_after_evaluation(models_root: Path, model_id: str, summar
     model_card_path = models_root / "final" / f"{model_id}.model_card.json"
     if not model_card_path.exists():
         return
-    payload = json.loads(model_card_path.read_text(encoding="utf-8"))
+    payload = read_json_dict(model_card_path, default={})
+    if not payload:
+        return
     payload["evaluation_summary_path"] = str(summary["evaluation_summary_path"])
     payload["evaluation_top1"] = float(summary["policy_accuracy_top1"])
     payload["evaluation_top3"] = float(summary["policy_accuracy_top3"])
     payload["evaluation_loss_total"] = float(summary["loss_total"])
     payload["evaluation_value_mae"] = float(summary["value_mae"])
-    model_card_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+    write_json_atomic(model_card_path, payload, ensure_ascii=True, indent=2)
 
 
 def run_evaluation(job: JobContext) -> dict[str, object]:
@@ -172,6 +173,12 @@ def run_evaluation(job: JobContext) -> dict[str, object]:
         persistent_workers=persistent_workers,
         prefetch_factor=prefetch_factor,
     )
+    model_input_dim = int(model_config.get("input_dim", 17))
+    if int(_input_dim) != model_input_dim:
+        raise ValueError(
+            "Incompatibilite modele/dataset detectee avant evaluation "
+            f"(model_id={model_id}, checkpoint_input_dim={model_input_dim}, dataset_input_dim={_input_dim}, dataset_id={dataset_id}, test_dataset_path={test_dataset_path})."
+        )
 
     state = job.read_state()
     completed_batches = int(state.get("completed_batches", 0))

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from songo_model_stockfish.ops.io_utils import read_json_dict, write_json_atomic, write_text_atomic
 from songo_model_stockfish.ops.logging import JsonlWriter, build_console_logger, utc_now_iso
 from songo_model_stockfish.ops.paths import ProjectPaths, build_project_paths
 
@@ -57,14 +58,10 @@ class JobContext:
     state_path: Path
 
     def read_status(self) -> dict[str, Any]:
-        if not self.status_path.exists():
-            return {}
-        return json.loads(self.status_path.read_text(encoding="utf-8"))
+        return read_json_dict(self.status_path, default={})
 
     def read_state(self) -> dict[str, Any]:
-        if not self.state_path.exists():
-            return {}
-        return json.loads(self.state_path.read_text(encoding="utf-8"))
+        return read_json_dict(self.state_path, default={})
 
     def write_event(self, message: str, **extra: Any) -> None:
         payload = {
@@ -98,7 +95,7 @@ class JobContext:
         }
         if extra:
             payload.update(extra)
-        self.status_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        write_json_atomic(self.status_path, payload, ensure_ascii=True, indent=2)
 
     def write_state(self, state: dict[str, Any]) -> None:
         payload = {
@@ -106,14 +103,12 @@ class JobContext:
             "run_type": self.run_type,
             **state,
         }
-        self.state_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        write_json_atomic(self.state_path, payload, ensure_ascii=True, indent=2)
 
     def set_phase(self, phase: str) -> None:
-        current = {}
-        if self.status_path.exists():
-            current = json.loads(self.status_path.read_text(encoding="utf-8"))
+        current = read_json_dict(self.status_path, default={})
         current.update({"phase": phase, "updated_at": utc_now_iso()})
-        self.status_path.write_text(json.dumps(current, indent=2), encoding="utf-8")
+        write_json_atomic(self.status_path, current, ensure_ascii=True, indent=2)
 
 
 def create_job_context(config: dict[str, Any], *, override_job_id: str | None = None) -> JobContext:
@@ -135,7 +130,7 @@ def create_job_context(config: dict[str, Any], *, override_job_id: str | None = 
     }:
         existing_status_path = paths.jobs_root / job_id / "run_status.json"
         if existing_status_path.exists():
-            existing_status = json.loads(existing_status_path.read_text(encoding="utf-8"))
+            existing_status = read_json_dict(existing_status_path, default={})
             if str(existing_status.get("status", "")).lower() == "completed":
                 job_id = _next_cycle_job_id(requested_job_id, paths.jobs_root)
     job_dir = paths.jobs_root / job_id
@@ -160,7 +155,7 @@ def create_job_context(config: dict[str, Any], *, override_job_id: str | None = 
         state_path=state_path,
     )
 
-    (job_dir / "config.yaml").write_text(_dump_yaml_like(config), encoding="utf-8")
+    write_text_atomic(job_dir / "config.yaml", _dump_yaml_like(config), encoding="utf-8")
     if not status_path.exists():
         context.write_status("pending")
     if not state_path.exists():
