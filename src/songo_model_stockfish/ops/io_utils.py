@@ -34,19 +34,44 @@ def read_json_dict(
 
 def write_text_atomic(path: Path, text: str, *, encoding: str = "utf-8") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f".{path.name}.tmp.{os.getpid()}.{time.time_ns()}")
+    last_exc: OSError | None = None
+    for attempt in range(3):
+        tmp_path = path.with_name(f".{path.name}.tmp.{os.getpid()}.{time.time_ns()}")
+        try:
+            with tmp_path.open("w", encoding=encoding) as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, path)
+            return
+        except FileNotFoundError as exc:
+            # Google Drive FUSE peut parfois echouer sur le rename atomique.
+            # On retente avant fallback.
+            last_exc = exc
+            path.parent.mkdir(parents=True, exist_ok=True)
+            time.sleep(0.02 * (attempt + 1))
+        except OSError as exc:
+            last_exc = exc
+            path.parent.mkdir(parents=True, exist_ok=True)
+            time.sleep(0.02 * (attempt + 1))
+        finally:
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except OSError:
+                pass
+
+    # Fallback robuste: ecriture directe sous lock appelant.
     try:
-        with tmp_path.open("w", encoding=encoding) as handle:
+        with path.open("w", encoding=encoding) as handle:
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(tmp_path, path)
-    finally:
-        try:
-            if tmp_path.exists():
-                tmp_path.unlink()
-        except OSError:
-            pass
+        return
+    except OSError:
+        if last_exc is not None:
+            raise last_exc
+        raise
 
 
 def write_json_atomic(path: Path, payload: Mapping[str, Any], *, ensure_ascii: bool = True, indent: int = 2) -> None:
