@@ -49,12 +49,12 @@ def _read_dataset_registry(data_root: Path, firestore_cfg: dict[str, Any] | None
     cfg = firestore_cfg if isinstance(firestore_cfg, dict) else {}
     backend = str(cfg.get("backend", "file")).strip().lower() or "file"
     if backend == "firestore":
+        project_id = str(cfg.get("project_id", "")).strip()
+        collection = str(cfg.get("collection", "dataset_registry")).strip() or "dataset_registry"
+        document = str(cfg.get("document", "primary")).strip() or "primary"
         try:
             from google.cloud import firestore
 
-            project_id = str(cfg.get("project_id", "")).strip()
-            collection = str(cfg.get("collection", "dataset_registry")).strip() or "dataset_registry"
-            document = str(cfg.get("document", "primary")).strip() or "primary"
             credentials_path = str(cfg.get("credentials_path", "")).strip()
             api_key = str(cfg.get("api_key", "")).strip()
             credentials = None
@@ -71,8 +71,12 @@ def _read_dataset_registry(data_root: Path, firestore_cfg: dict[str, Any] | None
             client = firestore.Client(project=(project_id or None), credentials=credentials, client_options=client_options)
             snap = client.collection(collection).document(document).get()
             payload = snap.to_dict() if snap.exists else {"dataset_sources": [], "built_datasets": []}
-        except Exception:
-            payload = {"dataset_sources": [], "built_datasets": []}
+        except Exception as exc:
+            raise RuntimeError(
+                "Lecture dataset_registry Firestore impossible | "
+                f"project_id={project_id or '<empty>'} | collection={collection} | document={document} | "
+                f"cause={type(exc).__name__}: {exc}"
+            ) from exc
     else:
         registry_path = data_root / "dataset_registry.json"
         payload = read_json_dict(registry_path, default={"dataset_sources": [], "built_datasets": []})

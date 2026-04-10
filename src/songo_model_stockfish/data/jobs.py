@@ -388,7 +388,6 @@ def _update_global_generation_progress_firestore(
             exc=exc,
             details=f"job_id={job_id} dataset_source_id={dataset_source_id}",
         )
-    _mirror_global_generation_progress_state(progress_path, state)
     return state
 
 
@@ -476,7 +475,6 @@ def _reserve_global_generation_budget_firestore(
                 f"requested_samples={requested_samples} requested_games={requested_games}"
             ),
         )
-    _mirror_global_generation_progress_state(progress_path, state)
     return allowed_samples, allowed_games, state
 
 
