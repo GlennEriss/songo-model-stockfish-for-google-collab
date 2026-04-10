@@ -1585,10 +1585,16 @@ def _resolve_model_checkpoint_for_generation(model_spec: str, *, models_root: Pa
     else:
         registry = load_registry(models_root)
         record = next((item for item in registry.get("models", []) if str(item.get("model_id", "")).strip() == requested), None)
-        if not record:
-            raise FileNotFoundError(f"Modele introuvable dans le registre pour dataset-generate: {requested}")
-        model_id = str(record.get("model_id", requested)).strip()
-        checkpoint_path = Path(str(record.get("checkpoint_path", "")).strip())
+        if record:
+            model_id = str(record.get("model_id", requested)).strip()
+            checkpoint_path = Path(str(record.get("checkpoint_path", "")).strip())
+        else:
+            # Fallback robuste: si le modele n'est pas reference dans le registre
+            # mais existe dans models/final/<model_id>.pt, on l'utilise quand meme.
+            model_id = requested
+            checkpoint_path = models_root / "final" / f"{requested}.pt"
+            if not checkpoint_path.exists():
+                raise FileNotFoundError(f"Modele introuvable dans le registre pour dataset-generate: {requested}")
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint introuvable pour dataset-generate model:{requested}: {checkpoint_path}")
     return model_id, checkpoint_path
