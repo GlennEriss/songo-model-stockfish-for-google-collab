@@ -148,6 +148,11 @@ cells = [
         FIRESTORE_DOCUMENT = GLOBAL_TARGET_ID
         FIRESTORE_CREDENTIALS_PATH = ''  # Optionnel: chemin JSON service account
         FIRESTORE_API_KEY = 'AIzaSyA0I4zJMpBElpwyae0tLlNpnMG0fnF07ys'
+        FIRESTORE_DATASET_REGISTRY_COLLECTION = 'dataset_registry'
+        FIRESTORE_DATASET_REGISTRY_DOCUMENT = 'primary'
+        FIRESTORE_WORKER_LEASES_COLLECTION = 'worker_leases'
+        FIRESTORE_PIPELINE_MANIFESTS_COLLECTION = 'pipeline_manifests'
+        FIRESTORE_WORKER_CHECKPOINTS_COLLECTION = 'worker_checkpoints'
         if str(GLOBAL_PROGRESS_BACKEND).strip().lower() != 'firestore':
             raise ValueError("GLOBAL_PROGRESS_BACKEND doit rester 'firestore' (fallback fichier desactive).")
         SOURCE_POLL_INTERVAL_SECONDS = 20
@@ -213,50 +218,64 @@ cells = [
 
         def _auto_assign_worker_index(*, drive_root: str, global_target_id: str, worker_tag: str, worker_count: int) -> int:
             worker_count = max(1, int(worker_count))
-            leases_path = Path(drive_root) / 'data' / 'global_generation_progress' / f'{global_target_id}.worker_leases.json'
-            lock_dir = Path(str(leases_path) + '.lock')
-            lock_ok = _acquire_lock_dir(lock_dir)
-            if not lock_ok:
-                return abs(hash(worker_tag)) % worker_count
             try:
-                payload = {}
-                if leases_path.exists():
-                    try:
-                        payload = json.loads(leases_path.read_text(encoding='utf-8'))
-                    except Exception:
+                from google.cloud import firestore
+                from google.auth.credentials import AnonymousCredentials
+                from google.api_core.client_options import ClientOptions
+                credentials_path = str(FIRESTORE_CREDENTIALS_PATH).strip()
+                project_id = str(FIRESTORE_PROJECT_ID).strip()
+                collection = str(FIRESTORE_WORKER_LEASES_COLLECTION).strip() or 'worker_leases'
+                document = str(global_target_id).strip() or 'default'
+                if credentials_path:
+                    from google.oauth2 import service_account
+                    creds = service_account.Credentials.from_service_account_file(credentials_path)
+                    client = firestore.Client(project=(project_id or None), credentials=creds)
+                elif str(FIRESTORE_API_KEY).strip():
+                    creds = AnonymousCredentials()
+                    client = firestore.Client(
+                        project=(project_id or None),
+                        credentials=creds,
+                        client_options=ClientOptions(api_key=str(FIRESTORE_API_KEY).strip()),
+                    )
+                else:
+                    client = firestore.Client(project=(project_id or None))
+                doc_ref = client.collection(collection).document(document)
+                tx = client.transaction()
+
+                @firestore.transactional
+                def _assign(transaction):
+                    snap = doc_ref.get(transaction=transaction)
+                    payload = snap.to_dict() if snap.exists else {}
+                    if not isinstance(payload, dict):
                         payload = {}
-                if not isinstance(payload, dict):
-                    payload = {}
-                leases = payload.get('leases', {})
-                if not isinstance(leases, dict):
-                    leases = {}
+                    leases = payload.get('leases', {})
+                    if not isinstance(leases, dict):
+                        leases = {}
+                    existing = leases.get(worker_tag, {})
+                    if isinstance(existing, dict):
+                        existing_index = existing.get('index')
+                        if isinstance(existing_index, int) and 0 <= existing_index < worker_count:
+                            leases[worker_tag] = {'index': existing_index, 'updated_at': time.time()}
+                            payload['leases'] = leases
+                            transaction.set(doc_ref, payload)
+                            return int(existing_index)
+                    used = set()
+                    for info in leases.values():
+                        if isinstance(info, dict):
+                            idx = info.get('index')
+                            if isinstance(idx, int) and 0 <= idx < worker_count:
+                                used.add(idx)
+                    assigned = next((idx for idx in range(worker_count) if idx not in used), None)
+                    if assigned is None:
+                        assigned = abs(hash(worker_tag)) % worker_count
+                    leases[worker_tag] = {'index': int(assigned), 'updated_at': time.time()}
+                    payload['leases'] = leases
+                    transaction.set(doc_ref, payload)
+                    return int(assigned)
 
-                existing = leases.get(worker_tag, {})
-                if isinstance(existing, dict):
-                    existing_index = existing.get('index')
-                    if isinstance(existing_index, int) and 0 <= existing_index < worker_count:
-                        leases[worker_tag] = {'index': existing_index, 'updated_at': time.time()}
-                        payload['leases'] = leases
-                        leases_path.parent.mkdir(parents=True, exist_ok=True)
-                        leases_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding='utf-8')
-                        return int(existing_index)
-
-                used = set()
-                for info in leases.values():
-                    if isinstance(info, dict):
-                        idx = info.get('index')
-                        if isinstance(idx, int) and 0 <= idx < worker_count:
-                            used.add(idx)
-                assigned = next((idx for idx in range(worker_count) if idx not in used), None)
-                if assigned is None:
-                    assigned = abs(hash(worker_tag)) % worker_count
-                leases[worker_tag] = {'index': int(assigned), 'updated_at': time.time()}
-                payload['leases'] = leases
-                leases_path.parent.mkdir(parents=True, exist_ok=True)
-                leases_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding='utf-8')
-                return int(assigned)
-            finally:
-                _release_lock_dir(lock_dir)
+                return int(_assign(tx))
+            except Exception:
+                return abs(hash(worker_tag)) % worker_count
 
         def _parse_iso_to_epoch(value: object) -> float:
             text = str(value or '').strip()
@@ -383,6 +402,55 @@ cells = [
                     raise RuntimeError(message) from exc
             raise RuntimeError(f'GLOBAL_PROGRESS_BACKEND non supporte: {backend} (mode firestore requis).')
 
+        def _get_firestore_client():
+            from google.cloud import firestore
+            from google.auth.credentials import AnonymousCredentials
+            from google.api_core.client_options import ClientOptions
+            credentials_path = str(FIRESTORE_CREDENTIALS_PATH).strip()
+            project_id = str(FIRESTORE_PROJECT_ID).strip()
+            if credentials_path:
+                from google.oauth2 import service_account
+                creds = service_account.Credentials.from_service_account_file(credentials_path)
+                return firestore.Client(project=(project_id or None), credentials=creds)
+            if str(FIRESTORE_API_KEY).strip():
+                creds = AnonymousCredentials()
+                return firestore.Client(
+                    project=(project_id or None),
+                    credentials=creds,
+                    client_options=ClientOptions(api_key=str(FIRESTORE_API_KEY).strip()),
+                )
+            return firestore.Client(project=(project_id or None))
+
+        def _read_firestore_doc(collection: str, document: str, default: dict | None = None) -> dict:
+            fallback = {} if default is None else default
+            client = _get_firestore_client()
+            snap = client.collection(str(collection)).document(str(document)).get()
+            if not snap.exists:
+                return dict(fallback)
+            payload = snap.to_dict() or {}
+            return payload if isinstance(payload, dict) else dict(fallback)
+
+        def _write_firestore_doc(collection: str, document: str, payload: dict) -> None:
+            client = _get_firestore_client()
+            client.collection(str(collection)).document(str(document)).set(dict(payload))
+
+        def _load_dataset_registry_payload() -> dict:
+            payload = _read_firestore_doc(
+                FIRESTORE_DATASET_REGISTRY_COLLECTION,
+                FIRESTORE_DATASET_REGISTRY_DOCUMENT,
+                default={'dataset_sources': [], 'built_datasets': []},
+            )
+            payload.setdefault('dataset_sources', [])
+            payload.setdefault('built_datasets', [])
+            return payload
+
+        def _load_pipeline_manifest_payload(worker_tag: str) -> dict:
+            return _read_firestore_doc(
+                FIRESTORE_PIPELINE_MANIFESTS_COLLECTION,
+                str(worker_tag),
+                default={},
+            )
+
         def _active_worker_tags_from_global_progress(
             *,
             drive_root: str,
@@ -427,11 +495,8 @@ cells = [
             stale_minutes: float,
             excluded_tags: set[str] | None = None,
         ) -> str | None:
-            registry_path = Path(drive_root) / 'data' / 'dataset_registry.json'
-            if not registry_path.exists():
-                return None
             try:
-                registry = json.loads(registry_path.read_text(encoding='utf-8'))
+                registry = _load_dataset_registry_payload()
             except Exception:
                 return None
             if not isinstance(registry, dict):
@@ -1120,6 +1185,7 @@ cells = [
         latest_path = Path(DRIVE_ROOT) / PIPELINE_MANIFEST_PATH
         latest_path.parent.mkdir(parents=True, exist_ok=True)
         latest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=True), encoding='utf-8')
+        _write_firestore_doc(FIRESTORE_PIPELINE_MANIFESTS_COLLECTION, WORKER_TAG, manifest)
 
         print('Pipeline lance en parallele')
         print('  dataset-generate pid =', generate_pid)
@@ -1127,6 +1193,7 @@ cells = [
         print('  generate log         =', generate_log_path)
         print('  build log            =', build_log_path)
         print('  manifest             =', latest_path)
+        print('  firestore_manifest   =', f'{FIRESTORE_PIPELINE_MANIFESTS_COLLECTION}/{WORKER_TAG}')
         """
     ),
     md("## 5bis. Suivre le pipeline dataset"),
@@ -1138,12 +1205,14 @@ cells = [
         from pathlib import Path
 
         logs_dir = Path(DRIVE_ROOT) / 'logs' / 'pipeline'
-        manifest_path = Path(DRIVE_ROOT) / PIPELINE_MANIFEST_PATH
 
-        if not manifest_path.exists():
-            print('Manifest introuvable:', manifest_path)
+        try:
+            manifest = _load_pipeline_manifest_payload(WORKER_TAG)
+        except Exception:
+            manifest = {}
+        if not manifest:
+            print('Manifest Firestore introuvable:', f'{FIRESTORE_PIPELINE_MANIFESTS_COLLECTION}/{WORKER_TAG}')
         else:
-            manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
             generate_pid = int(manifest.get('generate_pid', 0) or 0)
             build_pid = int(manifest.get('build_pid', 0) or 0)
             print('Manifest:')
@@ -1170,53 +1239,35 @@ cells = [
         import time
         from pathlib import Path
 
-        registry_path = Path(DRIVE_ROOT) / 'data' / 'dataset_registry.json'
+        try:
+            registry = _load_dataset_registry_payload()
+        except Exception as exc:
+            print('dataset_registry Firestore introuvable:', f'{type(exc).__name__}: {exc}')
+            registry = {'dataset_sources': [], 'built_datasets': []}
+        source = next((item for item in registry.get('dataset_sources', []) if item.get('dataset_source_id') == DATASET_SOURCE_ID), None)
+        built = next((item for item in registry.get('built_datasets', []) if item.get('dataset_id') == DATASET_BUILD_ID), None)
 
-        def _load_json_retry(path: Path, retries: int = 6, wait_seconds: float = 0.25, default=None):
-            fallback = {} if default is None else default
-            last_exc = None
-            for attempt in range(retries):
-                try:
-                    return json.loads(path.read_text(encoding='utf-8'))
-                except (FileNotFoundError, OSError):
-                    if attempt + 1 >= retries:
-                        return fallback
-                    time.sleep(wait_seconds)
-                except json.JSONDecodeError as exc:
-                    last_exc = exc
-                    time.sleep(wait_seconds)
-            if last_exc is not None:
-                return fallback
-            return fallback
-
-        if not registry_path.exists():
-            print('dataset_registry.json introuvable:', registry_path)
+        print('Source courante:')
+        if source is None:
+            print('- aucune entree source pour', DATASET_SOURCE_ID)
         else:
-            registry = _load_json_retry(registry_path)
-            source = next((item for item in registry.get('dataset_sources', []) if item.get('dataset_source_id') == DATASET_SOURCE_ID), None)
-            built = next((item for item in registry.get('built_datasets', []) if item.get('dataset_id') == DATASET_BUILD_ID), None)
+            print('  dataset_source_id =', source.get('dataset_source_id'))
+            print('  source_mode       =', source.get('source_mode'))
+            print('  source_status     =', source.get('source_status'))
+            print('  sampled_positions =', source.get('sampled_positions'))
+            print('  sampled_files     =', source.get('sampled_files'))
+            print('  updated_at        =', source.get('updated_at'))
 
-            print('Source courante:')
-            if source is None:
-                print('- aucune entree source pour', DATASET_SOURCE_ID)
-            else:
-                print('  dataset_source_id =', source.get('dataset_source_id'))
-                print('  source_mode       =', source.get('source_mode'))
-                print('  source_status     =', source.get('source_status'))
-                print('  sampled_positions =', source.get('sampled_positions'))
-                print('  sampled_files     =', source.get('sampled_files'))
-                print('  updated_at        =', source.get('updated_at'))
-
-            print('\\nDataset final courant:')
-            if built is None:
-                print('- aucune entree built pour', DATASET_BUILD_ID)
-            else:
-                print('  dataset_id        =', built.get('dataset_id'))
-                print('  build_status      =', built.get('build_status'))
-                print('  labeled_samples   =', built.get('labeled_samples'))
-                print('  target_samples    =', built.get('target_labeled_samples'))
-                print('  output_dir        =', built.get('output_dir'))
-                print('  updated_at        =', built.get('updated_at'))
+        print('\\nDataset final courant:')
+        if built is None:
+            print('- aucune entree built pour', DATASET_BUILD_ID)
+        else:
+            print('  dataset_id        =', built.get('dataset_id'))
+            print('  build_status      =', built.get('build_status'))
+            print('  labeled_samples   =', built.get('labeled_samples'))
+            print('  target_samples    =', built.get('target_labeled_samples'))
+            print('  output_dir        =', built.get('output_dir'))
+            print('  updated_at        =', built.get('updated_at'))
         """
     ),
     code(
@@ -1229,7 +1280,6 @@ cells = [
         REFRESH_SECONDS = 15
         MAX_LOOPS = 40
 
-        registry_path = Path(DRIVE_ROOT) / 'data' / 'dataset_registry.json'
         jobs_root = Path(DRIVE_ROOT) / 'jobs'
 
         def _load_json_retry(path: Path, retries: int = 6, wait_seconds: float = 0.25, default=None):
@@ -1263,11 +1313,7 @@ cells = [
             return sorted(candidates, key=lambda p: p.stat().st_mtime)[-1]
 
         for loop_idx in range(MAX_LOOPS):
-            if not registry_path.exists():
-                print('dataset_registry.json introuvable:', registry_path)
-                break
-
-            registry = _load_json_retry(registry_path)
+            registry = _load_dataset_registry_payload()
             source = next((item for item in registry.get('dataset_sources', []) if item.get('dataset_source_id') == DATASET_SOURCE_ID), None)
             built = next((item for item in registry.get('built_datasets', []) if item.get('dataset_id') == DATASET_BUILD_ID), None)
 
@@ -1306,8 +1352,6 @@ cells = [
 
         REFRESH_SECONDS = 15
         MAX_LOOPS = 40
-
-        registry_path = Path(DRIVE_ROOT) / 'data' / 'dataset_registry.json'
 
         def _load_json_retry(path: Path, retries: int = 6, wait_seconds: float = 0.25, default=None):
             fallback = {} if default is None else default
@@ -1348,13 +1392,12 @@ cells = [
 
             built_total_samples = 0
             built_worker_datasets = 0
-            if registry_path.exists():
-                registry = _load_json_retry(registry_path)
-                for item in registry.get('built_datasets', []):
-                    dataset_id = str(item.get('dataset_id', ''))
-                    if dataset_id == BASE_DATASET_BUILD_ID or dataset_id.startswith(f'{BASE_DATASET_BUILD_ID}_'):
-                        built_total_samples += int(item.get('labeled_samples', 0))
-                        built_worker_datasets += 1
+            registry = _load_dataset_registry_payload()
+            for item in registry.get('built_datasets', []):
+                dataset_id = str(item.get('dataset_id', ''))
+                if dataset_id == BASE_DATASET_BUILD_ID or dataset_id.startswith(f'{BASE_DATASET_BUILD_ID}_'):
+                    built_total_samples += int(item.get('labeled_samples', 0))
+                    built_worker_datasets += 1
 
             ts = time.strftime('%Y-%m-%d %H:%M:%S')
             print(
@@ -1464,7 +1507,6 @@ cells = [
         from pathlib import Path
 
         ACTIVE_THRESHOLD_SECONDS = 600
-        registry_path = Path(DRIVE_ROOT) / 'data' / 'dataset_registry.json'
         health_state_path = Path(DRIVE_ROOT) / 'logs' / 'pipeline' / f'health_snapshot_{GLOBAL_TARGET_ID}_{WORKER_TAG}.json'
 
         def _load_json_retry(path: Path, retries: int = 6, wait_seconds: float = 0.25, default=None):
@@ -1534,13 +1576,12 @@ cells = [
 
         build_total = 0
         build_workers = 0
-        if registry_path.exists():
-            registry = _load_json_retry(registry_path, default={'built_datasets': []})
-            for item in registry.get('built_datasets', []):
-                dataset_id = str(item.get('dataset_id', ''))
-                if dataset_id == BASE_DATASET_BUILD_ID or dataset_id.startswith(f'{BASE_DATASET_BUILD_ID}_'):
-                    build_total += int(item.get('labeled_samples', 0))
-                    build_workers += 1
+        registry = _load_dataset_registry_payload()
+        for item in registry.get('built_datasets', []):
+            dataset_id = str(item.get('dataset_id', ''))
+            if dataset_id == BASE_DATASET_BUILD_ID or dataset_id.startswith(f'{BASE_DATASET_BUILD_ID}_'):
+                build_total += int(item.get('labeled_samples', 0))
+                build_workers += 1
 
         current = {
             'ts': now_ts,
@@ -1623,12 +1664,10 @@ cells = [
 
         LOG_TAIL_LINES = 40
         logs_dir = Path(DRIVE_ROOT) / 'logs' / 'pipeline'
-        manifest_path = Path(DRIVE_ROOT) / PIPELINE_MANIFEST_PATH
-
-        if not manifest_path.exists():
-            print('Manifest introuvable:', manifest_path)
+        manifest = _load_pipeline_manifest_payload(WORKER_TAG)
+        if not manifest:
+            print('Manifest Firestore introuvable:', f'{FIRESTORE_PIPELINE_MANIFESTS_COLLECTION}/{WORKER_TAG}')
         else:
-            manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
             for label, key in [('dataset-generate', 'generate_log_path'), ('dataset-build', 'build_log_path')]:
                 log_path = Path(str(manifest.get(key, '')))
                 print(f'\\n===== {label} | {log_path} =====')
@@ -1647,11 +1686,10 @@ cells = [
         from pathlib import Path
 
         logs_dir = Path(DRIVE_ROOT) / 'logs' / 'pipeline'
-        manifest_path = Path(DRIVE_ROOT) / PIPELINE_MANIFEST_PATH
         fallback_path = logs_dir / f'{DATASET_BUILD_JOB_ID}.log'
 
-        if manifest_path.exists():
-            manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+        manifest = _load_pipeline_manifest_payload(WORKER_TAG)
+        if manifest:
             log_path = Path(str(manifest.get('build_log_path', fallback_path)))
         else:
             log_path = fallback_path
@@ -1670,11 +1708,8 @@ cells = [
         from datetime import datetime
         from pathlib import Path
 
-        registry_path = Path(DRIVE_ROOT) / 'data' / 'dataset_registry.json'
-        if not registry_path.exists():
-            print('dataset_registry.json introuvable:', registry_path)
-        else:
-            registry = json.loads(registry_path.read_text(encoding='utf-8'))
+        try:
+            registry = _load_dataset_registry_payload()
 
             def _fmt_ts(value: str) -> str:
                 value = str(value or '').strip()
@@ -1727,6 +1762,8 @@ cells = [
                     )
                 if not built:
                     print('- none')
+        except Exception as exc:
+            print('dataset_registry Firestore introuvable:', f'{type(exc).__name__}: {exc}')
         """
     ),
     md("## 7. Entrainement"),
@@ -1761,8 +1798,7 @@ cells = [
         requested_dataset_id = str(eval_block.get('dataset_id', DATASET_BUILD_ID))
         dataset_id = requested_dataset_id
 
-        registry_path = Path(DRIVE_ROOT) / 'data' / 'dataset_registry.json'
-        registry = json.loads(registry_path.read_text(encoding='utf-8')) if registry_path.exists() else {'built_datasets': []}
+        registry = _load_dataset_registry_payload()
         built_entries = [item for item in registry.get('built_datasets', []) if isinstance(item, dict)]
 
         def _entry_output_dir(entry: dict) -> Path:

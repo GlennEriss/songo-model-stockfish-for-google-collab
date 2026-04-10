@@ -12,6 +12,78 @@ from songo_model_stockfish.ops.logging import JsonlWriter, build_console_logger,
 from songo_model_stockfish.ops.paths import ProjectPaths, build_project_paths
 
 
+def _first_non_empty(candidates: list[Any]) -> str:
+    for candidate in candidates:
+        text = str(candidate or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _resolve_firestore_sync_config(config: dict[str, Any]) -> dict[str, Any]:
+    firestore_cfg = config.get("firestore", {}) if isinstance(config.get("firestore"), dict) else {}
+    dataset_gen_cfg = config.get("dataset_generation", {}) if isinstance(config.get("dataset_generation"), dict) else {}
+    dataset_build_cfg = config.get("dataset_build", {}) if isinstance(config.get("dataset_build"), dict) else {}
+    dataset_merge_cfg = config.get("dataset_merge_final", {}) if isinstance(config.get("dataset_merge_final"), dict) else {}
+    search_spaces = [firestore_cfg, dataset_gen_cfg, dataset_build_cfg, dataset_merge_cfg]
+
+    def pick(*keys: str) -> str:
+        values: list[Any] = []
+        for space in search_spaces:
+            for key in keys:
+                values.append(space.get(key))
+        return _first_non_empty(values)
+
+    backend = pick("job_firestore_backend", "global_progress_backend", "global_target_progress_backend").lower() or "file"
+    enabled_flag = pick("job_firestore_enabled").lower()
+    enabled = backend == "firestore" or enabled_flag in {"1", "true", "yes", "on"}
+
+    strict_flag = pick("job_firestore_strict").lower()
+    strict = strict_flag in {"", "1", "true", "yes", "on"}
+    project_id = pick(
+        "job_firestore_project_id",
+        "global_progress_firestore_project_id",
+        "global_target_progress_firestore_project_id",
+    )
+    collection = pick("worker_checkpoints_firestore_collection", "job_firestore_collection") or "worker_checkpoints"
+    credentials_path = pick(
+        "job_firestore_credentials_path",
+        "global_progress_firestore_credentials_path",
+        "global_target_progress_firestore_credentials_path",
+    )
+    api_key = pick(
+        "job_firestore_api_key",
+        "global_progress_firestore_api_key",
+        "global_target_progress_firestore_api_key",
+    )
+    return {
+        "enabled": bool(enabled),
+        "strict": bool(strict),
+        "project_id": project_id,
+        "collection": collection,
+        "credentials_path": credentials_path,
+        "api_key": api_key,
+    }
+
+
+def _build_firestore_job_client(*, project_id: str, credentials_path: str, api_key: str):
+    from google.cloud import firestore
+
+    credentials = None
+    client_options = None
+    if credentials_path:
+        from google.oauth2 import service_account
+
+        credentials = service_account.Credentials.from_service_account_file(credentials_path)
+    elif api_key:
+        from google.auth.credentials import AnonymousCredentials
+        from google.api_core.client_options import ClientOptions
+
+        credentials = AnonymousCredentials()
+        client_options = ClientOptions(api_key=api_key)
+    return firestore.Client(project=(project_id or None), credentials=credentials, client_options=client_options)
+
+
 def make_job_id(run_type: str) -> str:
     suffix = "".join(random.choices(string.ascii_lowercase + string.digits, k=4))
     stamp = utc_now_iso().replace("-", "").replace(":", "").replace("T", "_").replace("Z", "")
@@ -56,6 +128,7 @@ class JobContext:
     metrics: JsonlWriter
     status_path: Path
     state_path: Path
+    firestore_sync: dict[str, Any]
 
     def read_status(self) -> dict[str, Any]:
         return read_json_dict(self.status_path, default={})
@@ -96,6 +169,7 @@ class JobContext:
         if extra:
             payload.update(extra)
         write_json_atomic(self.status_path, payload, ensure_ascii=True, indent=2)
+        self._write_worker_checkpoint_firestore(status_payload=payload, state_payload=None)
 
     def write_state(self, state: dict[str, Any]) -> None:
         payload = {
@@ -104,11 +178,50 @@ class JobContext:
             **state,
         }
         write_json_atomic(self.state_path, payload, ensure_ascii=True, indent=2)
+        self._write_worker_checkpoint_firestore(status_payload=None, state_payload=payload)
 
     def set_phase(self, phase: str) -> None:
         current = read_json_dict(self.status_path, default={})
         current.update({"phase": phase, "updated_at": utc_now_iso()})
         write_json_atomic(self.status_path, current, ensure_ascii=True, indent=2)
+        self._write_worker_checkpoint_firestore(status_payload=current, state_payload=None)
+
+    def _write_worker_checkpoint_firestore(
+        self,
+        *,
+        status_payload: dict[str, Any] | None,
+        state_payload: dict[str, Any] | None,
+    ) -> None:
+        sync = self.firestore_sync if isinstance(self.firestore_sync, dict) else {}
+        if not bool(sync.get("enabled", False)):
+            return
+        strict = bool(sync.get("strict", True))
+        try:
+            client = _build_firestore_job_client(
+                project_id=str(sync.get("project_id", "")).strip(),
+                credentials_path=str(sync.get("credentials_path", "")).strip(),
+                api_key=str(sync.get("api_key", "")).strip(),
+            )
+            collection = str(sync.get("collection", "worker_checkpoints")).strip() or "worker_checkpoints"
+            doc_ref = client.collection(collection).document(self.job_id)
+            current = {}
+            snap = doc_ref.get()
+            if snap.exists:
+                current = snap.to_dict() or {}
+            payload = dict(current)
+            payload["job_id"] = self.job_id
+            payload["run_type"] = self.run_type
+            payload["updated_at"] = utc_now_iso()
+            if status_payload is not None:
+                payload["status"] = dict(status_payload)
+                payload["phase"] = str(status_payload.get("phase", ""))
+            if state_payload is not None:
+                payload["state"] = dict(state_payload)
+            doc_ref.set(payload)
+        except Exception as exc:
+            self.logger.warning("firestore worker checkpoint sync failed | job_id=%s | error=%s", self.job_id, f"{type(exc).__name__}: {exc}")
+            if strict:
+                raise
 
 
 def create_job_context(config: dict[str, Any], *, override_job_id: str | None = None) -> JobContext:
@@ -153,6 +266,7 @@ def create_job_context(config: dict[str, Any], *, override_job_id: str | None = 
         metrics=metrics,
         status_path=status_path,
         state_path=state_path,
+        firestore_sync=_resolve_firestore_sync_config(config),
     )
 
     write_text_atomic(job_dir / "config.yaml", _dump_yaml_like(config), encoding="utf-8")

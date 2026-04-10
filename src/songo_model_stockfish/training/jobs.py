@@ -45,9 +45,38 @@ def _resolve_storage_path(base: Path, configured: str | None, fallback: Path) ->
     return base / path
 
 
-def _read_dataset_registry(data_root: Path) -> dict[str, Any]:
-    registry_path = data_root / "dataset_registry.json"
-    payload = read_json_dict(registry_path, default={"dataset_sources": [], "built_datasets": []})
+def _read_dataset_registry(data_root: Path, firestore_cfg: dict[str, Any] | None = None) -> dict[str, Any]:
+    cfg = firestore_cfg if isinstance(firestore_cfg, dict) else {}
+    backend = str(cfg.get("backend", "file")).strip().lower() or "file"
+    if backend == "firestore":
+        try:
+            from google.cloud import firestore
+
+            project_id = str(cfg.get("project_id", "")).strip()
+            collection = str(cfg.get("collection", "dataset_registry")).strip() or "dataset_registry"
+            document = str(cfg.get("document", "primary")).strip() or "primary"
+            credentials_path = str(cfg.get("credentials_path", "")).strip()
+            api_key = str(cfg.get("api_key", "")).strip()
+            credentials = None
+            client_options = None
+            if credentials_path:
+                from google.oauth2 import service_account
+
+                credentials = service_account.Credentials.from_service_account_file(credentials_path)
+            elif api_key:
+                from google.auth.credentials import AnonymousCredentials
+                from google.api_core.client_options import ClientOptions
+
+                credentials = AnonymousCredentials()
+                client_options = ClientOptions(api_key=api_key)
+            client = firestore.Client(project=(project_id or None), credentials=credentials, client_options=client_options)
+            snap = client.collection(collection).document(document).get()
+            payload = snap.to_dict() if snap.exists else {"dataset_sources": [], "built_datasets": []}
+        except Exception:
+            payload = {"dataset_sources": [], "built_datasets": []}
+    else:
+        registry_path = data_root / "dataset_registry.json"
+        payload = read_json_dict(registry_path, default={"dataset_sources": [], "built_datasets": []})
     if not isinstance(payload, dict):
         return {"dataset_sources": [], "built_datasets": []}
     payload.setdefault("dataset_sources", [])
@@ -55,8 +84,8 @@ def _read_dataset_registry(data_root: Path) -> dict[str, Any]:
     return payload
 
 
-def _select_largest_built_dataset(data_root: Path) -> dict[str, Any]:
-    registry = _read_dataset_registry(data_root)
+def _select_largest_built_dataset(data_root: Path, firestore_cfg: dict[str, Any] | None = None) -> dict[str, Any]:
+    registry = _read_dataset_registry(data_root, firestore_cfg=firestore_cfg)
     candidates: list[dict[str, Any]] = []
     for entry in registry.get("built_datasets", []):
         output_dir = Path(str(entry.get("output_dir", "")))
@@ -79,11 +108,11 @@ def _select_largest_built_dataset(data_root: Path) -> dict[str, Any]:
     return candidates[0]
 
 
-def _resolve_built_dataset_by_id(data_root: Path, dataset_id: str) -> dict[str, Any]:
+def _resolve_built_dataset_by_id(data_root: Path, dataset_id: str, firestore_cfg: dict[str, Any] | None = None) -> dict[str, Any]:
     requested_id = str(dataset_id).strip()
     if not requested_id:
         raise ValueError("dataset_id vide pour la resolution du built dataset.")
-    registry = _read_dataset_registry(data_root)
+    registry = _read_dataset_registry(data_root, firestore_cfg=firestore_cfg)
     for entry in registry.get("built_datasets", []):
         if str(entry.get("dataset_id", "")).strip() == requested_id:
             return entry
@@ -263,11 +292,19 @@ def _write_json(path: Path, payload: dict) -> None:
 def run_train(job: JobContext) -> dict[str, object]:
     cfg = job.config.get("train", {})
     runtime_cfg = job.config.get("runtime", {})
+    firestore_cfg = {
+        "backend": str(cfg.get("dataset_registry_backend", cfg.get("global_progress_backend", "file"))).strip().lower() or "file",
+        "project_id": str(cfg.get("dataset_registry_firestore_project_id", cfg.get("global_progress_firestore_project_id", ""))).strip(),
+        "collection": str(cfg.get("dataset_registry_firestore_collection", "dataset_registry")).strip() or "dataset_registry",
+        "document": str(cfg.get("dataset_registry_firestore_document", "primary")).strip() or "primary",
+        "credentials_path": str(cfg.get("dataset_registry_firestore_credentials_path", cfg.get("global_progress_firestore_credentials_path", ""))).strip(),
+        "api_key": str(cfg.get("dataset_registry_firestore_api_key", cfg.get("global_progress_firestore_api_key", ""))).strip(),
+    }
     dataset_selection_mode = str(cfg.get("dataset_selection_mode", "configured")).strip().lower() or "configured"
     expected_dataset_input_dim: int | None = None
     selected_dataset_feature_schema_version = ""
     if dataset_selection_mode == "largest_built":
-        selected_dataset = _select_largest_built_dataset(job.paths.data_root)
+        selected_dataset = _select_largest_built_dataset(job.paths.data_root, firestore_cfg=firestore_cfg)
         dataset_id = str(selected_dataset.get("dataset_id", "dataset_v1"))
         selected_output_dir = Path(str(selected_dataset["output_dir"]))
         dataset_path = selected_output_dir / "train.npz"
@@ -291,7 +328,7 @@ def run_train(job: JobContext) -> dict[str, object]:
         configured_dataset_path = str(cfg.get("dataset_path", "")).strip()
         configured_validation_path = str(cfg.get("validation_path", "")).strip()
         if dataset_id not in {"", "auto"} and not configured_dataset_path and not configured_validation_path:
-            selected_dataset = _resolve_built_dataset_by_id(job.paths.data_root, dataset_id)
+            selected_dataset = _resolve_built_dataset_by_id(job.paths.data_root, dataset_id, firestore_cfg=firestore_cfg)
             selected_output_dir = Path(str(selected_dataset["output_dir"]))
             dataset_path = selected_output_dir / "train.npz"
             validation_path = selected_output_dir / "validation.npz"

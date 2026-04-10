@@ -852,21 +852,107 @@ def _dataset_registry_lock_dir(job: JobContext) -> Path:
     return job.paths.data_root / "dataset_registry.lock"
 
 
+def _dataset_registry_default_payload() -> dict[str, Any]:
+    return {"dataset_sources": [], "built_datasets": []}
+
+
+def _resolve_dataset_registry_backend_config(job: JobContext) -> dict[str, Any]:
+    sections: list[dict[str, Any]] = []
+    for key in ("dataset_generation", "dataset_build", "dataset_merge_final"):
+        value = job.config.get(key, {})
+        if isinstance(value, dict):
+            sections.append(value)
+
+    def _pick(*keys: str, default: str = "") -> str:
+        for section in sections:
+            for key in keys:
+                text = str(section.get(key, "")).strip()
+                if text:
+                    return text
+        return default
+
+    backend = _pick("dataset_registry_backend", "global_progress_backend", "global_target_progress_backend", default="file").lower() or "file"
+    project_id = _pick("dataset_registry_firestore_project_id", "global_progress_firestore_project_id", "global_target_progress_firestore_project_id")
+    collection = _pick("dataset_registry_firestore_collection", default="dataset_registry") or "dataset_registry"
+    document = _pick("dataset_registry_firestore_document", default="primary") or "primary"
+    credentials_path = _pick("dataset_registry_firestore_credentials_path", "global_progress_firestore_credentials_path", "global_target_progress_firestore_credentials_path")
+    api_key = _pick("dataset_registry_firestore_api_key", "global_progress_firestore_api_key", "global_target_progress_firestore_api_key")
+    return {
+        "backend": backend,
+        "firestore_project_id": project_id,
+        "firestore_collection": collection,
+        "firestore_document": document,
+        "firestore_credentials_path": credentials_path,
+        "firestore_api_key": api_key,
+    }
+
+
+def _dataset_registry_doc_ref_from_job(job: JobContext):
+    backend = _resolve_dataset_registry_backend_config(job)
+    if str(backend.get("backend", "file")).strip().lower() != "firestore":
+        return None, backend
+    endpoint = _resolve_firestore_progress_endpoint(
+        {
+            "backend": "firestore",
+            "global_target_id": "dataset_registry",
+            "firestore_project_id": str(backend.get("firestore_project_id", "")).strip(),
+            "firestore_collection": str(backend.get("firestore_collection", "dataset_registry")).strip() or "dataset_registry",
+            "firestore_document": str(backend.get("firestore_document", "primary")).strip() or "primary",
+            "firestore_credentials_path": str(backend.get("firestore_credentials_path", "")).strip(),
+            "firestore_api_key": str(backend.get("firestore_api_key", "")).strip(),
+        }
+    )
+    if endpoint is None:
+        return None, backend
+    client, doc_ref, firestore_mod = endpoint
+    return (client, doc_ref, firestore_mod), backend
+
+
 def _read_dataset_registry(job: JobContext) -> dict[str, Any]:
-    payload = _read_json_file(_dataset_registry_path(job), {"dataset_sources": [], "built_datasets": []})
+    endpoint, _resolved_backend = _dataset_registry_doc_ref_from_job(job)
+    if endpoint is not None:
+        _client, doc_ref, _firestore_mod = endpoint
+        snap = doc_ref.get()
+        payload = snap.to_dict() if snap.exists else _dataset_registry_default_payload()
+    else:
+        payload = _read_json_file(_dataset_registry_path(job), _dataset_registry_default_payload())
     if not isinstance(payload, dict):
-        return {"dataset_sources": [], "built_datasets": []}
+        return _dataset_registry_default_payload()
     payload.setdefault("dataset_sources", [])
     payload.setdefault("built_datasets", [])
     return payload
 
 
 def _write_dataset_registry(job: JobContext, payload: dict[str, Any]) -> None:
+    endpoint, _resolved_backend = _dataset_registry_doc_ref_from_job(job)
+    if endpoint is not None:
+        _client, doc_ref, _firestore_mod = endpoint
+        doc_ref.set(dict(payload))
+        return
     path = _dataset_registry_path(job)
     write_json_atomic(path, payload, ensure_ascii=True, indent=2)
 
 
 def _mutate_dataset_registry(job: JobContext, updater: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
+    endpoint, _resolved_backend = _dataset_registry_doc_ref_from_job(job)
+    if endpoint is not None:
+        client, doc_ref, firestore_mod = endpoint
+        transaction = client.transaction()
+
+        @firestore_mod.transactional
+        def _tx(tx):
+            snap = doc_ref.get(transaction=tx)
+            registry = snap.to_dict() if snap.exists else _dataset_registry_default_payload()
+            if not isinstance(registry, dict):
+                registry = _dataset_registry_default_payload()
+            registry.setdefault("dataset_sources", [])
+            registry.setdefault("built_datasets", [])
+            updater(registry)
+            tx.set(doc_ref, registry)
+            return registry
+
+        return _tx(transaction)
+
     lock_dir = _dataset_registry_lock_dir(job)
     lock_ok = _acquire_lock_dir(lock_dir, timeout_seconds=45.0, poll_seconds=0.1)
     if not lock_ok:
