@@ -61,13 +61,31 @@ def write_jsonl_atomic(path: Path, payloads: list[dict[str, Any]], *, ensure_asc
     write_text_atomic(path, text, encoding="utf-8")
 
 
-def acquire_lock_dir(lock_dir: Path, *, timeout_seconds: float = 30.0, poll_seconds: float = 0.1) -> bool:
+def acquire_lock_dir(
+    lock_dir: Path,
+    *,
+    timeout_seconds: float = 30.0,
+    poll_seconds: float = 0.1,
+    stale_after_seconds: float = 120.0,
+) -> bool:
     deadline = time.time() + max(1.0, float(timeout_seconds))
     while time.time() < deadline:
         try:
             lock_dir.mkdir(parents=True, exist_ok=False)
             return True
         except FileExistsError:
+            # Nettoyage defensif des verrous stale (runtime tue, kernel reset, etc.).
+            try:
+                stat = lock_dir.stat()
+                age_seconds = time.time() - float(stat.st_mtime)
+                if age_seconds >= max(10.0, float(stale_after_seconds)):
+                    lock_dir.rmdir()
+                    continue
+            except FileNotFoundError:
+                continue
+            except OSError:
+                # Verrou legitime (ou non vide): on attend le prochain poll.
+                pass
             time.sleep(max(0.01, float(poll_seconds)))
     return False
 
