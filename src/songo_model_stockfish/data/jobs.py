@@ -2512,6 +2512,8 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
     teacher_level = str(teacher_cfg.get("level", "hard"))
     dataset_id = str(cfg.get("dataset_id", "dataset_v1"))
     source_dataset_id = str(cfg.get("source_dataset_id", "")).strip()
+    configured_follow_source_updates = bool(cfg.get("follow_source_updates", False))
+    source_poll_interval_seconds = max(1.0, float(cfg.get("source_poll_interval_seconds", 30.0)))
     split_cfg = cfg.get("split", {})
     train_ratio = float(split_cfg.get("train", 0.8))
     validation_ratio = float(split_cfg.get("validation", 0.1))
@@ -2529,7 +2531,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
     )
 
     job.logger.info(
-        "dataset build startup | dataset=%s | source_dataset_id=%s | configured_input_sampled_dir=%s | workers=%s | max_pending_futures=%s | include_tactical_analysis=%s | export_partial_every_n_files=%s",
+        "dataset build startup | dataset=%s | source_dataset_id=%s | configured_input_sampled_dir=%s | workers=%s | max_pending_futures=%s | include_tactical_analysis=%s | export_partial_every_n_files=%s | follow_source_updates=%s | source_poll_interval_seconds=%.1f",
         dataset_id,
         source_dataset_id or "<auto>",
         str(cfg.get("input_sampled_dir", "")),
@@ -2537,15 +2539,35 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         max_pending_futures,
         include_tactical_analysis,
         export_partial_every_n_files,
+        configured_follow_source_updates,
+        source_poll_interval_seconds,
     )
 
     dataset_dir = job.job_dir / "dataset_build"
     if source_dataset_id:
-        source_entry = _resolve_dataset_source(job, source_dataset_id)
+        source_entry = None
+        while source_entry is None:
+            try:
+                source_entry = _resolve_dataset_source(job, source_dataset_id)
+            except FileNotFoundError:
+                if not configured_follow_source_updates:
+                    raise
+                job.logger.info(
+                    "dataset build waiting for source registration | source_dataset_id=%s | poll_interval_seconds=%.1f",
+                    source_dataset_id,
+                    source_poll_interval_seconds,
+                )
+                job.write_event(
+                    "dataset_build_waiting_for_source_registration",
+                    source_dataset_id=source_dataset_id,
+                    poll_interval_seconds=source_poll_interval_seconds,
+                )
+                time.sleep(source_poll_interval_seconds)
         sampled_root = Path(str(source_entry["sampled_dir"]))
     else:
         sampled_root = _resolve_storage_path(job.paths.drive_root, cfg.get("input_sampled_dir"), dataset_dir.parent / "dataset_generation" / "sampled_positions")
         source_dataset_id = Path(sampled_root).name
+    follow_source_updates = bool(configured_follow_source_updates and source_dataset_id)
     configured_label_cache_dir = cfg.get("label_cache_dir")
     if configured_label_cache_dir:
         configured_label_cache_path = Path(str(configured_label_cache_dir))
@@ -2590,7 +2612,32 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         },
     )
 
-    sampled_files = sorted(sampled_root.rglob("*.jsonl"))
+    def _refresh_source_inventory() -> tuple[list[Path], str]:
+        source_status = "completed"
+        if source_dataset_id:
+            try:
+                source_entry_latest = _resolve_dataset_source(job, source_dataset_id)
+                source_status = str(source_entry_latest.get("source_status", "completed")).strip().lower() or "completed"
+            except FileNotFoundError:
+                source_status = "completed"
+        return sorted(sampled_root.rglob("*.jsonl")), source_status
+
+    sampled_files, latest_source_status = _refresh_source_inventory()
+    while not sampled_files and follow_source_updates and latest_source_status != "completed":
+        job.logger.info(
+            "dataset build waiting for first sampled files | source_dataset_id=%s | source_status=%s | poll_interval_seconds=%.1f",
+            source_dataset_id,
+            latest_source_status,
+            source_poll_interval_seconds,
+        )
+        job.write_event(
+            "dataset_build_waiting_for_first_sampled_files",
+            source_dataset_id=source_dataset_id,
+            source_status=latest_source_status,
+            poll_interval_seconds=source_poll_interval_seconds,
+        )
+        time.sleep(source_poll_interval_seconds)
+        sampled_files, latest_source_status = _refresh_source_inventory()
     if not sampled_files:
         raise FileNotFoundError(f"Aucun fichier sampled_positions trouve dans {sampled_root}")
 
@@ -2598,6 +2645,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
     completed_files = set(state.get("completed_files", []))
     file_sample_counts: dict[str, int] = {}
     sampled_relative_names = [str(path.relative_to(sampled_root)) for path in sampled_files]
+    known_relative_names = set(sampled_relative_names)
     contiguous_completed_prefix = 0
     for relative_name in sampled_relative_names:
         if relative_name not in completed_files:
@@ -2614,6 +2662,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
     last_logged_progress_count = -1
     build_started_monotonic = time.monotonic()
     last_partial_export_processed = 0
+    last_completed_file_name = sampled_relative_names[contiguous_completed_prefix - 1] if contiguous_completed_prefix > 0 else ""
 
     def _estimate_remaining_seconds() -> float | None:
         if processed_count <= 0:
@@ -2645,7 +2694,9 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
                 "target_labeled_samples": target_labeled_samples,
                 "include_tactical_analysis": include_tactical_analysis,
                 "contiguous_completed_prefix": contiguous_completed_prefix,
-                "last_completed_file": sampled_relative_names[processed_count - 1] if processed_count > 0 else "",
+                "follow_source_updates": follow_source_updates,
+                "source_poll_interval_seconds": source_poll_interval_seconds,
+                "last_completed_file": last_completed_file_name,
             }
         )
 
@@ -2785,6 +2836,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
             file_sample_counts[relative_name] = source_count
             processed_count += 1
             labeled_samples_total += source_count
+            last_completed_file_name = relative_name
         else:
             pending_files.append(
                 {
@@ -2825,6 +2877,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         pending_files=pending_count,
         total_files=len(sampled_files),
         labeled_samples=labeled_samples_total,
+        source_status=latest_source_status,
     )
 
     def _materialize_labeled_file(
@@ -2836,7 +2889,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         *,
         mode: str,
     ) -> None:
-        nonlocal processed_count, skipped_terminal_samples, skipped_no_legal_samples, labeled_samples_total
+        nonlocal processed_count, skipped_terminal_samples, skipped_no_legal_samples, labeled_samples_total, last_completed_file_name
         output_labeled = Path(file_item["output_labeled"])
         output_labeled.parent.mkdir(parents=True, exist_ok=True)
         with output_labeled.open("w", encoding="utf-8") as handle:
@@ -2849,6 +2902,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         file_sample_counts[str(file_item["relative_name"])] = len(file_samples)
         processed_count += 1
         labeled_samples_total += len(file_samples)
+        last_completed_file_name = str(file_item["relative_name"])
         job.logger.info(
             "dataset build file completed | %s/%s | file=%s | mode=%s | source_samples=%s | labeled_samples=%s | skipped_terminal=%s | skipped_no_legal=%s",
             file_item["file_index"],
@@ -2866,9 +2920,11 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         _write_build_state()
         _export_partial_snapshot_if_needed()
 
-    if pending_files:
+    def _process_pending_files_batch(pending_batch: list[dict[str, Any]]) -> None:
+        if not pending_batch or _target_reached():
+            return
         if num_workers <= 1:
-            for file_item in pending_files:
+            for file_item in pending_batch:
                 job.logger.info(
                     "dataset build file started | %s/%s | file=%s | mode=sequential",
                     file_item["file_index"],
@@ -2901,7 +2957,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
             job.logger.info(
                 "dataset build parallel execution | workers=%s | pending_files=%s | max_pending=%s | start_method=%s | max_tasks_per_child=%s",
                 num_workers,
-                len(pending_files),
+                len(pending_batch),
                 max_pending_futures,
                 multiprocessing_start_method,
                 effective_max_tasks_per_child,
@@ -2909,13 +2965,13 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
             job.write_event(
                 "dataset_build_parallel_execution_started",
                 workers=num_workers,
-                pending_files=len(pending_files),
+                pending_files=len(pending_batch),
                 max_pending_futures=max_pending_futures,
                 multiprocessing_start_method=multiprocessing_start_method,
                 max_tasks_per_child=effective_max_tasks_per_child,
             )
             future_map: dict[concurrent.futures.Future, dict[str, Any]] = {}
-            pending_queue = list(pending_files)
+            pending_queue = list(pending_batch)
             target_reached = False
             try:
                 mp_context = multiprocessing.get_context(multiprocessing_start_method)
@@ -3013,6 +3069,98 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
                         )
                         break
 
+    _process_pending_files_batch(pending_files)
+
+    def _discover_new_sampled_files() -> tuple[list[dict[str, Any]], int, str]:
+        nonlocal sampled_files, sampled_relative_names, processed_count, labeled_samples_total, last_completed_file_name, latest_source_status
+        new_pending_files: list[dict[str, Any]] = []
+        reused_new_files = 0
+        sampled_files, latest_source_status = _refresh_source_inventory()
+        sampled_relative_names = [str(path.relative_to(sampled_root)) for path in sampled_files]
+        for file_index, sampled_file in enumerate(sampled_files, start=1):
+            relative_name = str(sampled_file.relative_to(sampled_root))
+            if relative_name in known_relative_names:
+                continue
+            known_relative_names.add(relative_name)
+            output_labeled = labeled_root / relative_name
+            output_labeled.parent.mkdir(parents=True, exist_ok=True)
+            if output_labeled.exists():
+                source_count = _count_jsonl_lines(output_labeled)
+                job.logger.info(
+                    "dataset build file reused | %s/%s | file=%s | labeled_samples=%s | discovery=source_refresh",
+                    file_index,
+                    len(sampled_files),
+                    relative_name,
+                    source_count,
+                )
+                completed_files.add(relative_name)
+                file_sample_counts[relative_name] = source_count
+                processed_count += 1
+                labeled_samples_total += source_count
+                last_completed_file_name = relative_name
+                reused_new_files += 1
+                _log_build_progress_if_needed()
+                _write_build_state()
+                if _target_reached():
+                    break
+                continue
+            new_pending_files.append(
+                {
+                    "file_index": file_index,
+                    "relative_name": relative_name,
+                    "sampled_file": sampled_file,
+                    "output_labeled": output_labeled,
+                }
+            )
+        return new_pending_files, reused_new_files, latest_source_status
+
+    while follow_source_updates and not _target_reached():
+        new_pending_files, reused_new_files, latest_source_status = _discover_new_sampled_files()
+        if reused_new_files > 0:
+            _export_partial_snapshot_if_needed(force=True)
+        if new_pending_files:
+            job.logger.info(
+                "dataset build source refresh detected new files | dataset=%s | source_dataset_id=%s | source_status=%s | new_pending_files=%s | reused_new_files=%s | total_known_files=%s",
+                dataset_id,
+                source_dataset_id,
+                latest_source_status,
+                len(new_pending_files),
+                reused_new_files,
+                len(sampled_files),
+            )
+            job.write_event(
+                "dataset_build_source_refreshed",
+                dataset_id=dataset_id,
+                source_dataset_id=source_dataset_id,
+                source_status=latest_source_status,
+                new_pending_files=len(new_pending_files),
+                reused_new_files=reused_new_files,
+                total_known_files=len(sampled_files),
+            )
+            _process_pending_files_batch(new_pending_files)
+            continue
+        if latest_source_status == "completed":
+            break
+        job.logger.info(
+            "dataset build waiting for source updates | dataset=%s | source_dataset_id=%s | source_status=%s | processed_files=%s | known_files=%s | poll_interval_seconds=%.1f",
+            dataset_id,
+            source_dataset_id,
+            latest_source_status,
+            processed_count,
+            len(sampled_files),
+            source_poll_interval_seconds,
+        )
+        job.write_event(
+            "dataset_build_waiting_for_source_updates",
+            dataset_id=dataset_id,
+            source_dataset_id=source_dataset_id,
+            source_status=latest_source_status,
+            processed_files=processed_count,
+            known_files=len(sampled_files),
+            poll_interval_seconds=source_poll_interval_seconds,
+        )
+        time.sleep(source_poll_interval_seconds)
+
     split_summary, exported_input_dim = _export_built_dataset_snapshot(
         job=job,
         dataset_id=dataset_id,
@@ -3046,7 +3194,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         "labeled_samples": labeled_samples_total,
         "target_labeled_samples": target_labeled_samples,
         "input_dim": exported_input_dim,
-        "feature_schema_version": "policy_value_tactical_v2",
+        "feature_schema_version": "policy_value_tactical_v3",
         "skipped_terminal_samples": skipped_terminal_samples,
         "skipped_no_legal_samples": skipped_no_legal_samples,
     }

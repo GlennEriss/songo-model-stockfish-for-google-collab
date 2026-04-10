@@ -23,6 +23,8 @@ dataset_build:
   output_dir: data/datasets/dataset_v2_full_matrix_colab_pro_insane_1m
   label_cache_dir: data/label_cache/dataset_v2_full_matrix_colab_pro_insane_1m
   target_labeled_samples: 1000000
+  follow_source_updates: true
+  source_poll_interval_seconds: 20
   num_workers: 16
   max_pending_futures: 32
   export_partial_every_n_files: 100
