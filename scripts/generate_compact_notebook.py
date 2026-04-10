@@ -477,7 +477,24 @@ cells = [
     code(
         """
         # Optionnel: suivi live du log dataset-build. Interrompre la cellule quand tu veux.
-        !bash -lc "tail -f /content/drive/MyDrive/songo-stockfish/logs/pipeline/${DATASET_BUILD_JOB_ID}.log"
+        import json
+        from pathlib import Path
+
+        logs_dir = Path(DRIVE_ROOT) / 'logs' / 'pipeline'
+        manifest_path = logs_dir / 'latest_dataset_pipeline.json'
+        fallback_path = logs_dir / f'{DATASET_BUILD_JOB_ID}.log'
+
+        if manifest_path.exists():
+            manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+            log_path = Path(str(manifest.get('build_log_path', fallback_path)))
+        else:
+            log_path = fallback_path
+
+        print('tailing:', log_path)
+        if not log_path.exists():
+            print('log introuvable:', log_path)
+        else:
+            !tail -f {log_path}
         """
     ),
     md("## 6. Lister les datasets"),
