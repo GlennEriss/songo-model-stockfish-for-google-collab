@@ -191,10 +191,15 @@ def _firestore_error_hint(*, exc: Exception | None, diagnostics: dict[str, Any])
     if exc is not None:
         exc_text = f"{type(exc).__name__}: {exc}".lower()
     auth_mode = str(diagnostics.get("auth_mode", "")).strip().lower()
+    if auth_mode == "api_key_anonymous":
+        return (
+            "Firestore Python ne supporte pas API key seule; configure "
+            "`global_progress_firestore_credentials_path`."
+        )
     if auth_mode == "adc" and ("metadata.google.internal" in exc_text or "compute engine metadata" in exc_text):
         return (
-            "Auth ADC indisponible dans ce runtime; configure `global_progress_firestore_api_key` "
-            "ou `global_progress_firestore_credentials_path`."
+            "Auth ADC indisponible dans ce runtime; configure "
+            "`global_progress_firestore_credentials_path`."
         )
     if "permissiondenied" in exc_text or "permission denied" in exc_text:
         return "Acces refuse par les regles Firestore (verifie Rules et role du compte)."
@@ -258,7 +263,6 @@ def _build_firestore_progress_endpoint(
 
     credentials = None
     client_options = None
-    use_api_key_mode = False
     if credentials_path:
         if not Path(credentials_path).exists():
             raise FileNotFoundError(f"Fichier credentials Firestore introuvable: {credentials_path}")
@@ -269,18 +273,12 @@ def _build_firestore_progress_endpoint(
         except Exception as exc:
             raise RuntimeError(f"Chargement credentials Firestore impossible: {credentials_path}") from exc
     elif api_key:
-        try:
-            from google.api_core.client_options import ClientOptions
-
-            client_options = ClientOptions(api_key=api_key)
-            use_api_key_mode = True
-        except Exception as exc:
-            raise RuntimeError("Initialisation Firestore en mode API key impossible.") from exc
+        raise RuntimeError(
+            "Mode API key non supporte avec google-cloud-firestore; "
+            "configure `global_progress_firestore_credentials_path`."
+        )
     try:
-        if use_api_key_mode:
-            client = firestore.Client(project=(project_id or None), client_options=client_options)
-        else:
-            client = firestore.Client(project=(project_id or None), credentials=credentials, client_options=client_options)
+        client = firestore.Client(project=(project_id or None), credentials=credentials, client_options=client_options)
     except Exception as exc:
         raise RuntimeError("Creation client Firestore impossible.") from exc
     doc_ref = client.collection(collection).document(document)

@@ -146,8 +146,8 @@ cells = [
         FIRESTORE_PROJECT_ID = 'songo-model-ai'
         FIRESTORE_COLLECTION = 'global_generation_progress'
         FIRESTORE_DOCUMENT = GLOBAL_TARGET_ID
-        FIRESTORE_CREDENTIALS_PATH = ''  # Optionnel: chemin JSON service account
-        FIRESTORE_API_KEY = 'AIzaSyA0I4zJMpBElpwyae0tLlNpnMG0fnF07ys'
+        FIRESTORE_CREDENTIALS_PATH = ''  # Chemin JSON service account (requis pour Python Firestore)
+        FIRESTORE_API_KEY = ''  # Non supporte par google-cloud-firestore (serveur)
         FIRESTORE_DATASET_REGISTRY_COLLECTION = 'dataset_registry'
         FIRESTORE_DATASET_REGISTRY_DOCUMENT = 'primary'
         FIRESTORE_WORKER_LEASES_COLLECTION = 'worker_leases'
@@ -336,8 +336,10 @@ cells = [
         def _firestore_monitor_error_hint(exc: Exception, debug_context: dict) -> str:
             text = f'{type(exc).__name__}: {exc}'.lower()
             auth_mode = str(debug_context.get('auth_mode', '')).strip().lower()
+            if auth_mode == 'api_key_anonymous':
+                return 'Firestore Python ne supporte pas API key seule; configure FIRESTORE_CREDENTIALS_PATH (service account JSON).'
             if auth_mode == 'adc' and ('metadata.google.internal' in text or 'compute engine metadata' in text):
-                return 'ADC indisponible ici; renseigne FIRESTORE_API_KEY ou FIRESTORE_CREDENTIALS_PATH.'
+                return 'ADC indisponible ici; configure FIRESTORE_CREDENTIALS_PATH (service account JSON).'
             if 'permissiondenied' in text or 'permission denied' in text:
                 return 'Acces refuse par les regles Firestore.'
             if 'unauthenticated' in text or 'invalid authentication credentials' in text:
@@ -374,9 +376,9 @@ cells = [
                         creds = service_account.Credentials.from_service_account_file(credentials_path)
                         client = firestore.Client(project=(project_id or None), credentials=creds)
                     elif str(FIRESTORE_API_KEY).strip():
-                        client = firestore.Client(
-                            project=(project_id or None),
-                            client_options=ClientOptions(api_key=str(FIRESTORE_API_KEY).strip()),
+                        raise RuntimeError(
+                            'Mode API key non supporte avec google-cloud-firestore; '
+                            'renseigne FIRESTORE_CREDENTIALS_PATH.'
                         )
                     else:
                         client = firestore.Client(project=(project_id or None))
@@ -406,9 +408,9 @@ cells = [
                 creds = service_account.Credentials.from_service_account_file(credentials_path)
                 return firestore.Client(project=(project_id or None), credentials=creds)
             if str(FIRESTORE_API_KEY).strip():
-                return firestore.Client(
-                    project=(project_id or None),
-                    client_options=ClientOptions(api_key=str(FIRESTORE_API_KEY).strip()),
+                raise RuntimeError(
+                    'Mode API key non supporte avec google-cloud-firestore; '
+                    'renseigne FIRESTORE_CREDENTIALS_PATH.'
                 )
             return firestore.Client(project=(project_id or None))
 
