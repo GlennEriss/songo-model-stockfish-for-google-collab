@@ -365,6 +365,107 @@ cells = [
         print('  manifest             =', latest_path)
         """
     ),
+    md("## 5bis. Suivre le pipeline dataset"),
+    code(
+        """
+        import json
+        import os
+        import subprocess
+        from pathlib import Path
+
+        logs_dir = Path(DRIVE_ROOT) / 'logs' / 'pipeline'
+        manifest_path = logs_dir / 'latest_dataset_pipeline.json'
+
+        if not manifest_path.exists():
+            print('Manifest introuvable:', manifest_path)
+        else:
+            manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+            generate_pid = int(manifest.get('generate_pid', 0) or 0)
+            build_pid = int(manifest.get('build_pid', 0) or 0)
+            print('Manifest:')
+            print(json.dumps(manifest, indent=2, ensure_ascii=True))
+
+            for label, pid in [('dataset-generate', generate_pid), ('dataset-build', build_pid)]:
+                if pid <= 0:
+                    print(f'\\n{label}: pid absent')
+                    continue
+                proc = subprocess.run(
+                    ['ps', '-p', str(pid), '-o', 'pid=,ppid=,etime=,state=,command='],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                output = proc.stdout.strip()
+                print(f'\\n{label}:')
+                print(output if output else 'processus non trouve')
+        """
+    ),
+    code(
+        """
+        import json
+        from pathlib import Path
+
+        registry_path = Path(DRIVE_ROOT) / 'data' / 'dataset_registry.json'
+        if not registry_path.exists():
+            print('dataset_registry.json introuvable:', registry_path)
+        else:
+            registry = json.loads(registry_path.read_text(encoding='utf-8'))
+            source = next((item for item in registry.get('dataset_sources', []) if item.get('dataset_source_id') == DATASET_SOURCE_ID), None)
+            built = next((item for item in registry.get('built_datasets', []) if item.get('dataset_id') == DATASET_BUILD_ID), None)
+
+            print('Source courante:')
+            if source is None:
+                print('- aucune entree source pour', DATASET_SOURCE_ID)
+            else:
+                print('  dataset_source_id =', source.get('dataset_source_id'))
+                print('  source_mode       =', source.get('source_mode'))
+                print('  source_status     =', source.get('source_status'))
+                print('  sampled_positions =', source.get('sampled_positions'))
+                print('  sampled_files     =', source.get('sampled_files'))
+                print('  updated_at        =', source.get('updated_at'))
+
+            print('\\nDataset final courant:')
+            if built is None:
+                print('- aucune entree built pour', DATASET_BUILD_ID)
+            else:
+                print('  dataset_id        =', built.get('dataset_id'))
+                print('  build_status      =', built.get('build_status'))
+                print('  labeled_samples   =', built.get('labeled_samples'))
+                print('  target_samples    =', built.get('target_labeled_samples'))
+                print('  output_dir        =', built.get('output_dir'))
+                print('  updated_at        =', built.get('updated_at'))
+        """
+    ),
+    code(
+        """
+        import json
+        from pathlib import Path
+
+        LOG_TAIL_LINES = 40
+        logs_dir = Path(DRIVE_ROOT) / 'logs' / 'pipeline'
+        manifest_path = logs_dir / 'latest_dataset_pipeline.json'
+
+        if not manifest_path.exists():
+            print('Manifest introuvable:', manifest_path)
+        else:
+            manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+            for label, key in [('dataset-generate', 'generate_log_path'), ('dataset-build', 'build_log_path')]:
+                log_path = Path(str(manifest.get(key, '')))
+                print(f'\\n===== {label} | {log_path} =====')
+                if not log_path.exists():
+                    print('log introuvable')
+                    continue
+                lines = log_path.read_text(encoding='utf-8', errors='replace').splitlines()
+                for line in lines[-LOG_TAIL_LINES:]:
+                    print(line)
+        """
+    ),
+    code(
+        """
+        # Optionnel: suivi live du log dataset-build. Interrompre la cellule quand tu veux.
+        !bash -lc "tail -f /content/drive/MyDrive/songo-stockfish/logs/pipeline/${DATASET_BUILD_JOB_ID}.log"
+        """
+    ),
     md("## 6. Lister les datasets"),
     code(
         """
