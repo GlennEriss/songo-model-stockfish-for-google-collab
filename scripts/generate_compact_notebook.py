@@ -117,6 +117,7 @@ cells = [
         AUTO_ASSIGN_WORKER_INDEX = True
         AUTO_REUSE_CHECKPOINT_WORKER_TAG = True
         CHECKPOINT_STALE_MINUTES = 20  # Reprise auto d'un worker stoppe apres inactivite
+        ACTIVE_WORKER_GUARD_MINUTES = 10  # N'assigne pas un tag deja actif dans cette fenetre
         TARGET_SAMPLES = 20000000
         TARGET_LABELED_SAMPLES = 20000000
         BENCHMATCH_GAMES = 400
@@ -258,12 +259,51 @@ cells = [
             except Exception:
                 return 0.0
 
+        def _active_worker_tags_from_global_progress(
+            *,
+            drive_root: str,
+            global_target_id: str,
+            base_source_id: str,
+            active_minutes: float,
+        ) -> set[str]:
+            progress_path = Path(drive_root) / 'data' / 'global_generation_progress' / f'{global_target_id}.json'
+            if not progress_path.exists():
+                return set()
+            try:
+                payload = json.loads(progress_path.read_text(encoding='utf-8'))
+            except Exception:
+                return set()
+            workers = payload.get('workers', {})
+            if not isinstance(workers, dict):
+                return set()
+            active_seconds = max(60.0, float(active_minutes) * 60.0)
+            now_ts = time.time()
+            tags: set[str] = set()
+            source_prefix = f'{base_source_id}_'
+            for _job_id, info in workers.items():
+                if not isinstance(info, dict):
+                    continue
+                updated_ts = _parse_iso_to_epoch(info.get('updated_at'))
+                if updated_ts <= 0:
+                    continue
+                age_seconds = now_ts - updated_ts
+                if age_seconds > active_seconds:
+                    continue
+                source_id = str(info.get('dataset_source_id', '')).strip()
+                if not source_id.startswith(source_prefix):
+                    continue
+                tag = source_id[len(source_prefix):].strip()
+                if tag:
+                    tags.add(tag)
+            return tags
+
         def _detect_resumable_worker_tag(
             *,
             drive_root: str,
             base_source_id: str,
             base_build_id: str,
             stale_minutes: float,
+            excluded_tags: set[str] | None = None,
         ) -> str | None:
             registry_path = Path(drive_root) / 'data' / 'dataset_registry.json'
             if not registry_path.exists():
@@ -323,7 +363,10 @@ cells = [
             stale_seconds = max(60.0, float(stale_minutes) * 60.0)
             now_ts = time.time()
             eligible: list[tuple[str, dict[str, float]]] = []
+            excluded = set(excluded_tags or set())
             for tag, meta in candidates.items():
+                if tag in excluded:
+                    continue
                 updated = float(meta.get('updated', 0.0))
                 if updated <= 0:
                     continue
@@ -337,6 +380,12 @@ cells = [
             return str(eligible[0][0])
 
         RESUMED_FROM_CHECKPOINT = False
+        active_worker_tags = _active_worker_tags_from_global_progress(
+            drive_root=DRIVE_ROOT,
+            global_target_id=GLOBAL_TARGET_ID,
+            base_source_id=BASE_DATASET_SOURCE_ID,
+            active_minutes=float(ACTIVE_WORKER_GUARD_MINUTES),
+        )
 
         if not WORKER_TAG:
             if AUTO_REUSE_CHECKPOINT_WORKER_TAG:
@@ -345,6 +394,7 @@ cells = [
                     base_source_id=BASE_DATASET_SOURCE_ID,
                     base_build_id=BASE_DATASET_BUILD_ID,
                     stale_minutes=float(CHECKPOINT_STALE_MINUTES),
+                    excluded_tags=active_worker_tags,
                 )
                 if resumed:
                     WORKER_TAG = resumed
@@ -352,6 +402,13 @@ cells = [
             if not WORKER_TAG:
                 WORKER_TAG = socket.gethostname().strip().lower().replace('-', '_')
                 WORKER_TAG = re.sub(r'[^a-z0-9_]+', '_', WORKER_TAG).strip('_') or 'worker'
+                if WORKER_TAG in active_worker_tags:
+                    suffix = 1
+                    candidate = f'{WORKER_TAG}_{suffix}'
+                    while candidate in active_worker_tags:
+                        suffix += 1
+                        candidate = f'{WORKER_TAG}_{suffix}'
+                    WORKER_TAG = candidate
 
         if AUTO_ASSIGN_WORKER_INDEX and int(WORKER_COUNT) > 1 and int(WORKER_INDEX) < 0:
             WORKER_INDEX = _auto_assign_worker_index(
@@ -395,7 +452,9 @@ cells = [
         print('WORKER_INDEX            =', WORKER_INDEX)
         print('AUTO_ASSIGN_WORKER_INDEX =', AUTO_ASSIGN_WORKER_INDEX)
         print('AUTO_REUSE_CHECKPOINT_WORKER_TAG =', AUTO_REUSE_CHECKPOINT_WORKER_TAG)
+        print('ACTIVE_WORKER_GUARD_MINUTES =', ACTIVE_WORKER_GUARD_MINUTES)
         print('CHECKPOINT_STALE_MINUTES =', CHECKPOINT_STALE_MINUTES)
+        print('active_worker_tags_before_assign =', sorted(active_worker_tags))
         print('RESUMED_FROM_CHECKPOINT =', RESUMED_FROM_CHECKPOINT)
         print('PIPELINE_MANIFEST_PATH  =', PIPELINE_MANIFEST_PATH)
         print('TARGET_SAMPLES          =', TARGET_SAMPLES)
