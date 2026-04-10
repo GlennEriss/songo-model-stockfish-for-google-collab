@@ -128,6 +128,8 @@ cells = [
         ]
         BENCHMATCH_INCLUDE_ALL_REGISTERED_MODELS = True
         BENCHMATCH_MODEL_PREFIX = 'songo_policy_value_colab_pro_'
+        BENCHMATCH_MODEL_SCAN_DIR = 'models/final'
+        BENCHMATCH_MODEL_ORDER = 'newest_first'  # 'newest_first' ou 'oldest_first'
         BENCHMATCH_MODEL_IDS = []
         BENCHMATCH_EXCLUDE_MODEL_IDS = []
         BENCHMATCH_MODEL_LIMIT = 0
@@ -620,14 +622,71 @@ cells = [
         selected_model_ids = []
         seen_model_ids = set()
         skipped_unavailable_model_ids = []
-        available_registry_model_ids = set()
+        discovered_model_rows = []
+        discovered_model_map = {}
+        registry_sort_ts_by_id = {}
+        for item in model_registry.get('models', []):
+            model_id = str(item.get('model_id', '')).strip()
+            if not model_id:
+                continue
+            sort_ts = float(item.get('sort_ts', 0.0) or 0.0)
+            if sort_ts > registry_sort_ts_by_id.get(model_id, 0.0):
+                registry_sort_ts_by_id[model_id] = sort_ts
+
+        model_scan_dir = Path(DRIVE_ROOT) / str(BENCHMATCH_MODEL_SCAN_DIR).strip()
+        if model_scan_dir.exists():
+            for ckpt_path in model_scan_dir.glob('*.pt'):
+                model_id = ckpt_path.stem.strip()
+                if not model_id:
+                    continue
+                if BENCHMATCH_MODEL_PREFIX and not model_id.startswith(BENCHMATCH_MODEL_PREFIX):
+                    continue
+                if model_id in BENCHMATCH_EXCLUDE_MODEL_IDS:
+                    continue
+                sort_ts = float(registry_sort_ts_by_id.get(model_id, float(ckpt_path.stat().st_mtime)))
+                existing = discovered_model_map.get(model_id)
+                if existing is None or sort_ts >= float(existing.get('sort_ts', 0.0)):
+                    row = {
+                        'model_id': model_id,
+                        'checkpoint_path': str(ckpt_path),
+                        'sort_ts': sort_ts,
+                        'source': 'filesystem',
+                    }
+                    discovered_model_map[model_id] = row
+
+        # Fallback: si le dossier scanne est vide/incomplet, on complete avec le registre (checkpoint existant).
         for item in model_registry.get('models', []):
             model_id = str(item.get('model_id', '')).strip()
             checkpoint_value = str(item.get('checkpoint_path', '')).strip()
             if not model_id or not checkpoint_value:
                 continue
-            if Path(checkpoint_value).exists():
-                available_registry_model_ids.add(model_id)
+            if BENCHMATCH_MODEL_PREFIX and not model_id.startswith(BENCHMATCH_MODEL_PREFIX):
+                continue
+            if model_id in BENCHMATCH_EXCLUDE_MODEL_IDS:
+                continue
+            checkpoint_path = Path(checkpoint_value)
+            if not checkpoint_path.exists():
+                continue
+            sort_ts = float(item.get('sort_ts', checkpoint_path.stat().st_mtime) or checkpoint_path.stat().st_mtime)
+            existing = discovered_model_map.get(model_id)
+            if existing is None or sort_ts >= float(existing.get('sort_ts', 0.0)):
+                row = {
+                    'model_id': model_id,
+                    'checkpoint_path': str(checkpoint_path),
+                    'sort_ts': sort_ts,
+                    'source': 'registry',
+                }
+                discovered_model_map[model_id] = row
+
+        discovered_model_rows = list(discovered_model_map.values())
+        order_value = str(BENCHMATCH_MODEL_ORDER).strip().lower()
+        newest_first = order_value != 'oldest_first'
+        discovered_model_rows = sorted(
+            discovered_model_rows,
+            key=lambda item: (float(item.get('sort_ts', 0.0)), str(item.get('model_id', ''))),
+            reverse=newest_first,
+        )
+        available_discovered_model_ids = {str(item.get('model_id', '')).strip() for item in discovered_model_rows if str(item.get('model_id', '')).strip()}
 
         def _maybe_add_model(model_id: str):
             model_id = str(model_id).strip()
@@ -637,15 +696,15 @@ cells = [
                 return
             if model_id in BENCHMATCH_EXCLUDE_MODEL_IDS or model_id in seen_model_ids:
                 return
-            if model_id not in available_registry_model_ids:
+            if model_id not in available_discovered_model_ids:
                 skipped_unavailable_model_ids.append(model_id)
                 return
             seen_model_ids.add(model_id)
             selected_model_ids.append(model_id)
 
         if BENCHMATCH_INCLUDE_ALL_REGISTERED_MODELS:
-            discovered = sorted(available_registry_model_ids, key=_version_sort_key)
-            for model_id in discovered:
+            discovered_ids = [str(item.get('model_id', '')).strip() for item in discovered_model_rows]
+            for model_id in discovered_ids:
                 _maybe_add_model(model_id)
 
         for model_id in BENCHMATCH_MODEL_IDS:
@@ -775,6 +834,9 @@ cells = [
         print('BENCHMARK_CONFIG_ACTIVE        =', BENCHMARK_CONFIG_ACTIVE)
         print('output_raw_dir                 =', output_raw_dir)
         print('output_sampled_dir             =', output_sampled_dir)
+        print('model_scan_dir                 =', model_scan_dir)
+        print('model_order                    =', 'newest_first' if newest_first else 'oldest_first')
+        print('discovered_model_ids           =', [str(item.get('model_id', '')) for item in discovered_model_rows])
         print('selected_model_ids             =', selected_model_ids)
         print('skipped_missing_model_ids      =', skipped_unavailable_model_ids)
         print('total_agents                   =', len(bench_agents))
