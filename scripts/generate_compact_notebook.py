@@ -108,8 +108,10 @@ cells = [
         EVALUATION_CONFIG = 'config/evaluation.full_matrix.colab_pro.yaml'
         BENCHMARK_CONFIG = 'config/benchmark.colab_pro.yaml'
 
-        DATASET_SOURCE_ID = 'sampled_full_matrix_colab_pro_bench_models_20m'
-        DATASET_BUILD_ID = 'dataset_v5_full_matrix_colab_pro_insane_20m'
+        BASE_DATASET_SOURCE_ID = 'sampled_full_matrix_colab_pro_bench_models_20m'
+        BASE_DATASET_BUILD_ID = 'dataset_v5_full_matrix_colab_pro_insane_20m'
+        MULTI_COLAB_SAFE_MODE = True
+        WORKER_TAG = ''  # Laisse vide pour auto, ou fixe manuellement: 'w1', 'w2', etc.
         TARGET_SAMPLES = 20000000
         TARGET_LABELED_SAMPLES = 20000000
         BENCHMATCH_GAMES = 400
@@ -164,6 +166,25 @@ cells = [
         EVALUATION_JOB_ID = 'eval_colab_pro_compact_001'
         BENCHMARK_JOB_ID = 'benchmark_colab_pro_compact_001'
 
+        import re
+        import socket
+        if not WORKER_TAG:
+            WORKER_TAG = socket.gethostname().strip().lower().replace('-', '_')
+            WORKER_TAG = re.sub(r'[^a-z0-9_]+', '_', WORKER_TAG).strip('_') or 'worker'
+
+        if MULTI_COLAB_SAFE_MODE:
+            DATASET_SOURCE_ID = f'{BASE_DATASET_SOURCE_ID}_{WORKER_TAG}'
+            DATASET_BUILD_ID = f'{BASE_DATASET_BUILD_ID}_{WORKER_TAG}'
+            TRAIN_CONTINUE_JOB_ID = f'{TRAIN_CONTINUE_JOB_ID}_{WORKER_TAG}'
+            TRAIN_SCRATCH_JOB_ID = f'{TRAIN_SCRATCH_JOB_ID}_{WORKER_TAG}'
+            EVALUATION_JOB_ID = f'{EVALUATION_JOB_ID}_{WORKER_TAG}'
+            BENCHMARK_JOB_ID = f'{BENCHMARK_JOB_ID}_{WORKER_TAG}'
+        else:
+            DATASET_SOURCE_ID = BASE_DATASET_SOURCE_ID
+            DATASET_BUILD_ID = BASE_DATASET_BUILD_ID
+
+        PIPELINE_MANIFEST_PATH = f'logs/pipeline/latest_dataset_pipeline_{WORKER_TAG}.json'
+
         def _auto_dataset_generate_job_id(dataset_source_id: str, target_samples: int) -> str:
             safe_source = dataset_source_id.replace('-', '_')
             return f'dataset_benchmatch_{safe_source}_{target_samples}_001'
@@ -177,6 +198,9 @@ cells = [
 
         print('DATASET_SOURCE_ID       =', DATASET_SOURCE_ID)
         print('DATASET_BUILD_ID        =', DATASET_BUILD_ID)
+        print('MULTI_COLAB_SAFE_MODE   =', MULTI_COLAB_SAFE_MODE)
+        print('WORKER_TAG              =', WORKER_TAG)
+        print('PIPELINE_MANIFEST_PATH  =', PIPELINE_MANIFEST_PATH)
         print('TARGET_SAMPLES          =', TARGET_SAMPLES)
         print('TARGET_LABELED_SAMPLES  =', TARGET_LABELED_SAMPLES)
         print('AUTO_TUNE_RESOURCES     =', AUTO_TUNE_RESOURCES)
@@ -583,7 +607,8 @@ cells = [
             'generate_log_path': str(generate_log_path),
             'build_log_path': str(build_log_path),
         }
-        latest_path = logs_dir / 'latest_dataset_pipeline.json'
+        latest_path = Path(DRIVE_ROOT) / PIPELINE_MANIFEST_PATH
+        latest_path.parent.mkdir(parents=True, exist_ok=True)
         latest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=True), encoding='utf-8')
 
         print('Pipeline lance en parallele')
@@ -603,7 +628,7 @@ cells = [
         from pathlib import Path
 
         logs_dir = Path(DRIVE_ROOT) / 'logs' / 'pipeline'
-        manifest_path = logs_dir / 'latest_dataset_pipeline.json'
+        manifest_path = Path(DRIVE_ROOT) / PIPELINE_MANIFEST_PATH
 
         if not manifest_path.exists():
             print('Manifest introuvable:', manifest_path)
@@ -755,7 +780,7 @@ cells = [
 
         LOG_TAIL_LINES = 40
         logs_dir = Path(DRIVE_ROOT) / 'logs' / 'pipeline'
-        manifest_path = logs_dir / 'latest_dataset_pipeline.json'
+        manifest_path = Path(DRIVE_ROOT) / PIPELINE_MANIFEST_PATH
 
         if not manifest_path.exists():
             print('Manifest introuvable:', manifest_path)
@@ -779,7 +804,7 @@ cells = [
         from pathlib import Path
 
         logs_dir = Path(DRIVE_ROOT) / 'logs' / 'pipeline'
-        manifest_path = logs_dir / 'latest_dataset_pipeline.json'
+        manifest_path = Path(DRIVE_ROOT) / PIPELINE_MANIFEST_PATH
         fallback_path = logs_dir / f'{DATASET_BUILD_JOB_ID}.log'
 
         if manifest_path.exists():
