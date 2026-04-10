@@ -1,20 +1,22 @@
 from __future__ import annotations
 
 import concurrent.futures
+import functools
 import hashlib
 import json
 import multiprocessing
 import shutil
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
 from songo_model_stockfish.adapters import songo_ai_game
 from songo_model_stockfish.ops.job import JobContext
 from songo_model_stockfish.ops.logging import utc_now_iso
-from songo_model_stockfish.training.features import encode_model_features
+from songo_model_stockfish.ops.model_registry import latest_model_record, load_registry, promoted_best_metadata
+from songo_model_stockfish.training.features import build_runtime_tactical_analysis, encode_model_features
 
 
 def _slugify_matchup(matchup_spec: str) -> str:
@@ -254,6 +256,9 @@ def _register_dataset_source(
     dataset_version: str | None = None,
     source_status: str = "completed",
     partial_summary: dict[str, Any] | None = None,
+    raw_files_override: int | None = None,
+    sampled_files_override: int | None = None,
+    sampled_positions_override: int | None = None,
 ) -> dict[str, Any]:
     resolved_source_dataset_ids = source_dataset_ids or ([source_dataset_id] if source_dataset_id else [])
     payload = {
@@ -265,9 +270,9 @@ def _register_dataset_source(
         "games_per_matchup": games_per_matchup,
         "sample_every_n_plies": sample_every_n_plies,
         "matchups": matchups,
-        "raw_files": _count_json_files(raw_dir),
-        "sampled_files": _count_jsonl_files(sampled_dir),
-        "sampled_positions": _count_total_jsonl_lines(sampled_dir) if sampled_dir.exists() else 0,
+        "raw_files": int(raw_files_override) if raw_files_override is not None else _count_json_files(raw_dir),
+        "sampled_files": int(sampled_files_override) if sampled_files_override is not None else _count_jsonl_files(sampled_dir),
+        "sampled_positions": int(sampled_positions_override) if sampled_positions_override is not None else (_count_total_jsonl_lines(sampled_dir) if sampled_dir.exists() else 0),
         "source_dataset_id": source_dataset_id,
         "source_dataset_ids": resolved_source_dataset_ids,
         "derivation_strategy": derivation_strategy,
@@ -308,7 +313,7 @@ def _register_built_dataset(
     parent_dataset_ids: list[str] | None = None,
     dataset_version: str | None = None,
     build_status: str = "completed",
-    feature_schema_version: str = "policy_value_tactical_v2",
+    feature_schema_version: str = "policy_value_tactical_v3",
     input_dim: int | None = None,
 ) -> dict[str, Any]:
     resolved_source_dataset_ids = source_dataset_ids or ([source_dataset_id] if source_dataset_id else [])
@@ -332,6 +337,7 @@ def _register_built_dataset(
         "has_policy_target_full": True,
         "has_tactical_features": True,
         "has_tactical_move_masks": True,
+        "has_strategy_features": True,
         "dataset_version": dataset_version or utc_now_iso(),
         "updated_at": utc_now_iso(),
     }
@@ -381,6 +387,7 @@ def _write_dataset_generation_progress_snapshot(
 ) -> dict[str, Any]:
     added_games = sum(int(item.get("games_added", 0)) for item in summaries)
     added_samples = sum(int(item.get("samples_added", 0)) for item in summaries)
+    total_game_files = sum(int(item.get("existing_games", 0)) + int(item.get("games_added", 0)) for item in summaries)
     metadata = _register_dataset_source(
         job,
         dataset_source_id=dataset_source_id,
@@ -409,6 +416,66 @@ def _write_dataset_generation_progress_snapshot(
         "source_mode": source_mode,
         "matchups": summaries,
         "existing_samples": max(0, int(total_samples) - int(added_samples)),
+        "added_games": added_games,
+        "added_samples": added_samples,
+        "total_samples": int(metadata["sampled_positions"]),
+        "target_samples": target_samples,
+    }
+    _write_json(dataset_dir / "dataset_generation_summary.json", summary)
+    return summary
+
+
+def _write_benchmatch_progress_snapshot(
+    *,
+    job: JobContext,
+    dataset_dir: Path,
+    dataset_source_id: str,
+    raw_dir: Path,
+    sampled_dir: Path,
+    target_samples: int,
+    games_per_matchup: int,
+    sample_every_n_plies: int,
+    matchups: list[str],
+    source_dataset_id: str,
+    source_dataset_ids: list[str] | None,
+    derivation_strategy: str,
+    derivation_params: dict[str, Any],
+    summaries: list[dict[str, Any]],
+    total_samples: int,
+) -> dict[str, Any]:
+    added_games = sum(int(item.get("games_added", 0)) for item in summaries)
+    added_samples = sum(int(item.get("samples_added", 0)) for item in summaries)
+    metadata = _register_dataset_source(
+        job,
+        dataset_source_id=dataset_source_id,
+        source_mode="benchmatch",
+        raw_dir=raw_dir,
+        sampled_dir=sampled_dir,
+        target_samples=target_samples,
+        games_per_matchup=games_per_matchup,
+        sample_every_n_plies=sample_every_n_plies,
+        matchups=matchups,
+        source_dataset_id=source_dataset_id,
+        source_dataset_ids=source_dataset_ids,
+        derivation_strategy=derivation_strategy,
+        derivation_params=derivation_params,
+        source_status="partial",
+        partial_summary={
+            "completed_matchups": len(summaries),
+            "added_games": added_games,
+            "added_samples": added_samples,
+            "total_samples": int(total_samples),
+        },
+        raw_files_override=total_game_files,
+        sampled_files_override=total_game_files,
+        sampled_positions_override=int(total_samples),
+    )
+    summary = {
+        "job_id": job.job_id,
+        "dataset_source_id": dataset_source_id,
+        "source_mode": "benchmatch",
+        "matchups": summaries,
+        "existing_samples": max(0, int(total_samples) - added_samples),
         "added_games": added_games,
         "added_samples": added_samples,
         "total_samples": int(metadata["sampled_positions"]),
@@ -1154,15 +1221,56 @@ def _build_pending_incremental_games(
     return pending
 
 
-def _build_external_agent(spec: str):
+def _resolve_model_checkpoint_for_generation(model_spec: str, *, models_root: Path) -> tuple[str, Path]:
+    requested = str(model_spec).strip()
+    if requested in {"auto", "auto_latest"}:
+        latest = latest_model_record(models_root)
+        if not latest:
+            raise FileNotFoundError("Aucun modele disponible dans le registre pour dataset-generate model:auto_latest.")
+        model_id = str(latest.get("model_id", "")).strip()
+        checkpoint_path = Path(str(latest.get("checkpoint_path", "")).strip())
+    elif requested in {"auto_best", "auto_promoted_best"}:
+        metadata = promoted_best_metadata(models_root)
+        if not metadata:
+            raise FileNotFoundError("Aucun modele promu disponible pour dataset-generate model:auto_best.")
+        model_id = str(metadata.get("model_id", "promoted_best")).strip()
+        checkpoint_path = models_root / "promoted" / "best" / "model.pt"
+    else:
+        registry = load_registry(models_root)
+        record = next((item for item in registry.get("models", []) if str(item.get("model_id", "")).strip() == requested), None)
+        if not record:
+            raise FileNotFoundError(f"Modele introuvable dans le registre pour dataset-generate: {requested}")
+        model_id = str(record.get("model_id", requested)).strip()
+        checkpoint_path = Path(str(record.get("checkpoint_path", "")).strip())
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint introuvable pour dataset-generate model:{requested}: {checkpoint_path}")
+    return model_id, checkpoint_path
+
+
+@functools.lru_cache(maxsize=None)
+def _build_external_agent_cached(spec: str, models_root_str: str, device: str):
     from songo_model_stockfish.reference_songo.agents import MCTSAgent, MinimaxAgent
+    from songo_model_stockfish.benchmark.model_agent import ModelAgent
 
     kind, level = spec.split(":", 1)
     if kind == "minimax":
         return MinimaxAgent(level)
     if kind == "mcts":
         return MCTSAgent(level)
+    if kind == "model":
+        model_id, checkpoint_path = _resolve_model_checkpoint_for_generation(level, models_root=Path(models_root_str))
+        return ModelAgent(str(checkpoint_path), display_name=model_id, device=device)
     raise ValueError(f"Unsupported dataset generation agent: {spec}")
+
+
+def _build_external_agent(spec: str, *, models_root: Path | None = None, device: str = "cpu"):
+    normalized_spec = str(spec).strip()
+    if ":" not in normalized_spec:
+        raise ValueError(f"Unsupported dataset generation agent: {spec}")
+    kind, _level = normalized_spec.split(":", 1)
+    resolved_models_root = (models_root or Path(".")).resolve()
+    resolved_device = "cpu" if kind != "model" else (str(device).strip() or "cpu")
+    return _build_external_agent_cached(normalized_spec, str(resolved_models_root), resolved_device)
 
 
 def _teacher_choose(state: Any, *, engine: str, level: str) -> tuple[int, dict[str, Any]]:
@@ -1275,77 +1383,12 @@ def _build_tactical_analysis(
     *,
     best_move: int,
 ) -> dict[str, Any]:
-    root_player = int(runtime_state["current_player"])
-    opponent = 1 - root_player
-    root_scores = list(runtime_state["scores"])
-    root_player_score = int(root_scores[root_player])
-    root_opponent_score = int(root_scores[opponent])
-
-    per_move: dict[str, dict[str, Any]] = {}
-    capture_moves_count = 0
-    safe_moves_count = 0
-    risky_moves_count = 0
-    max_immediate_score_gain = 0
-    min_opponent_best_gain: int | None = None
-
-    for move in legal_moves:
-        next_state = songo_ai_game.simulate_move(runtime_state, int(move))
-        next_scores = list(next_state["scores"])
-        immediate_score_gain = int(next_scores[root_player]) - root_player_score
-        immediate_score_loss = int(next_scores[opponent]) - root_opponent_score
-        opponent_legal_moves = list(songo_ai_game.legal_moves(next_state))
-
-        opponent_best_immediate_gain = 0
-        opponent_capture_moves = 0
-        for opponent_move in opponent_legal_moves:
-            reply_state = songo_ai_game.simulate_move(next_state, int(opponent_move))
-            reply_scores = list(reply_state["scores"])
-            gain = int(reply_scores[opponent]) - int(next_scores[opponent])
-            if gain > 0:
-                opponent_capture_moves += 1
-            if gain > opponent_best_immediate_gain:
-                opponent_best_immediate_gain = gain
-
-        net_score_swing = int(immediate_score_gain) - int(opponent_best_immediate_gain)
-        has_immediate_capture = immediate_score_gain > 0
-        exposes_to_immediate_capture = opponent_best_immediate_gain > 0
-        if has_immediate_capture:
-            capture_moves_count += 1
-        if exposes_to_immediate_capture:
-            risky_moves_count += 1
-        else:
-            safe_moves_count += 1
-
-        max_immediate_score_gain = max(max_immediate_score_gain, int(immediate_score_gain))
-        if min_opponent_best_gain is None or opponent_best_immediate_gain < min_opponent_best_gain:
-            min_opponent_best_gain = int(opponent_best_immediate_gain)
-
-        per_move[str(move)] = {
-            "teacher_score": float(move_scores.get(int(move), 0.0)),
-            "immediate_score_gain": int(immediate_score_gain),
-            "immediate_score_loss": int(immediate_score_loss),
-            "has_immediate_capture": bool(has_immediate_capture),
-            "opponent_legal_moves_count": int(len(opponent_legal_moves)),
-            "opponent_capture_moves_count": int(opponent_capture_moves),
-            "opponent_best_immediate_gain": int(opponent_best_immediate_gain),
-            "exposes_to_immediate_capture": bool(exposes_to_immediate_capture),
-            "net_score_swing_next_ply": int(net_score_swing),
-        }
-
-    best_move_stats = per_move.get(str(best_move), {})
-    return {
-        "summary": {
-            "capture_moves_count": int(capture_moves_count),
-            "safe_moves_count": int(safe_moves_count),
-            "risky_moves_count": int(risky_moves_count),
-            "max_immediate_score_gain": int(max_immediate_score_gain),
-            "min_opponent_best_immediate_gain": int(min_opponent_best_gain or 0),
-            "best_move_has_immediate_capture": bool(best_move_stats.get("has_immediate_capture", False)),
-            "best_move_exposes_to_immediate_capture": bool(best_move_stats.get("exposes_to_immediate_capture", False)),
-            "best_move_net_score_swing_next_ply": int(best_move_stats.get("net_score_swing_next_ply", 0)),
-        },
-        "per_move": per_move,
-    }
+    return build_runtime_tactical_analysis(
+        runtime_state,
+        legal_moves,
+        move_scores=move_scores,
+        best_move=best_move,
+    )
 def _label_sample(
     sample: dict[str, Any],
     *,
@@ -1576,9 +1619,12 @@ def _play_and_sample_game_from_specs(
     starter: int,
     sample_every_n_plies: int,
     max_moves: int = 300,
+    models_root: str = ".",
+    model_agent_device: str = "cpu",
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    agent_a = _build_external_agent(matchup_a)
-    agent_b = _build_external_agent(matchup_b)
+    resolved_models_root = Path(models_root)
+    agent_a = _build_external_agent(matchup_a, models_root=resolved_models_root, device=model_agent_device)
+    agent_b = _build_external_agent(matchup_b, models_root=resolved_models_root, device=model_agent_device)
     return _play_and_sample_game(
         agent_a,
         agent_b,
@@ -1650,9 +1696,12 @@ def _run_pending_games_sequential(
     games: int,
     sample_every_n_plies: int,
     max_moves: int,
+    models_root: Path,
+    model_agent_device: str,
+    on_game_completed: Callable[[dict[str, Any], int, int], None] | None = None,
 ) -> tuple[int, int, str]:
-    agent_a = _build_external_agent(matchup_a)
-    agent_b = _build_external_agent(matchup_b)
+    agent_a = _build_external_agent(matchup_a, models_root=models_root, device=model_agent_device)
+    agent_b = _build_external_agent(matchup_b, models_root=models_root, device=model_agent_device)
     completed_games = 0
     completed_samples = 0
     for pending in pending_games:
@@ -1685,6 +1734,8 @@ def _run_pending_games_sequential(
         )
         completed_games += games_inc
         completed_samples += samples_inc
+        if on_game_completed is not None:
+            on_game_completed(pending, completed_games, completed_samples)
     return completed_games, completed_samples, "sequential"
 
 
@@ -1716,6 +1767,7 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
         scope="dataset generation pool configuration",
     )
     target_samples = int(cfg.get("target_samples", 0))
+    model_agent_device = str(cfg.get("model_agent_device", "cpu")).strip().lower() or "cpu"
 
     dataset_dir = job.job_dir / "dataset_generation"
     configured_output_raw_dir = cfg.get("output_raw_dir")
@@ -2161,6 +2213,55 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
             seed_base=base_seed + (matchup_index * 1_000_000),
         )
 
+        def _update_benchmatch_progress(last_completed_game_id: str) -> None:
+            _write_benchmatch_progress_snapshot(
+                job=job,
+                dataset_dir=dataset_dir,
+                dataset_source_id=dataset_source_id,
+                raw_dir=raw_dir,
+                sampled_dir=sampled_dir,
+                target_samples=target_samples,
+                games_per_matchup=games,
+                sample_every_n_plies=sample_every_n_plies,
+                matchups=[str(matchup) for matchup in matchups],
+                source_dataset_id=source_dataset_id,
+                source_dataset_ids=source_dataset_ids,
+                derivation_strategy=derivation_strategy,
+                derivation_params=derivation_params,
+                summaries=summaries + [{
+                    "matchup_id": matchup_id,
+                    "player_a": matchup_a,
+                    "player_b": matchup_b,
+                    "existing_games": existing_game_count,
+                    "games_added": matchup_game_count,
+                    "samples_added": matchup_sample_count,
+                    "sample_every_n_plies": sample_every_n_plies,
+                    "num_workers": num_workers,
+                }],
+                total_samples=total_samples_after_run,
+            )
+            job.write_state(
+                {
+                    "current_matchup": matchup_id,
+                    "completed_games": matchup_game_count,
+                    "remaining_games": games - matchup_game_count,
+                    "last_completed_game_id": last_completed_game_id,
+                    "sample_count": total_samples_after_run,
+                    "target_samples": target_samples,
+                }
+            )
+
+        def _make_sequential_progress_callback(base_games: int, base_samples: int) -> Callable[[dict[str, Any], int, int], None]:
+            def _on_sequential_game_completed(pending: dict[str, Any], completed_games_so_far: int, completed_samples_so_far: int) -> None:
+                nonlocal matchup_game_count, matchup_sample_count, total_samples_after_run
+                matchup_game_count = int(base_games) + int(completed_games_so_far)
+                matchup_sample_count = int(base_samples) + int(completed_samples_so_far)
+                total_samples_after_run = initial_total_samples + sum(int(item.get("samples_added", 0)) for item in summaries) + matchup_sample_count
+                if matchup_game_count % progress_update_every_n_games == 0:
+                    _update_benchmatch_progress(str(pending["game_id"]))
+
+            return _on_sequential_game_completed
+
         if num_workers <= 1:
             completed_games, completed_samples, _execution_mode = _run_pending_games_sequential(
                 job,
@@ -2171,20 +2272,14 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
                 games=games,
                 sample_every_n_plies=sample_every_n_plies,
                 max_moves=max_moves,
+                models_root=job.paths.models_root,
+                model_agent_device=model_agent_device,
+                on_game_completed=_make_sequential_progress_callback(0, 0),
             )
-            matchup_game_count += completed_games
-            matchup_sample_count += completed_samples
+            matchup_game_count = int(completed_games)
+            matchup_sample_count = int(completed_samples)
             if pending_games:
-                job.write_state(
-                    {
-                        "current_matchup": matchup_id,
-                        "completed_games": matchup_game_count,
-                        "remaining_games": games - matchup_game_count,
-                        "last_completed_game_id": pending_games[-1]["game_id"],
-                        "sample_count": total_samples_after_run + matchup_sample_count,
-                        "target_samples": target_samples,
-                    }
-                )
+                _update_benchmatch_progress(str(pending_games[-1]["game_id"]))
         else:
             job.logger.info(
                 "dataset matchup parallel execution | matchup=%s | workers=%s | pending_games=%s | max_pending=%s | start_method=%s | max_tasks_per_child=%s",
@@ -2235,6 +2330,8 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
                                 starter=int(pending["starter"]),
                                 sample_every_n_plies=sample_every_n_plies,
                                 max_moves=max_moves,
+                                models_root=str(job.paths.models_root),
+                                model_agent_device=model_agent_device,
                             )
                             future_map[future] = pending
 
@@ -2257,44 +2354,8 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
                             matchup_game_count += games_inc
                             matchup_sample_count += samples_inc
                             total_samples_after_run += samples_inc
-                            job.write_state(
-                                {
-                                    "current_matchup": matchup_id,
-                                    "completed_games": matchup_game_count,
-                                    "remaining_games": games - matchup_game_count,
-                                    "last_completed_game_id": pending["game_id"],
-                                    "sample_count": total_samples_after_run,
-                                    "target_samples": target_samples,
-                                }
-                            )
                             if matchup_game_count % progress_update_every_n_games == 0:
-                                _write_dataset_generation_progress_snapshot(
-                                    job=job,
-                                    dataset_dir=dataset_dir,
-                                    dataset_source_id=dataset_source_id,
-                                    source_mode=source_mode,
-                                    raw_dir=raw_dir,
-                                    sampled_dir=sampled_dir,
-                                    target_samples=target_samples,
-                                    games_per_matchup=games,
-                                    sample_every_n_plies=sample_every_n_plies,
-                                    matchups=[str(matchup) for matchup in matchups],
-                                    source_dataset_id=source_dataset_id,
-                                    source_dataset_ids=source_dataset_ids,
-                                    derivation_strategy=derivation_strategy,
-                                    derivation_params=derivation_params,
-                                    summaries=summaries + [{
-                                        "matchup_id": matchup_id,
-                                        "player_a": matchup_a,
-                                        "player_b": matchup_b,
-                                        "existing_games": existing_game_count,
-                                        "games_added": matchup_game_count,
-                                        "samples_added": matchup_sample_count,
-                                        "sample_every_n_plies": sample_every_n_plies,
-                                        "num_workers": num_workers,
-                                    }],
-                                    total_samples=total_samples_after_run,
-                                )
+                                _update_benchmatch_progress(str(pending["game_id"]))
             except concurrent.futures.process.BrokenProcessPool as exc:
                 failed_pending = list(future_map.values()) + list(pending_queue)
                 job.logger.warning(
@@ -2320,10 +2381,12 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
                     games=games,
                     sample_every_n_plies=sample_every_n_plies,
                     max_moves=max_moves,
+                    models_root=job.paths.models_root,
+                    model_agent_device=model_agent_device,
+                    on_game_completed=_make_sequential_progress_callback(matchup_game_count, matchup_sample_count),
                 )
-                matchup_game_count += completed_games
-                matchup_sample_count += completed_samples
-                total_samples_after_run += completed_samples
+                matchup_game_count = int(matchup_game_count)
+                matchup_sample_count = int(matchup_sample_count)
                 if failed_pending:
                     job.write_state(
                         {
@@ -2335,9 +2398,6 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
                             "target_samples": target_samples,
                         }
                     )
-
-        if num_workers <= 1 and pending_games:
-            total_samples_after_run += matchup_sample_count
 
         summary_payload = {
             "matchup_id": matchup_id,
@@ -2371,11 +2431,10 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
         )
         job.write_metric({"metric_type": "dataset_matchup_completed", **summary_payload})
         job.write_event("dataset_matchup_completed", matchup=matchup_id, samples=matchup_sample_count)
-        _write_dataset_generation_progress_snapshot(
+        _write_benchmatch_progress_snapshot(
             job=job,
             dataset_dir=dataset_dir,
             dataset_source_id=dataset_source_id,
-            source_mode=source_mode,
             raw_dir=raw_dir,
             sampled_dir=sampled_dir,
             target_samples=target_samples,
@@ -2419,6 +2478,9 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
         derivation_params=derivation_params,
         source_status="completed",
         partial_summary={},
+        raw_files_override=sum(int(item.get("existing_games", 0)) + int(item.get("games_added", 0)) for item in summaries),
+        sampled_files_override=sum(int(item.get("existing_games", 0)) + int(item.get("games_added", 0)) for item in summaries),
+        sampled_positions_override=initial_total_samples + added_samples,
     )
     _write_json(dataset_dir / "dataset_generation_summary.json", summary)
     job.logger.info(
