@@ -265,9 +265,17 @@ cells = [
 
         generate_cfg = yaml.safe_load((Path(WORKTREE) / DATASET_GENERATE_CONFIG).read_text(encoding='utf-8')) or {}
         generate_block = dict(generate_cfg.get('dataset_generation', {}) or {})
+        if DATASET_SOURCE_ID.startswith('sampled_'):
+            output_sampled_dir = f'data/{DATASET_SOURCE_ID}'
+            output_raw_dir = f"data/raw_{DATASET_SOURCE_ID[len('sampled_'):]}"
+        else:
+            output_sampled_dir = f'data/{DATASET_SOURCE_ID}'
+            output_raw_dir = f'data/raw_{DATASET_SOURCE_ID}'
         generate_block['source_mode'] = 'benchmatch'
         generate_block['dataset_source_id'] = DATASET_SOURCE_ID
         generate_block['target_samples'] = int(TARGET_SAMPLES)
+        generate_block['output_sampled_dir'] = output_sampled_dir
+        generate_block['output_raw_dir'] = output_raw_dir
         generate_block['games'] = int(BENCHMATCH_GAMES)
         generate_block['matchups'] = matchups
         generate_block['model_agent_device'] = str(BENCHMATCH_MODEL_AGENT_DEVICE)
@@ -293,6 +301,8 @@ cells = [
         print('TRAIN_SCRATCH_CONFIG_ACTIVE    =', TRAIN_SCRATCH_CONFIG_ACTIVE)
         print('EVALUATION_CONFIG_ACTIVE       =', EVALUATION_CONFIG_ACTIVE)
         print('BENCHMARK_CONFIG_ACTIVE        =', BENCHMARK_CONFIG_ACTIVE)
+        print('output_raw_dir                 =', output_raw_dir)
+        print('output_sampled_dir             =', output_sampled_dir)
         print('selected_model_ids             =', selected_model_ids)
         print('total_agents                   =', len(bench_agents))
         print('total_matchups                 =', len(matchups))
@@ -304,11 +314,15 @@ cells = [
         import json
         import shlex
         import subprocess
-        from datetime import datetime
+        from datetime import UTC, datetime
         from pathlib import Path
 
         logs_dir = Path(DRIVE_ROOT) / 'logs' / 'pipeline'
         logs_dir.mkdir(parents=True, exist_ok=True)
+        jobs_dir = Path(DRIVE_ROOT) / 'jobs'
+        jobs_dir.mkdir(parents=True, exist_ok=True)
+        (jobs_dir / DATASET_GENERATE_JOB_ID).mkdir(parents=True, exist_ok=True)
+        (jobs_dir / DATASET_BUILD_JOB_ID).mkdir(parents=True, exist_ok=True)
 
         generate_log_path = logs_dir / f'{DATASET_GENERATE_JOB_ID}.log'
         build_log_path = logs_dir / f'{DATASET_BUILD_JOB_ID}.log'
@@ -344,7 +358,7 @@ cells = [
         build_pid = _launch_background(build_cmd, build_log_path)
 
         manifest = {
-            'launched_at': datetime.utcnow().isoformat() + 'Z',
+            'launched_at': datetime.now(UTC).isoformat().replace('+00:00', 'Z'),
             'dataset_source_id': DATASET_SOURCE_ID,
             'dataset_id': DATASET_BUILD_ID,
             'generate_job_id': DATASET_GENERATE_JOB_ID,
