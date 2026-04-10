@@ -1482,6 +1482,44 @@ def _parse_matchup(matchup_spec: str) -> tuple[str, str]:
     return parts[0].strip(), parts[1].strip()
 
 
+def _validate_generation_agent_spec(
+    spec: str,
+    *,
+    models_root: Path,
+    cache: dict[str, tuple[bool, str]],
+) -> tuple[bool, str]:
+    normalized = str(spec).strip()
+    if not normalized:
+        return False, "agent vide"
+    cached = cache.get(normalized)
+    if cached is not None:
+        return cached
+    if ":" not in normalized:
+        result = (False, f"agent invalide (format attendu kind:level): {normalized}")
+        cache[normalized] = result
+        return result
+    kind, level = normalized.split(":", 1)
+    kind = kind.strip().lower()
+    level = str(level).strip()
+    if kind in {"minimax", "mcts"}:
+        result = (True, "")
+        cache[normalized] = result
+        return result
+    if kind == "model":
+        try:
+            _resolve_model_checkpoint_for_generation(level, models_root=models_root)
+            result = (True, "")
+            cache[normalized] = result
+            return result
+        except Exception as exc:
+            result = (False, f"{type(exc).__name__}: {exc}")
+            cache[normalized] = result
+            return result
+    result = (False, f"agent non supporte: {kind}")
+    cache[normalized] = result
+    return result
+
+
 def _sample_position(
     *,
     game_id: str,
@@ -2044,6 +2082,56 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
     if source_mode not in {"benchmatch", "clone_existing", "derive_existing", "augment_existing", "merge_existing"}:
         raise ValueError(f"Unsupported dataset generation source_mode: {source_mode}")
 
+    if source_mode == "benchmatch":
+        validation_cache: dict[str, tuple[bool, str]] = {}
+        valid_matchups: list[str] = []
+        skipped_matchups: list[dict[str, str]] = []
+        for matchup_spec in matchups:
+            matchup_text = str(matchup_spec).strip()
+            if not matchup_text:
+                continue
+            try:
+                matchup_a, matchup_b = _parse_matchup(matchup_text)
+            except Exception as exc:
+                skipped_matchups.append({"matchup": matchup_text, "reason": f"{type(exc).__name__}: {exc}"})
+                continue
+            ok_a, reason_a = _validate_generation_agent_spec(
+                matchup_a,
+                models_root=job.paths.models_root,
+                cache=validation_cache,
+            )
+            ok_b, reason_b = _validate_generation_agent_spec(
+                matchup_b,
+                models_root=job.paths.models_root,
+                cache=validation_cache,
+            )
+            if ok_a and ok_b:
+                valid_matchups.append(matchup_text)
+                continue
+            failure_reasons: list[str] = []
+            if not ok_a:
+                failure_reasons.append(f"player_a={reason_a}")
+            if not ok_b:
+                failure_reasons.append(f"player_b={reason_b}")
+            skipped_matchups.append({"matchup": matchup_text, "reason": " | ".join(failure_reasons)})
+        if skipped_matchups:
+            preview = skipped_matchups[:20]
+            job.logger.warning(
+                "dataset generation benchmatch filtered invalid matchups | kept=%s | skipped=%s | examples=%s",
+                len(valid_matchups),
+                len(skipped_matchups),
+                preview,
+            )
+            job.write_event(
+                "dataset_matchups_filtered",
+                kept=len(valid_matchups),
+                skipped=len(skipped_matchups),
+                examples=preview,
+            )
+        if not valid_matchups:
+            raise FileNotFoundError("Aucun matchup benchmatch valide (modeles manquants ou specs invalides).")
+        matchups = valid_matchups
+
     if source_mode == "clone_existing":
         if not source_dataset_id:
             raise ValueError("`source_dataset_id` est requis quand `source_mode=clone_existing`")
@@ -2409,6 +2497,7 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
 
         matchup_game_count = 0
         matchup_sample_count = 0
+        matchup_failed_game_count = 0
         global_stop_requested = False
         existing_numbers = _existing_game_numbers(raw_dir, sampled_dir, matchup_id)
         existing_game_count = len(existing_numbers)
@@ -2617,7 +2706,27 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
                         )
                         for future in done:
                             pending = future_map.pop(future)
-                            raw_payload, samples = future.result()
+                            try:
+                                raw_payload, samples = future.result()
+                            except Exception as exc:
+                                matchup_failed_game_count += 1
+                                job.logger.warning(
+                                    "dataset game failed | matchup=%s | game=%s/%s | error=%s: %s | mode=parallel",
+                                    matchup_id,
+                                    pending["game_no"],
+                                    games,
+                                    type(exc).__name__,
+                                    exc,
+                                )
+                                job.write_event(
+                                    "dataset_game_failed",
+                                    matchup=matchup_id,
+                                    game_id=pending["game_id"],
+                                    game_index=pending["game_no"],
+                                    execution_mode="parallel",
+                                    error=f"{type(exc).__name__}: {exc}",
+                                )
+                                continue
                             admitted_samples = _resolve_admitted_samples(len(samples))
                             games_inc, samples_inc = _materialize_completed_game(
                                 job,
@@ -2693,6 +2802,7 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
             "player_b": matchup_b,
             "existing_games": existing_game_count,
             "games_added": matchup_game_count,
+            "games_failed": matchup_failed_game_count,
             "samples_added": matchup_sample_count,
             "sample_every_n_plies": sample_every_n_plies,
             "num_workers": num_workers,
@@ -2700,10 +2810,11 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
         _write_json(summary_path, summary_payload)
         summaries.append(summary_payload)
         job.logger.info(
-            "dataset matchup completed | %s vs %s | games_added=%s | samples_added=%s | total_samples=%s",
+            "dataset matchup completed | %s vs %s | games_added=%s | games_failed=%s | samples_added=%s | total_samples=%s",
             matchup_a,
             matchup_b,
             matchup_game_count,
+            matchup_failed_game_count,
             matchup_sample_count,
             total_samples_after_run,
         )
@@ -2740,6 +2851,7 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
             break
 
     added_games = sum(int(item["games_added"]) for item in summaries)
+    failed_games = sum(int(item.get("games_failed", 0)) for item in summaries)
     added_samples = sum(int(item["samples_added"]) for item in summaries)
     summary = {
         "job_id": job.job_id,
@@ -2748,6 +2860,7 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
         "matchups": summaries,
         "existing_samples": initial_total_samples,
         "added_games": added_games,
+        "failed_games": failed_games,
         "added_samples": added_samples,
         "total_samples": initial_total_samples + added_samples,
         "target_samples": target_samples,
@@ -2774,9 +2887,10 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
     )
     _write_json(dataset_dir / "dataset_generation_summary.json", summary)
     job.logger.info(
-        "dataset generation completed | matchups=%s | added_games=%s | added_samples=%s | total_samples=%s | target_samples=%s",
+        "dataset generation completed | matchups=%s | added_games=%s | failed_games=%s | added_samples=%s | total_samples=%s | target_samples=%s",
         len(summaries),
         added_games,
+        failed_games,
         added_samples,
         initial_total_samples + added_samples,
         target_samples,

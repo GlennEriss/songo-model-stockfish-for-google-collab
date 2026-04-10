@@ -619,6 +619,15 @@ cells = [
         model_registry = json.loads(model_registry_path.read_text(encoding='utf-8')) if model_registry_path.exists() else {'models': []}
         selected_model_ids = []
         seen_model_ids = set()
+        skipped_unavailable_model_ids = []
+        available_registry_model_ids = set()
+        for item in model_registry.get('models', []):
+            model_id = str(item.get('model_id', '')).strip()
+            checkpoint_value = str(item.get('checkpoint_path', '')).strip()
+            if not model_id or not checkpoint_value:
+                continue
+            if Path(checkpoint_value).exists():
+                available_registry_model_ids.add(model_id)
 
         def _maybe_add_model(model_id: str):
             model_id = str(model_id).strip()
@@ -628,12 +637,15 @@ cells = [
                 return
             if model_id in BENCHMATCH_EXCLUDE_MODEL_IDS or model_id in seen_model_ids:
                 return
+            if model_id not in available_registry_model_ids:
+                skipped_unavailable_model_ids.append(model_id)
+                return
             seen_model_ids.add(model_id)
             selected_model_ids.append(model_id)
 
         if BENCHMATCH_INCLUDE_ALL_REGISTERED_MODELS:
-            discovered = [str(item.get('model_id', '')).strip() for item in model_registry.get('models', [])]
-            for model_id in sorted(discovered, key=_version_sort_key):
+            discovered = sorted(available_registry_model_ids, key=_version_sort_key)
+            for model_id in discovered:
                 _maybe_add_model(model_id)
 
         for model_id in BENCHMATCH_MODEL_IDS:
@@ -641,6 +653,7 @@ cells = [
 
         if BENCHMATCH_MODEL_LIMIT > 0:
             selected_model_ids = selected_model_ids[:BENCHMATCH_MODEL_LIMIT]
+        skipped_unavailable_model_ids = sorted({mid for mid in skipped_unavailable_model_ids if mid}, key=_version_sort_key)
 
         bench_agents = list(BENCHMATCH_CLASSIC_AGENTS) + [f'model:{model_id}' for model_id in selected_model_ids]
         all_matchups = []
@@ -763,6 +776,7 @@ cells = [
         print('output_raw_dir                 =', output_raw_dir)
         print('output_sampled_dir             =', output_sampled_dir)
         print('selected_model_ids             =', selected_model_ids)
+        print('skipped_missing_model_ids      =', skipped_unavailable_model_ids)
         print('total_agents                   =', len(bench_agents))
         print('total_matchups_all             =', len(all_matchups))
         print('total_matchups_worker          =', len(matchups))
