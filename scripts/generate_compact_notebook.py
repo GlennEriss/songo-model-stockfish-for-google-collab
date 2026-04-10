@@ -149,6 +149,7 @@ cells = [
         BENCHMARK_TPU_CONFIG_PATH = f'{WORKTREE}/config/generated/benchmark.colab_pro.tpu.yaml'
         TRAIN_CONTINUE_20M_CONFIG_ACTIVE_PATH = f'{WORKTREE}/config/generated/train.full_matrix.colab_pro.continue.dataset20m.active.yaml'
         TRAIN_SCRATCH_20M_CONFIG_ACTIVE_PATH = f'{WORKTREE}/config/generated/train.full_matrix.colab_pro.scratch.dataset20m.active.yaml'
+        EVALUATION_20M_CONFIG_ACTIVE_PATH = f'{WORKTREE}/config/generated/evaluation.full_matrix.colab_pro.dataset20m.active.yaml'
 
         DATASET_LIST_KIND = 'all'       # 'sources', 'built', 'all'
         DATASET_LIST_SORT_BY = 'size'   # 'size', 'created_at', 'updated_at'
@@ -224,6 +225,7 @@ cells = [
         DATASET_BUILD_CONFIG_ACTIVE = DATASET_BUILD_CONFIG_ACTIVE_PATH
         TRAIN_CONTINUE_20M_CONFIG_ACTIVE = TRAIN_CONTINUE_20M_CONFIG_ACTIVE_PATH
         TRAIN_SCRATCH_20M_CONFIG_ACTIVE = TRAIN_SCRATCH_20M_CONFIG_ACTIVE_PATH
+        EVALUATION_20M_CONFIG_ACTIVE = EVALUATION_20M_CONFIG_ACTIVE_PATH
 
         def _version_sort_key(model_id: str):
             match = re.search(r'_v(\\d+)$', model_id)
@@ -477,6 +479,13 @@ cells = [
         train_scratch_cfg['train'] = train_scratch_block
         TRAIN_SCRATCH_20M_CONFIG_ACTIVE = _write_yaml(train_scratch_cfg, TRAIN_SCRATCH_20M_CONFIG_ACTIVE_PATH)
 
+        eval_cfg = yaml.safe_load(Path(EVALUATION_CONFIG_ACTIVE).read_text(encoding='utf-8')) or {}
+        eval_block = dict(eval_cfg.get('evaluation', {}) or {})
+        eval_block['dataset_selection_mode'] = 'configured'
+        eval_block['dataset_id'] = DATASET_BUILD_ID
+        eval_cfg['evaluation'] = eval_block
+        EVALUATION_20M_CONFIG_ACTIVE = _write_yaml(eval_cfg, EVALUATION_20M_CONFIG_ACTIVE_PATH)
+
         print('RUNTIME_PROFILE                =', RUNTIME_PROFILE)
         print('TPU_ENV_PRESENT                =', TPU_ENV_PRESENT)
         print('TPU_RUNTIME_READY              =', TPU_RUNTIME_READY)
@@ -488,6 +497,7 @@ cells = [
         print('TRAIN_SCRATCH_CONFIG_ACTIVE    =', TRAIN_SCRATCH_CONFIG_ACTIVE)
         print('TRAIN_CONTINUE_20M_CONFIG_ACTIVE =', TRAIN_CONTINUE_20M_CONFIG_ACTIVE)
         print('TRAIN_SCRATCH_20M_CONFIG_ACTIVE  =', TRAIN_SCRATCH_20M_CONFIG_ACTIVE)
+        print('EVALUATION_20M_CONFIG_ACTIVE     =', EVALUATION_20M_CONFIG_ACTIVE)
         print('EVALUATION_CONFIG_ACTIVE       =', EVALUATION_CONFIG_ACTIVE)
         print('BENCHMARK_CONFIG_ACTIVE        =', BENCHMARK_CONFIG_ACTIVE)
         print('output_raw_dir                 =', output_raw_dir)
@@ -858,7 +868,9 @@ cells = [
     md("## 8. Evaluation"),
     code(
         """
-        !bash -lc "cd $WORKTREE && PYTHONPATH=$WORKTREE/src $PYTHON_BIN -m songo_model_stockfish.cli.main evaluate --config $EVALUATION_CONFIG_ACTIVE --job-id $EVALUATION_JOB_ID"
+        print('Evaluation sur dataset 20M partiel configure')
+        print('config =', EVALUATION_20M_CONFIG_ACTIVE)
+        !bash -lc "cd $WORKTREE && PYTHONPATH=$WORKTREE/src $PYTHON_BIN -m songo_model_stockfish.cli.main evaluate --config $EVALUATION_20M_CONFIG_ACTIVE --job-id $EVALUATION_JOB_ID"
         """
     ),
     code(
