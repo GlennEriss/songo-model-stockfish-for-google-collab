@@ -853,16 +853,16 @@ cells = [
     md("## 7. Entrainement"),
     code(
         """
-        print('Cellule A: continue depuis best sur dataset 20M partiel')
-        print('config =', TRAIN_CONTINUE_20M_CONFIG_ACTIVE)
-        !bash -lc "cd $WORKTREE && PYTHONPATH=$WORKTREE/src $PYTHON_BIN -m songo_model_stockfish.cli.main train --config $TRAIN_CONTINUE_20M_CONFIG_ACTIVE --job-id $TRAIN_CONTINUE_JOB_ID"
+        print('Cellule A: continue depuis best sur le plus grand dataset disponible')
+        print('config =', TRAIN_CONTINUE_CONFIG_ACTIVE)
+        !bash -lc "cd $WORKTREE && PYTHONPATH=$WORKTREE/src $PYTHON_BIN -m songo_model_stockfish.cli.main train --config $TRAIN_CONTINUE_CONFIG_ACTIVE --job-id $TRAIN_CONTINUE_JOB_ID"
         """
     ),
     code(
         """
-        print('Cellule B: from scratch sur dataset 20M partiel')
-        print('config =', TRAIN_SCRATCH_20M_CONFIG_ACTIVE)
-        !bash -lc "cd $WORKTREE && PYTHONPATH=$WORKTREE/src $PYTHON_BIN -m songo_model_stockfish.cli.main train --config $TRAIN_SCRATCH_20M_CONFIG_ACTIVE --job-id $TRAIN_SCRATCH_JOB_ID"
+        print('Cellule B: from scratch sur le plus grand dataset disponible')
+        print('config =', TRAIN_SCRATCH_CONFIG_ACTIVE)
+        !bash -lc "cd $WORKTREE && PYTHONPATH=$WORKTREE/src $PYTHON_BIN -m songo_model_stockfish.cli.main train --config $TRAIN_SCRATCH_CONFIG_ACTIVE --job-id $TRAIN_SCRATCH_JOB_ID"
         """
     ),
     md("## 8. Evaluation"),
