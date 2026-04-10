@@ -445,6 +445,7 @@ def _write_benchmatch_progress_snapshot(
 ) -> dict[str, Any]:
     added_games = sum(int(item.get("games_added", 0)) for item in summaries)
     added_samples = sum(int(item.get("samples_added", 0)) for item in summaries)
+    total_game_files = sum(int(item.get("existing_games", 0)) + int(item.get("games_added", 0)) for item in summaries)
     metadata = _register_dataset_source(
         job,
         dataset_source_id=dataset_source_id,
