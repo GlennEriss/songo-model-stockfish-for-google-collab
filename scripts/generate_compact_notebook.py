@@ -1315,6 +1315,155 @@ cells = [
     ),
     code(
         """
+        # Health check compact: un seul bloc pour voir si le pipeline avance vraiment
+        import json
+        import time
+        from datetime import datetime
+        from pathlib import Path
+
+        ACTIVE_THRESHOLD_SECONDS = 600
+        global_progress_path = Path(DRIVE_ROOT) / 'data' / 'global_generation_progress' / f'{GLOBAL_TARGET_ID}.json'
+        registry_path = Path(DRIVE_ROOT) / 'data' / 'dataset_registry.json'
+        health_state_path = Path(DRIVE_ROOT) / 'logs' / 'pipeline' / f'health_snapshot_{GLOBAL_TARGET_ID}.json'
+
+        def _load_json_retry(path: Path, retries: int = 6, wait_seconds: float = 0.25, default=None):
+            fallback = {} if default is None else default
+            last_exc = None
+            for attempt in range(retries):
+                try:
+                    return json.loads(path.read_text(encoding='utf-8'))
+                except (FileNotFoundError, OSError):
+                    if attempt + 1 >= retries:
+                        return fallback
+                    time.sleep(wait_seconds)
+                except json.JSONDecodeError as exc:
+                    last_exc = exc
+                    time.sleep(wait_seconds)
+            if last_exc is not None:
+                return fallback
+            return fallback
+
+        def _parse_iso_to_epoch(value: object) -> float:
+            text = str(value or '').strip()
+            if not text:
+                return 0.0
+            try:
+                return float(datetime.fromisoformat(text.replace('Z', '+00:00')).timestamp())
+            except Exception:
+                return 0.0
+
+        def _safe_pct(value: int, target: int) -> float:
+            if target <= 0:
+                return 0.0
+            return (100.0 * float(value)) / float(target)
+
+        payload = _load_json_retry(global_progress_path, default={
+            'total_samples': 0,
+            'total_games': 0,
+            'target_samples': int(GLOBAL_TARGET_SAMPLES),
+            'workers': {},
+            'updated_at': '<none>',
+        })
+        workers = payload.get('workers', {})
+        if not isinstance(workers, dict):
+            workers = {}
+
+        now_ts = time.time()
+        active_rows = []
+        inactive_rows = []
+        for worker_job_id, info in workers.items():
+            if not isinstance(info, dict):
+                continue
+            updated_at = str(info.get('updated_at', ''))
+            updated_ts = _parse_iso_to_epoch(updated_at)
+            age_seconds = (now_ts - updated_ts) if updated_ts > 0 else float('inf')
+            row = {
+                'job': worker_job_id,
+                'source': str(info.get('dataset_source_id', '')),
+                'samples': int(info.get('contributed_samples', 0)),
+                'games': int(info.get('contributed_games', 0)),
+                'updated_at': updated_at or '<none>',
+                'age_seconds': age_seconds,
+            }
+            if age_seconds <= ACTIVE_THRESHOLD_SECONDS:
+                active_rows.append(row)
+            else:
+                inactive_rows.append(row)
+
+        active_rows.sort(key=lambda r: r['age_seconds'])
+        inactive_rows.sort(key=lambda r: r['age_seconds'])
+
+        build_total = 0
+        build_workers = 0
+        if registry_path.exists():
+            registry = _load_json_retry(registry_path, default={'built_datasets': []})
+            for item in registry.get('built_datasets', []):
+                dataset_id = str(item.get('dataset_id', ''))
+                if dataset_id == BASE_DATASET_BUILD_ID or dataset_id.startswith(f'{BASE_DATASET_BUILD_ID}_'):
+                    build_total += int(item.get('labeled_samples', 0))
+                    build_workers += 1
+
+        current = {
+            'ts': now_ts,
+            'global_samples': int(payload.get('total_samples', 0)),
+            'global_games': int(payload.get('total_games', 0)),
+            'build_total': int(build_total),
+            'active_workers': len(active_rows),
+            'inactive_workers': len(inactive_rows),
+        }
+        previous = _load_json_retry(health_state_path, default={})
+        prev_ts = float(previous.get('ts', 0.0) or 0.0)
+        elapsed = max(0.0, current['ts'] - prev_ts) if prev_ts > 0 else 0.0
+        delta_global_samples = int(current['global_samples'] - int(previous.get('global_samples', 0) or 0))
+        delta_global_games = int(current['global_games'] - int(previous.get('global_games', 0) or 0))
+        delta_build_total = int(current['build_total'] - int(previous.get('build_total', 0) or 0))
+
+        health_state_path.parent.mkdir(parents=True, exist_ok=True)
+        health_state_path.write_text(json.dumps(current, indent=2, ensure_ascii=True), encoding='utf-8')
+
+        target = int(payload.get('target_samples', GLOBAL_TARGET_SAMPLES))
+        global_updated_at = str(payload.get('updated_at', '<none>'))
+        global_age = now_ts - _parse_iso_to_epoch(global_updated_at)
+        global_age_display = 'inf' if global_age == float('inf') else str(int(max(0.0, global_age)))
+
+        health = 'ok'
+        if len(active_rows) == 0:
+            health = 'critical'
+        elif elapsed > 0 and delta_global_samples <= 0 and delta_build_total <= 0:
+            health = 'warning'
+
+        print(
+            f"HEALTH={health.upper()} | global={current['global_samples']}/{target} ({_safe_pct(current['global_samples'], target):.2f}%) "
+            f"| games={current['global_games']} | build_sum={current['build_total']} | workers_active={len(active_rows)} "
+            f"| workers_inactive={len(inactive_rows)} | global_age_s={global_age_display}"
+        )
+        if elapsed > 0:
+            print(
+                f"TREND last_{int(elapsed)}s | delta_global_samples={delta_global_samples} | "
+                f"delta_global_games={delta_global_games} | delta_build_sum={delta_build_total}"
+            )
+        else:
+            print('TREND: premier snapshot (relance la cellule pour voir les deltas)')
+
+        for row in active_rows[:5]:
+            print(
+                f"ACTIVE | age_s={int(row['age_seconds'])} | samples={row['samples']} | games={row['games']} "
+                f"| job={row['job']}"
+            )
+        if len(active_rows) > 5:
+            print(f'ACTIVE | +{len(active_rows) - 5} autres workers actifs')
+        for row in inactive_rows[:3]:
+            age_display = 'inf' if row['age_seconds'] == float('inf') else str(int(row['age_seconds']))
+            print(
+                f"INACTIVE | age_s={age_display} | samples={row['samples']} | games={row['games']} "
+                f"| job={row['job']}"
+            )
+        if len(inactive_rows) > 3:
+            print(f'INACTIVE | +{len(inactive_rows) - 3} autres workers inactifs')
+        """
+    ),
+    code(
+        """
         import json
         from pathlib import Path
 
