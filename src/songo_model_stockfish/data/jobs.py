@@ -114,6 +114,12 @@ def _resolve_global_progress_backend_config(
             cfg.get("global_target_progress_firestore_credentials_path", os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")),
         )
     ).strip()
+    api_key = str(
+        cfg.get(
+            "global_progress_firestore_api_key",
+            cfg.get("global_target_progress_firestore_api_key", os.environ.get("FIREBASE_API_KEY", "")),
+        )
+    ).strip()
     fallback_to_file = bool(
         cfg.get(
             "global_progress_firestore_fallback_to_file",
@@ -134,6 +140,7 @@ def _resolve_global_progress_backend_config(
         "firestore_collection": collection,
         "firestore_document": document,
         "firestore_credentials_path": credentials_path,
+        "firestore_api_key": api_key,
         "firestore_fallback_to_file": fallback_to_file,
         "firestore_strict": strict,
     }
@@ -175,17 +182,25 @@ def _normalize_global_generation_state_payload(
 def _build_firestore_progress_endpoint(
     project_id: str,
     credentials_path: str,
+    api_key: str,
     collection: str,
     document: str,
 ) -> tuple[Any, Any, Any]:
     from google.cloud import firestore
 
     credentials = None
+    client_options = None
     if credentials_path:
         from google.oauth2 import service_account
 
         credentials = service_account.Credentials.from_service_account_file(credentials_path)
-    client = firestore.Client(project=(project_id or None), credentials=credentials)
+    elif api_key:
+        from google.auth.credentials import AnonymousCredentials
+        from google.api_core.client_options import ClientOptions
+
+        credentials = AnonymousCredentials()
+        client_options = ClientOptions(api_key=api_key)
+    client = firestore.Client(project=(project_id or None), credentials=credentials, client_options=client_options)
     doc_ref = client.collection(collection).document(document)
     return client, doc_ref, firestore
 
@@ -198,9 +213,10 @@ def _resolve_firestore_progress_endpoint(progress_backend: dict[str, Any] | None
     collection = str(backend.get("firestore_collection", "global_generation_progress")).strip() or "global_generation_progress"
     document = str(backend.get("firestore_document", backend.get("global_target_id", ""))).strip()
     credentials_path = str(backend.get("firestore_credentials_path", "")).strip()
+    api_key = str(backend.get("firestore_api_key", "")).strip()
     if not document:
         return None
-    return _build_firestore_progress_endpoint(project_id, credentials_path, collection, document)
+    return _build_firestore_progress_endpoint(project_id, credentials_path, api_key, collection, document)
 
 
 def _mirror_global_generation_progress_state(progress_path: Path, state: dict[str, Any]) -> None:

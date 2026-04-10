@@ -142,11 +142,12 @@ cells = [
         GLOBAL_TARGET_ID = 'bench_models_20m_global'
         GLOBAL_TARGET_SAMPLES = 20000000
         GLOBAL_PROGRESS_PATH = f'data/global_generation_progress/{GLOBAL_TARGET_ID}.json'
-        GLOBAL_PROGRESS_BACKEND = 'firestore'  # 'file' ou 'firestore'
+        GLOBAL_PROGRESS_BACKEND = 'file'  # 'file' ou 'firestore' (mettre 'firestore' quand l'auth sera en place)
         FIRESTORE_PROJECT_ID = 'songo-model-ai'
         FIRESTORE_COLLECTION = 'global_generation_progress'
         FIRESTORE_DOCUMENT = GLOBAL_TARGET_ID
         FIRESTORE_CREDENTIALS_PATH = ''  # Optionnel: chemin JSON service account
+        FIRESTORE_API_KEY = 'AIzaSyA0I4zJMpBElpwyae0tLlNpnMG0fnF07ys'
         FIRESTORE_FALLBACK_TO_FILE = True
         SOURCE_POLL_INTERVAL_SECONDS = 20
         DATASET_GENERATE_WORKERS = 16
@@ -309,6 +310,8 @@ cells = [
             if backend == 'firestore':
                 try:
                     from google.cloud import firestore
+                    from google.auth.credentials import AnonymousCredentials
+                    from google.api_core.client_options import ClientOptions
                     credentials_path = str(FIRESTORE_CREDENTIALS_PATH).strip()
                     project_id = str(FIRESTORE_PROJECT_ID).strip()
                     collection = str(FIRESTORE_COLLECTION).strip() or 'global_generation_progress'
@@ -317,6 +320,13 @@ cells = [
                         from google.oauth2 import service_account
                         creds = service_account.Credentials.from_service_account_file(credentials_path)
                         client = firestore.Client(project=(project_id or None), credentials=creds)
+                    elif str(FIRESTORE_API_KEY).strip():
+                        creds = AnonymousCredentials()
+                        client = firestore.Client(
+                            project=(project_id or None),
+                            credentials=creds,
+                            client_options=ClientOptions(api_key=str(FIRESTORE_API_KEY).strip()),
+                        )
                     else:
                         client = firestore.Client(project=(project_id or None))
                     snap = client.collection(collection).document(document).get()
@@ -541,6 +551,7 @@ cells = [
         print('FIRESTORE_PROJECT_ID     =', FIRESTORE_PROJECT_ID)
         print('FIRESTORE_COLLECTION     =', FIRESTORE_COLLECTION)
         print('FIRESTORE_DOCUMENT       =', FIRESTORE_DOCUMENT)
+        print('FIRESTORE_API_KEY_SET    =', bool(str(FIRESTORE_API_KEY).strip()))
         print('FIRESTORE_FALLBACK_TO_FILE =', FIRESTORE_FALLBACK_TO_FILE)
         print('DATASET_GENERATE_JOB_ID =', DATASET_GENERATE_JOB_ID)
         print('DATASET_BUILD_JOB_ID    =', DATASET_BUILD_JOB_ID)
@@ -548,30 +559,6 @@ cells = [
         print('TRAIN_SCRATCH_JOB_ID    =', TRAIN_SCRATCH_JOB_ID)
         print('EVALUATION_JOB_ID       =', EVALUATION_JOB_ID)
         print('BENCHMARK_JOB_ID        =', BENCHMARK_JOB_ID)
-        """
-    ),
-    md("## 3.b Auth Firestore (si backend = firestore)"),
-    code(
-        """
-        import subprocess
-
-        if str(GLOBAL_PROGRESS_BACKEND).strip().lower() == 'firestore':
-            try:
-                from google.colab import auth as colab_auth
-                colab_auth.authenticate_user()
-                print('Colab auth: OK')
-            except Exception as exc:
-                print('Colab auth: echec ->', exc)
-
-            project_id = str(FIRESTORE_PROJECT_ID).strip()
-            if project_id:
-                try:
-                    subprocess.run(['gcloud', 'config', 'set', 'project', project_id], check=False)
-                    print('gcloud project =', project_id)
-                except Exception as exc:
-                    print('gcloud config: echec ->', exc)
-        else:
-            print('Firestore non actif (GLOBAL_PROGRESS_BACKEND != firestore)')
         """
     ),
     md("## 4. Generer les configs actives"),
@@ -934,6 +921,7 @@ cells = [
         generate_block['global_progress_firestore_collection'] = str(FIRESTORE_COLLECTION)
         generate_block['global_progress_firestore_document'] = str(FIRESTORE_DOCUMENT)
         generate_block['global_progress_firestore_credentials_path'] = str(FIRESTORE_CREDENTIALS_PATH)
+        generate_block['global_progress_firestore_api_key'] = str(FIRESTORE_API_KEY)
         generate_block['global_progress_firestore_fallback_to_file'] = bool(FIRESTORE_FALLBACK_TO_FILE)
         generate_block['progress_update_every_n_games'] = 1
         generate_cfg['dataset_generation'] = generate_block
@@ -960,6 +948,7 @@ cells = [
         build_block['global_target_progress_firestore_collection'] = str(FIRESTORE_COLLECTION)
         build_block['global_target_progress_firestore_document'] = str(FIRESTORE_DOCUMENT)
         build_block['global_target_progress_firestore_credentials_path'] = str(FIRESTORE_CREDENTIALS_PATH)
+        build_block['global_target_progress_firestore_api_key'] = str(FIRESTORE_API_KEY)
         build_block['global_target_progress_firestore_fallback_to_file'] = bool(FIRESTORE_FALLBACK_TO_FILE)
         build_block['global_target_samples'] = int(GLOBAL_TARGET_SAMPLES)
         build_block['global_target_stabilization_polls'] = int(GLOBAL_TARGET_STABILIZATION_POLLS)
@@ -1001,6 +990,7 @@ cells = [
         print('FIRESTORE_PROJECT_ID           =', FIRESTORE_PROJECT_ID)
         print('FIRESTORE_COLLECTION           =', FIRESTORE_COLLECTION)
         print('FIRESTORE_DOCUMENT             =', FIRESTORE_DOCUMENT)
+        print('FIRESTORE_API_KEY_SET          =', bool(str(FIRESTORE_API_KEY).strip()))
         print('TRAIN_CONTINUE_CONFIG_ACTIVE   =', TRAIN_CONTINUE_CONFIG_ACTIVE)
         print('TRAIN_SCRATCH_CONFIG_ACTIVE    =', TRAIN_SCRATCH_CONFIG_ACTIVE)
         print('TRAIN_CONTINUE_20M_CONFIG_ACTIVE =', TRAIN_CONTINUE_20M_CONFIG_ACTIVE)
