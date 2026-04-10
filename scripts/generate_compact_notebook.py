@@ -201,13 +201,12 @@ cells = [
         RUNTIME_PROFILE = 'cpu'
         TPU_ENV_PRESENT = bool(os.environ.get('COLAB_TPU_ADDR'))
         TPU_RUNTIME_READY = False
-        if TPU_ENV_PRESENT:
-            try:
-                import torch_xla.core.xla_model as xm  # type: ignore[import-not-found]
-                _ = xm.xla_device()
-                TPU_RUNTIME_READY = True
-            except Exception:
-                TPU_RUNTIME_READY = False
+        try:
+            import torch_xla.core.xla_model as xm  # type: ignore[import-not-found]
+            _ = xm.xla_device()
+            TPU_RUNTIME_READY = True
+        except Exception:
+            TPU_RUNTIME_READY = False
 
         RUNTIME_HAS_CUDA = bool(torch.cuda.is_available())
         if TPU_RUNTIME_READY:
