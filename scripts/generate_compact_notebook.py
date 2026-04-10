@@ -115,6 +115,8 @@ cells = [
         WORKER_COUNT = 1  # Mets 2,3,4... quand tu lances plusieurs Colab
         WORKER_INDEX = -1  # -1 => auto assignment
         AUTO_ASSIGN_WORKER_INDEX = True
+        AUTO_REUSE_CHECKPOINT_WORKER_TAG = True
+        CHECKPOINT_STALE_MINUTES = 20  # Reprise auto d'un worker stoppe apres inactivite
         TARGET_SAMPLES = 20000000
         TARGET_LABELED_SAMPLES = 20000000
         BENCHMATCH_GAMES = 400
@@ -173,6 +175,7 @@ cells = [
         import re
         import socket
         import time
+        from datetime import datetime
         from pathlib import Path
 
         def _acquire_lock_dir(lock_dir: Path, timeout_seconds: float = 20.0, poll_seconds: float = 0.1) -> bool:
@@ -238,9 +241,109 @@ cells = [
             finally:
                 _release_lock_dir(lock_dir)
 
+        def _parse_iso_to_epoch(value: object) -> float:
+            text = str(value or '').strip()
+            if not text:
+                return 0.0
+            try:
+                return float(datetime.fromisoformat(text.replace('Z', '+00:00')).timestamp())
+            except Exception:
+                return 0.0
+
+        def _detect_resumable_worker_tag(
+            *,
+            drive_root: str,
+            base_source_id: str,
+            base_build_id: str,
+            stale_minutes: float,
+        ) -> str | None:
+            registry_path = Path(drive_root) / 'data' / 'dataset_registry.json'
+            if not registry_path.exists():
+                return None
+            try:
+                registry = json.loads(registry_path.read_text(encoding='utf-8'))
+            except Exception:
+                return None
+            if not isinstance(registry, dict):
+                return None
+
+            candidates: dict[str, dict[str, float]] = {}
+            source_prefix = f'{base_source_id}_'
+            build_prefix = f'{base_build_id}_'
+
+            for item in registry.get('dataset_sources', []):
+                if not isinstance(item, dict):
+                    continue
+                source_id = str(item.get('dataset_source_id', ''))
+                if not source_id.startswith(source_prefix):
+                    continue
+                tag = source_id[len(source_prefix):].strip()
+                if not tag:
+                    continue
+                source_status = str(item.get('source_status', 'partial')).strip().lower()
+                if source_status == 'completed':
+                    continue
+                updated = _parse_iso_to_epoch(item.get('updated_at'))
+                samples = float(int(item.get('sampled_positions', 0)))
+                cur = candidates.get(tag, {'updated': 0.0, 'samples': 0.0})
+                cur['updated'] = max(float(cur.get('updated', 0.0)), float(updated))
+                cur['samples'] = max(float(cur.get('samples', 0.0)), float(samples))
+                candidates[tag] = cur
+
+            for item in registry.get('built_datasets', []):
+                if not isinstance(item, dict):
+                    continue
+                dataset_id = str(item.get('dataset_id', ''))
+                if not dataset_id.startswith(build_prefix):
+                    continue
+                tag = dataset_id[len(build_prefix):].strip()
+                if not tag:
+                    continue
+                build_status = str(item.get('build_status', 'partial')).strip().lower()
+                if build_status == 'completed':
+                    continue
+                updated = _parse_iso_to_epoch(item.get('updated_at'))
+                samples = float(int(item.get('labeled_samples', 0)))
+                cur = candidates.get(tag, {'updated': 0.0, 'samples': 0.0})
+                cur['updated'] = max(float(cur.get('updated', 0.0)), float(updated))
+                cur['samples'] = max(float(cur.get('samples', 0.0)), float(samples))
+                candidates[tag] = cur
+
+            if not candidates:
+                return None
+
+            stale_seconds = max(60.0, float(stale_minutes) * 60.0)
+            now_ts = time.time()
+            eligible: list[tuple[str, dict[str, float]]] = []
+            for tag, meta in candidates.items():
+                updated = float(meta.get('updated', 0.0))
+                if updated <= 0:
+                    continue
+                if (now_ts - updated) >= stale_seconds:
+                    eligible.append((tag, meta))
+
+            if not eligible:
+                return None
+
+            eligible.sort(key=lambda item: (float(item[1].get('samples', 0.0)), float(item[1].get('updated', 0.0))), reverse=True)
+            return str(eligible[0][0])
+
+        RESUMED_FROM_CHECKPOINT = False
+
         if not WORKER_TAG:
-            WORKER_TAG = socket.gethostname().strip().lower().replace('-', '_')
-            WORKER_TAG = re.sub(r'[^a-z0-9_]+', '_', WORKER_TAG).strip('_') or 'worker'
+            if AUTO_REUSE_CHECKPOINT_WORKER_TAG:
+                resumed = _detect_resumable_worker_tag(
+                    drive_root=DRIVE_ROOT,
+                    base_source_id=BASE_DATASET_SOURCE_ID,
+                    base_build_id=BASE_DATASET_BUILD_ID,
+                    stale_minutes=float(CHECKPOINT_STALE_MINUTES),
+                )
+                if resumed:
+                    WORKER_TAG = resumed
+                    RESUMED_FROM_CHECKPOINT = True
+            if not WORKER_TAG:
+                WORKER_TAG = socket.gethostname().strip().lower().replace('-', '_')
+                WORKER_TAG = re.sub(r'[^a-z0-9_]+', '_', WORKER_TAG).strip('_') or 'worker'
 
         if AUTO_ASSIGN_WORKER_INDEX and int(WORKER_COUNT) > 1 and int(WORKER_INDEX) < 0:
             WORKER_INDEX = _auto_assign_worker_index(
@@ -283,6 +386,9 @@ cells = [
         print('WORKER_COUNT            =', WORKER_COUNT)
         print('WORKER_INDEX            =', WORKER_INDEX)
         print('AUTO_ASSIGN_WORKER_INDEX =', AUTO_ASSIGN_WORKER_INDEX)
+        print('AUTO_REUSE_CHECKPOINT_WORKER_TAG =', AUTO_REUSE_CHECKPOINT_WORKER_TAG)
+        print('CHECKPOINT_STALE_MINUTES =', CHECKPOINT_STALE_MINUTES)
+        print('RESUMED_FROM_CHECKPOINT =', RESUMED_FROM_CHECKPOINT)
         print('PIPELINE_MANIFEST_PATH  =', PIPELINE_MANIFEST_PATH)
         print('TARGET_SAMPLES          =', TARGET_SAMPLES)
         print('TARGET_LABELED_SAMPLES  =', TARGET_LABELED_SAMPLES)
@@ -940,6 +1046,83 @@ cells = [
             if loop_idx >= (MAX_LOOPS - 1):
                 break
             time.sleep(REFRESH_SECONDS)
+        """
+    ),
+    code(
+        """
+        # Workers status: actif/inactif (vision globale multi-Colab)
+        import json
+        import time
+        from datetime import datetime
+        from pathlib import Path
+
+        ACTIVE_THRESHOLD_SECONDS = 600
+        global_progress_path = Path(DRIVE_ROOT) / 'data' / 'global_generation_progress' / f'{GLOBAL_TARGET_ID}.json'
+
+        def _load_json_retry(path: Path, retries: int = 6, wait_seconds: float = 0.25):
+            last_exc = None
+            for _ in range(retries):
+                try:
+                    return json.loads(path.read_text(encoding='utf-8'))
+                except json.JSONDecodeError as exc:
+                    last_exc = exc
+                    time.sleep(wait_seconds)
+            raise last_exc
+
+        def _parse_iso_to_epoch(value: object) -> float:
+            text = str(value or '').strip()
+            if not text:
+                return 0.0
+            try:
+                return float(datetime.fromisoformat(text.replace('Z', '+00:00')).timestamp())
+            except Exception:
+                return 0.0
+
+        if not global_progress_path.exists():
+            print('global progress introuvable:', global_progress_path)
+        else:
+            payload = _load_json_retry(global_progress_path)
+            workers = payload.get('workers', {})
+            if not isinstance(workers, dict) or not workers:
+                print('Aucun worker global enregistre')
+            else:
+                now_ts = time.time()
+                rows = []
+                for worker_job_id, info in workers.items():
+                    if not isinstance(info, dict):
+                        continue
+                    updated_at = str(info.get('updated_at', ''))
+                    updated_ts = _parse_iso_to_epoch(updated_at)
+                    age_seconds = (now_ts - updated_ts) if updated_ts > 0 else float('inf')
+                    status = 'active' if age_seconds <= ACTIVE_THRESHOLD_SECONDS else 'inactive'
+                    rows.append(
+                        {
+                            'status': status,
+                            'age_seconds': age_seconds,
+                            'worker_job_id': worker_job_id,
+                            'dataset_source_id': str(info.get('dataset_source_id', '')),
+                            'contributed_samples': int(info.get('contributed_samples', 0)),
+                            'contributed_games': int(info.get('contributed_games', 0)),
+                            'updated_at': updated_at or '<none>',
+                        }
+                    )
+
+                rows.sort(key=lambda row: (0 if row['status'] == 'active' else 1, row['age_seconds']))
+
+                active_count = sum(1 for row in rows if row['status'] == 'active')
+                inactive_count = len(rows) - active_count
+                print(
+                    f'Workers global: total={len(rows)} | active={active_count} | inactive={inactive_count} '
+                    f'| active_threshold_seconds={ACTIVE_THRESHOLD_SECONDS}'
+                )
+                for row in rows:
+                    age_display = 'inf' if row['age_seconds'] == float('inf') else str(int(row['age_seconds']))
+                    print(
+                        f"- status={row['status']:8s} | age_s={age_display:>5s} | "
+                        f"job={row['worker_job_id']} | source={row['dataset_source_id']} | "
+                        f"samples={row['contributed_samples']} | games={row['contributed_games']} | "
+                        f"updated_at={row['updated_at']}"
+                    )
         """
     ),
     code(
