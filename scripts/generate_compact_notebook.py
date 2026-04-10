@@ -452,6 +452,67 @@ cells = [
     ),
     code(
         """
+        # KPI live: progression source + build vers la cible
+        import json
+        import time
+        from pathlib import Path
+
+        REFRESH_SECONDS = 15
+        MAX_LOOPS = 40
+
+        registry_path = Path(DRIVE_ROOT) / 'data' / 'dataset_registry.json'
+        jobs_root = Path(DRIVE_ROOT) / 'jobs'
+
+        def _safe_pct(value: int, target: int) -> float:
+            if target <= 0:
+                return 0.0
+            return (100.0 * float(value)) / float(target)
+
+        def _latest_job_dir(job_id: str) -> Path | None:
+            if not jobs_root.exists():
+                return None
+            candidates = [p for p in jobs_root.iterdir() if p.is_dir() and p.name.startswith(job_id.rsplit('_', 1)[0])]
+            if not candidates:
+                return None
+            return sorted(candidates, key=lambda p: p.stat().st_mtime)[-1]
+
+        for loop_idx in range(MAX_LOOPS):
+            if not registry_path.exists():
+                print('dataset_registry.json introuvable:', registry_path)
+                break
+
+            registry = json.loads(registry_path.read_text(encoding='utf-8'))
+            source = next((item for item in registry.get('dataset_sources', []) if item.get('dataset_source_id') == DATASET_SOURCE_ID), None)
+            built = next((item for item in registry.get('built_datasets', []) if item.get('dataset_id') == DATASET_BUILD_ID), None)
+
+            source_samples = int(source.get('sampled_positions', 0)) if source else 0
+            source_status = str(source.get('source_status', '<none>')) if source else '<none>'
+            source_files = int(source.get('sampled_files', 0)) if source else 0
+
+            build_samples = int(built.get('labeled_samples', 0)) if built else 0
+            build_status = str(built.get('build_status', '<none>')) if built else '<none>'
+            build_target = int(built.get('target_labeled_samples', TARGET_LABELED_SAMPLES)) if built else int(TARGET_LABELED_SAMPLES)
+
+            played_games = 0
+            latest_generate_dir = _latest_job_dir(DATASET_GENERATE_JOB_ID)
+            if latest_generate_dir is not None:
+                summary_path = latest_generate_dir / 'dataset_generation' / 'dataset_generation_summary.json'
+                if summary_path.exists():
+                    summary = json.loads(summary_path.read_text(encoding='utf-8'))
+                    played_games = int(summary.get('added_games', 0))
+
+            ts = time.strftime('%Y-%m-%d %H:%M:%S')
+            print(f'[{ts}] source_samples={source_samples}/{TARGET_SAMPLES} ({_safe_pct(source_samples, int(TARGET_SAMPLES)):.2f}%) | source_files={source_files} | source_status={source_status}')
+            print(f'[{ts}] played_games={played_games} | build_samples={build_samples}/{build_target} ({_safe_pct(build_samples, build_target):.2f}%) | build_status={build_status}')
+            print('-' * 120)
+
+            if loop_idx >= (MAX_LOOPS - 1):
+                break
+            time.sleep(REFRESH_SECONDS)
+        """
+    ),
+    code(
+        """
         import json
         from pathlib import Path
 
