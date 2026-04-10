@@ -291,6 +291,7 @@ cells = [
         build_block['target_labeled_samples'] = int(TARGET_LABELED_SAMPLES)
         build_block['follow_source_updates'] = True
         build_block['source_poll_interval_seconds'] = float(SOURCE_POLL_INTERVAL_SECONDS)
+        build_block['export_partial_every_n_files'] = int(min(20, int(build_block.get('export_partial_every_n_files', 100) or 100)))
         build_cfg['dataset_build'] = build_block
         DATASET_BUILD_CONFIG_ACTIVE = _write_yaml(build_cfg, DATASET_BUILD_CONFIG_ACTIVE_PATH)
 
@@ -306,6 +307,7 @@ cells = [
         print('selected_model_ids             =', selected_model_ids)
         print('total_agents                   =', len(bench_agents))
         print('total_matchups                 =', len(matchups))
+        print('export_partial_every_n_files   =', build_block.get('export_partial_every_n_files'))
         """
     ),
     md("## 5. Lancer le pipeline dataset en parallele"),
@@ -417,13 +419,25 @@ cells = [
     code(
         """
         import json
+        import time
         from pathlib import Path
 
         registry_path = Path(DRIVE_ROOT) / 'data' / 'dataset_registry.json'
+
+        def _load_json_retry(path: Path, retries: int = 6, wait_seconds: float = 0.25):
+            last_exc = None
+            for _ in range(retries):
+                try:
+                    return json.loads(path.read_text(encoding='utf-8'))
+                except json.JSONDecodeError as exc:
+                    last_exc = exc
+                    time.sleep(wait_seconds)
+            raise last_exc
+
         if not registry_path.exists():
             print('dataset_registry.json introuvable:', registry_path)
         else:
-            registry = json.loads(registry_path.read_text(encoding='utf-8'))
+            registry = _load_json_retry(registry_path)
             source = next((item for item in registry.get('dataset_sources', []) if item.get('dataset_source_id') == DATASET_SOURCE_ID), None)
             built = next((item for item in registry.get('built_datasets', []) if item.get('dataset_id') == DATASET_BUILD_ID), None)
 
@@ -463,6 +477,16 @@ cells = [
         registry_path = Path(DRIVE_ROOT) / 'data' / 'dataset_registry.json'
         jobs_root = Path(DRIVE_ROOT) / 'jobs'
 
+        def _load_json_retry(path: Path, retries: int = 6, wait_seconds: float = 0.25):
+            last_exc = None
+            for _ in range(retries):
+                try:
+                    return json.loads(path.read_text(encoding='utf-8'))
+                except json.JSONDecodeError as exc:
+                    last_exc = exc
+                    time.sleep(wait_seconds)
+            raise last_exc
+
         def _safe_pct(value: int, target: int) -> float:
             if target <= 0:
                 return 0.0
@@ -481,7 +505,7 @@ cells = [
                 print('dataset_registry.json introuvable:', registry_path)
                 break
 
-            registry = json.loads(registry_path.read_text(encoding='utf-8'))
+            registry = _load_json_retry(registry_path)
             source = next((item for item in registry.get('dataset_sources', []) if item.get('dataset_source_id') == DATASET_SOURCE_ID), None)
             built = next((item for item in registry.get('built_datasets', []) if item.get('dataset_id') == DATASET_BUILD_ID), None)
 
@@ -498,7 +522,7 @@ cells = [
             if latest_generate_dir is not None:
                 summary_path = latest_generate_dir / 'dataset_generation' / 'dataset_generation_summary.json'
                 if summary_path.exists():
-                    summary = json.loads(summary_path.read_text(encoding='utf-8'))
+                    summary = _load_json_retry(summary_path)
                     played_games = int(summary.get('added_games', 0))
 
             ts = time.strftime('%Y-%m-%d %H:%M:%S')
