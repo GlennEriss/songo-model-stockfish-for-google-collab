@@ -64,6 +64,158 @@ def _release_lock_dir(lock_dir: Path) -> None:
     release_lock_dir(lock_dir)
 
 
+def _default_global_generation_progress_state(global_target_id: str, target_samples: int) -> dict[str, Any]:
+    return {
+        "global_target_id": global_target_id,
+        "target_samples": int(target_samples),
+        "total_samples": 0,
+        "total_games": 0,
+        "workers": {},
+        "updated_at": utc_now_iso(),
+    }
+
+
+def _global_generation_workers_dir(progress_path: Path) -> Path:
+    return progress_path.parent / f"{progress_path.stem}.workers"
+
+
+def _global_generation_worker_snapshot_path(progress_path: Path, job_id: str) -> Path:
+    digest = hashlib.sha1(str(job_id).encode("utf-8")).hexdigest()
+    return _global_generation_workers_dir(progress_path) / f"{digest}.json"
+
+
+def _normalize_worker_progress_entry(
+    *,
+    job_id: str,
+    payload: Any,
+    fallback_dataset_source_id: str = "",
+) -> dict[str, Any] | None:
+    resolved_job_id = str(job_id).strip()
+    if not resolved_job_id:
+        return None
+    raw = payload if isinstance(payload, dict) else {}
+    dataset_source_id = str(raw.get("dataset_source_id", fallback_dataset_source_id)).strip()
+    contributed_samples = int(raw.get("contributed_samples", 0) or 0)
+    contributed_games = int(raw.get("contributed_games", 0) or 0)
+    updated_at = str(raw.get("updated_at", "")).strip() or utc_now_iso()
+    return {
+        "job_id": resolved_job_id,
+        "dataset_source_id": dataset_source_id,
+        "contributed_samples": max(0, contributed_samples),
+        "contributed_games": max(0, contributed_games),
+        "updated_at": updated_at,
+    }
+
+
+def _merge_worker_progress_maps(
+    *maps: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    for mapping in maps:
+        if not isinstance(mapping, dict):
+            continue
+        for job_id, payload in mapping.items():
+            normalized = _normalize_worker_progress_entry(job_id=str(job_id), payload=payload)
+            if normalized is None:
+                continue
+            existing = merged.get(normalized["job_id"])
+            if existing is None:
+                merged[normalized["job_id"]] = normalized
+                continue
+            existing["contributed_samples"] = max(
+                int(existing.get("contributed_samples", 0)),
+                int(normalized.get("contributed_samples", 0)),
+            )
+            existing["contributed_games"] = max(
+                int(existing.get("contributed_games", 0)),
+                int(normalized.get("contributed_games", 0)),
+            )
+            if not str(existing.get("dataset_source_id", "")).strip():
+                existing["dataset_source_id"] = str(normalized.get("dataset_source_id", ""))
+            if str(normalized.get("updated_at", "")) > str(existing.get("updated_at", "")):
+                existing["updated_at"] = str(normalized.get("updated_at", ""))
+            merged[normalized["job_id"]] = existing
+    return merged
+
+
+def _load_global_generation_worker_snapshots(progress_path: Path) -> dict[str, dict[str, Any]]:
+    workers_dir = _global_generation_workers_dir(progress_path)
+    if not workers_dir.exists():
+        return {}
+    snapshots: dict[str, dict[str, Any]] = {}
+    for snapshot_path in workers_dir.glob("*.json"):
+        payload = _read_json_file(snapshot_path, {})
+        if not isinstance(payload, dict):
+            continue
+        job_id = str(payload.get("job_id", "")).strip()
+        normalized = _normalize_worker_progress_entry(
+            job_id=job_id,
+            payload=payload,
+            fallback_dataset_source_id=str(payload.get("dataset_source_id", "")).strip(),
+        )
+        if normalized is None:
+            continue
+        snapshots = _merge_worker_progress_maps(snapshots, {normalized["job_id"]: normalized})
+    return snapshots
+
+
+def _write_global_generation_worker_snapshot(
+    *,
+    progress_path: Path,
+    worker_payload: dict[str, Any],
+) -> None:
+    job_id = str(worker_payload.get("job_id", "")).strip()
+    if not job_id:
+        return
+    workers_dir = _global_generation_workers_dir(progress_path)
+    workers_dir.mkdir(parents=True, exist_ok=True)
+    snapshot_path = _global_generation_worker_snapshot_path(progress_path, job_id)
+    write_json_atomic(snapshot_path, worker_payload, ensure_ascii=True, indent=2)
+
+
+def _sync_global_generation_progress_state(
+    *,
+    progress_path: Path,
+    global_target_id: str,
+    target_samples: int,
+) -> dict[str, Any]:
+    state = _read_json_file(
+        progress_path,
+        _default_global_generation_progress_state(global_target_id, target_samples),
+    )
+    state["global_target_id"] = str(state.get("global_target_id") or global_target_id)
+    state_target = int(state.get("target_samples") or target_samples or 0)
+    state["target_samples"] = state_target
+
+    workers_from_state: dict[str, dict[str, Any]] = {}
+    raw_workers = state.get("workers")
+    if isinstance(raw_workers, dict):
+        for worker_job_id, payload in raw_workers.items():
+            normalized = _normalize_worker_progress_entry(job_id=str(worker_job_id), payload=payload)
+            if normalized is not None:
+                workers_from_state[normalized["job_id"]] = normalized
+
+    workers_from_snapshots = _load_global_generation_worker_snapshots(progress_path)
+    merged_workers = _merge_worker_progress_maps(workers_from_state, workers_from_snapshots)
+
+    merged_total_samples = sum(int(item.get("contributed_samples", 0)) for item in merged_workers.values())
+    merged_total_games = sum(int(item.get("contributed_games", 0)) for item in merged_workers.values())
+
+    state["workers"] = {
+        worker_job_id: {
+            "dataset_source_id": str(payload.get("dataset_source_id", "")),
+            "contributed_samples": int(payload.get("contributed_samples", 0)),
+            "contributed_games": int(payload.get("contributed_games", 0)),
+            "updated_at": str(payload.get("updated_at", "")),
+        }
+        for worker_job_id, payload in merged_workers.items()
+    }
+    state["total_samples"] = max(int(state.get("total_samples", 0)), int(merged_total_samples))
+    state["total_games"] = max(int(state.get("total_games", 0)), int(merged_total_games))
+    state["updated_at"] = utc_now_iso()
+    return state
+
+
 def _update_global_generation_progress(
     *,
     progress_path: Path,
@@ -79,33 +231,40 @@ def _update_global_generation_progress(
     if not lock_ok:
         return {}
     try:
-        state = _read_json_file(
-            progress_path,
-            {
-                "global_target_id": global_target_id,
-                "target_samples": int(target_samples),
-                "total_samples": 0,
-                "total_games": 0,
-                "workers": {},
-                "updated_at": utc_now_iso(),
-            },
+        state = _sync_global_generation_progress_state(
+            progress_path=progress_path,
+            global_target_id=global_target_id,
+            target_samples=target_samples,
         )
-        state["global_target_id"] = str(state.get("global_target_id") or global_target_id)
-        state["target_samples"] = int(state.get("target_samples") or target_samples)
-        state["total_samples"] = int(state.get("total_samples", 0)) + int(max(0, delta_samples))
-        state["total_games"] = int(state.get("total_games", 0)) + int(max(0, delta_games))
+
         workers = state.get("workers")
         if not isinstance(workers, dict):
             workers = {}
-        worker_payload = workers.get(job_id, {})
-        if not isinstance(worker_payload, dict):
-            worker_payload = {}
-        worker_payload["dataset_source_id"] = dataset_source_id
-        worker_payload["contributed_samples"] = int(worker_payload.get("contributed_samples", 0)) + int(max(0, delta_samples))
-        worker_payload["contributed_games"] = int(worker_payload.get("contributed_games", 0)) + int(max(0, delta_games))
-        worker_payload["updated_at"] = utc_now_iso()
-        workers[job_id] = worker_payload
+        current = _normalize_worker_progress_entry(
+            job_id=job_id,
+            payload=workers.get(job_id, {}),
+            fallback_dataset_source_id=dataset_source_id,
+        ) or {
+            "job_id": str(job_id),
+            "dataset_source_id": str(dataset_source_id),
+            "contributed_samples": 0,
+            "contributed_games": 0,
+            "updated_at": utc_now_iso(),
+        }
+        current["dataset_source_id"] = str(dataset_source_id)
+        current["contributed_samples"] = int(current.get("contributed_samples", 0)) + int(max(0, delta_samples))
+        current["contributed_games"] = int(current.get("contributed_games", 0)) + int(max(0, delta_games))
+        current["updated_at"] = utc_now_iso()
+        workers[str(job_id)] = {
+            "dataset_source_id": str(current.get("dataset_source_id", "")),
+            "contributed_samples": int(current.get("contributed_samples", 0)),
+            "contributed_games": int(current.get("contributed_games", 0)),
+            "updated_at": str(current.get("updated_at", "")),
+        }
+        _write_global_generation_worker_snapshot(progress_path=progress_path, worker_payload=current)
         state["workers"] = workers
+        state["total_samples"] = sum(int(item.get("contributed_samples", 0)) for item in workers.values() if isinstance(item, dict))
+        state["total_games"] = sum(int(item.get("contributed_games", 0)) for item in workers.values() if isinstance(item, dict))
         state["updated_at"] = utc_now_iso()
         write_json_atomic(progress_path, state, ensure_ascii=True, indent=2)
         return state
@@ -128,18 +287,11 @@ def _reserve_global_generation_budget(
     if not lock_ok:
         return 0, 0, {}
     try:
-        state = _read_json_file(
-            progress_path,
-            {
-                "global_target_id": global_target_id,
-                "target_samples": int(target_samples),
-                "total_samples": 0,
-                "total_games": 0,
-                "workers": {},
-                "updated_at": utc_now_iso(),
-            },
+        state = _sync_global_generation_progress_state(
+            progress_path=progress_path,
+            global_target_id=global_target_id,
+            target_samples=target_samples,
         )
-        state["global_target_id"] = str(state.get("global_target_id") or global_target_id)
         state_target = int(state.get("target_samples") or target_samples or 0)
         state["target_samples"] = state_target
         state_total_samples = int(state.get("total_samples", 0))
@@ -151,21 +303,34 @@ def _reserve_global_generation_budget(
             allowed_samples = min(requested_samples, remaining)
         allowed_games = int(requested_games) if allowed_samples > 0 else 0
 
-        state["total_samples"] = state_total_samples + allowed_samples
-        state["total_games"] = int(state.get("total_games", 0)) + int(max(0, allowed_games))
-
         workers = state.get("workers")
         if not isinstance(workers, dict):
             workers = {}
-        worker_payload = workers.get(job_id, {})
-        if not isinstance(worker_payload, dict):
-            worker_payload = {}
-        worker_payload["dataset_source_id"] = dataset_source_id
-        worker_payload["contributed_samples"] = int(worker_payload.get("contributed_samples", 0)) + int(max(0, allowed_samples))
-        worker_payload["contributed_games"] = int(worker_payload.get("contributed_games", 0)) + int(max(0, allowed_games))
-        worker_payload["updated_at"] = utc_now_iso()
-        workers[job_id] = worker_payload
+        current = _normalize_worker_progress_entry(
+            job_id=job_id,
+            payload=workers.get(job_id, {}),
+            fallback_dataset_source_id=dataset_source_id,
+        ) or {
+            "job_id": str(job_id),
+            "dataset_source_id": str(dataset_source_id),
+            "contributed_samples": 0,
+            "contributed_games": 0,
+            "updated_at": utc_now_iso(),
+        }
+        current["dataset_source_id"] = str(dataset_source_id)
+        current["contributed_samples"] = int(current.get("contributed_samples", 0)) + int(max(0, allowed_samples))
+        current["contributed_games"] = int(current.get("contributed_games", 0)) + int(max(0, allowed_games))
+        current["updated_at"] = utc_now_iso()
+        workers[str(job_id)] = {
+            "dataset_source_id": str(current.get("dataset_source_id", "")),
+            "contributed_samples": int(current.get("contributed_samples", 0)),
+            "contributed_games": int(current.get("contributed_games", 0)),
+            "updated_at": str(current.get("updated_at", "")),
+        }
+        _write_global_generation_worker_snapshot(progress_path=progress_path, worker_payload=current)
         state["workers"] = workers
+        state["total_samples"] = sum(int(item.get("contributed_samples", 0)) for item in workers.values() if isinstance(item, dict))
+        state["total_games"] = sum(int(item.get("contributed_games", 0)) for item in workers.values() if isinstance(item, dict))
         state["updated_at"] = utc_now_iso()
 
         write_json_atomic(progress_path, state, ensure_ascii=True, indent=2)
@@ -175,16 +340,10 @@ def _reserve_global_generation_budget(
 
 
 def _read_global_generation_progress(progress_path: Path, global_target_id: str, target_samples: int) -> dict[str, Any]:
-    state = _read_json_file(
-        progress_path,
-        {
-            "global_target_id": global_target_id,
-            "target_samples": int(target_samples),
-            "total_samples": 0,
-            "total_games": 0,
-            "workers": {},
-            "updated_at": utc_now_iso(),
-        },
+    state = _sync_global_generation_progress_state(
+        progress_path=progress_path,
+        global_target_id=global_target_id,
+        target_samples=target_samples,
     )
     state.setdefault("global_target_id", global_target_id)
     state.setdefault("target_samples", int(target_samples))
