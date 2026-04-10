@@ -142,6 +142,12 @@ cells = [
         GLOBAL_TARGET_ID = 'bench_models_20m_global'
         GLOBAL_TARGET_SAMPLES = 20000000
         GLOBAL_PROGRESS_PATH = f'data/global_generation_progress/{GLOBAL_TARGET_ID}.json'
+        GLOBAL_PROGRESS_BACKEND = 'firestore'  # 'file' ou 'firestore'
+        FIRESTORE_PROJECT_ID = 'songo-model-ai'
+        FIRESTORE_COLLECTION = 'global_generation_progress'
+        FIRESTORE_DOCUMENT = GLOBAL_TARGET_ID
+        FIRESTORE_CREDENTIALS_PATH = ''  # Optionnel: chemin JSON service account
+        FIRESTORE_FALLBACK_TO_FILE = True
         SOURCE_POLL_INTERVAL_SECONDS = 20
         DATASET_GENERATE_WORKERS = 16
         DATASET_GENERATE_MAX_PENDING_FUTURES = 32
@@ -259,6 +265,71 @@ cells = [
             except Exception:
                 return 0.0
 
+        def _load_json_retry(path: Path, retries: int = 6, wait_seconds: float = 0.25, default=None):
+            fallback = {} if default is None else default
+            last_exc = None
+            for attempt in range(retries):
+                try:
+                    return json.loads(path.read_text(encoding='utf-8'))
+                except (FileNotFoundError, OSError):
+                    if attempt + 1 >= retries:
+                        return fallback
+                    time.sleep(wait_seconds)
+                except json.JSONDecodeError as exc:
+                    last_exc = exc
+                    time.sleep(wait_seconds)
+            if last_exc is not None:
+                return fallback
+            return fallback
+
+        def _normalize_global_payload(payload: object, target_samples: int) -> dict:
+            raw = payload if isinstance(payload, dict) else {}
+            workers = raw.get('workers', {})
+            if not isinstance(workers, dict):
+                workers = {}
+            return {
+                'global_target_id': str(raw.get('global_target_id', GLOBAL_TARGET_ID)),
+                'target_samples': int(raw.get('target_samples', target_samples) or target_samples),
+                'total_samples': int(raw.get('total_samples', 0) or 0),
+                'total_games': int(raw.get('total_games', 0) or 0),
+                'workers': workers,
+                'updated_at': str(raw.get('updated_at', '<none>') or '<none>'),
+            }
+
+        def _load_global_progress_payload(*, drive_root: str, global_target_id: str, target_samples: int) -> dict:
+            fallback_payload = {
+                'global_target_id': str(global_target_id),
+                'target_samples': int(target_samples),
+                'total_samples': 0,
+                'total_games': 0,
+                'workers': {},
+                'updated_at': '<none>',
+            }
+            backend = str(GLOBAL_PROGRESS_BACKEND).strip().lower()
+            if backend == 'firestore':
+                try:
+                    from google.cloud import firestore
+                    credentials_path = str(FIRESTORE_CREDENTIALS_PATH).strip()
+                    project_id = str(FIRESTORE_PROJECT_ID).strip()
+                    collection = str(FIRESTORE_COLLECTION).strip() or 'global_generation_progress'
+                    document = str(FIRESTORE_DOCUMENT).strip() or str(global_target_id)
+                    if credentials_path:
+                        from google.oauth2 import service_account
+                        creds = service_account.Credentials.from_service_account_file(credentials_path)
+                        client = firestore.Client(project=(project_id or None), credentials=creds)
+                    else:
+                        client = firestore.Client(project=(project_id or None))
+                    snap = client.collection(collection).document(document).get()
+                    if snap.exists:
+                        return _normalize_global_payload(snap.to_dict(), int(target_samples))
+                except Exception:
+                    if not bool(FIRESTORE_FALLBACK_TO_FILE):
+                        return fallback_payload
+            progress_path = Path(drive_root) / 'data' / 'global_generation_progress' / f'{global_target_id}.json'
+            if progress_path.exists():
+                return _normalize_global_payload(_load_json_retry(progress_path, default=fallback_payload), int(target_samples))
+            return fallback_payload
+
         def _active_worker_tags_from_global_progress(
             *,
             drive_root: str,
@@ -266,13 +337,11 @@ cells = [
             base_source_id: str,
             active_minutes: float,
         ) -> set[str]:
-            progress_path = Path(drive_root) / 'data' / 'global_generation_progress' / f'{global_target_id}.json'
-            if not progress_path.exists():
-                return set()
-            try:
-                payload = json.loads(progress_path.read_text(encoding='utf-8'))
-            except Exception:
-                return set()
+            payload = _load_global_progress_payload(
+                drive_root=drive_root,
+                global_target_id=global_target_id,
+                target_samples=int(GLOBAL_TARGET_SAMPLES),
+            )
             workers = payload.get('workers', {})
             if not isinstance(workers, dict):
                 return set()
@@ -468,12 +537,41 @@ cells = [
         print('GLOBAL_TARGET_ENABLED    =', GLOBAL_TARGET_ENABLED)
         print('GLOBAL_TARGET_ID         =', GLOBAL_TARGET_ID)
         print('GLOBAL_TARGET_SAMPLES    =', GLOBAL_TARGET_SAMPLES)
+        print('GLOBAL_PROGRESS_BACKEND  =', GLOBAL_PROGRESS_BACKEND)
+        print('FIRESTORE_PROJECT_ID     =', FIRESTORE_PROJECT_ID)
+        print('FIRESTORE_COLLECTION     =', FIRESTORE_COLLECTION)
+        print('FIRESTORE_DOCUMENT       =', FIRESTORE_DOCUMENT)
+        print('FIRESTORE_FALLBACK_TO_FILE =', FIRESTORE_FALLBACK_TO_FILE)
         print('DATASET_GENERATE_JOB_ID =', DATASET_GENERATE_JOB_ID)
         print('DATASET_BUILD_JOB_ID    =', DATASET_BUILD_JOB_ID)
         print('TRAIN_CONTINUE_JOB_ID   =', TRAIN_CONTINUE_JOB_ID)
         print('TRAIN_SCRATCH_JOB_ID    =', TRAIN_SCRATCH_JOB_ID)
         print('EVALUATION_JOB_ID       =', EVALUATION_JOB_ID)
         print('BENCHMARK_JOB_ID        =', BENCHMARK_JOB_ID)
+        """
+    ),
+    md("## 3.b Auth Firestore (si backend = firestore)"),
+    code(
+        """
+        import subprocess
+
+        if str(GLOBAL_PROGRESS_BACKEND).strip().lower() == 'firestore':
+            try:
+                from google.colab import auth as colab_auth
+                colab_auth.authenticate_user()
+                print('Colab auth: OK')
+            except Exception as exc:
+                print('Colab auth: echec ->', exc)
+
+            project_id = str(FIRESTORE_PROJECT_ID).strip()
+            if project_id:
+                try:
+                    subprocess.run(['gcloud', 'config', 'set', 'project', project_id], check=False)
+                    print('gcloud project =', project_id)
+                except Exception as exc:
+                    print('gcloud config: echec ->', exc)
+        else:
+            print('Firestore non actif (GLOBAL_PROGRESS_BACKEND != firestore)')
         """
     ),
     md("## 4. Generer les configs actives"),
@@ -830,6 +928,13 @@ cells = [
         generate_block['global_target_id'] = str(GLOBAL_TARGET_ID)
         generate_block['global_target_samples'] = int(GLOBAL_TARGET_SAMPLES)
         generate_block['global_progress_path'] = str(GLOBAL_PROGRESS_PATH)
+        generate_block['global_progress_backend'] = str(GLOBAL_PROGRESS_BACKEND)
+        generate_block['global_progress_firestore_enabled'] = str(GLOBAL_PROGRESS_BACKEND).strip().lower() == 'firestore'
+        generate_block['global_progress_firestore_project_id'] = str(FIRESTORE_PROJECT_ID)
+        generate_block['global_progress_firestore_collection'] = str(FIRESTORE_COLLECTION)
+        generate_block['global_progress_firestore_document'] = str(FIRESTORE_DOCUMENT)
+        generate_block['global_progress_firestore_credentials_path'] = str(FIRESTORE_CREDENTIALS_PATH)
+        generate_block['global_progress_firestore_fallback_to_file'] = bool(FIRESTORE_FALLBACK_TO_FILE)
         generate_block['progress_update_every_n_games'] = 1
         generate_cfg['dataset_generation'] = generate_block
         DATASET_GENERATE_CONFIG_ACTIVE = _write_yaml(generate_cfg, DATASET_GENERATE_CONFIG_ACTIVE_PATH)
@@ -847,7 +952,15 @@ cells = [
         build_block['source_poll_interval_min_seconds'] = float(max(5.0, SOURCE_POLL_INTERVAL_SECONDS / 2.0))
         build_block['source_poll_interval_max_seconds'] = float(max(60.0, SOURCE_POLL_INTERVAL_SECONDS * 4.0))
         build_block['stop_when_global_target_reached'] = bool(GLOBAL_TARGET_ENABLED)
+        build_block['global_target_id'] = str(GLOBAL_TARGET_ID)
         build_block['global_target_progress_path'] = str(GLOBAL_PROGRESS_PATH)
+        build_block['global_target_progress_backend'] = str(GLOBAL_PROGRESS_BACKEND)
+        build_block['global_target_progress_firestore_enabled'] = str(GLOBAL_PROGRESS_BACKEND).strip().lower() == 'firestore'
+        build_block['global_target_progress_firestore_project_id'] = str(FIRESTORE_PROJECT_ID)
+        build_block['global_target_progress_firestore_collection'] = str(FIRESTORE_COLLECTION)
+        build_block['global_target_progress_firestore_document'] = str(FIRESTORE_DOCUMENT)
+        build_block['global_target_progress_firestore_credentials_path'] = str(FIRESTORE_CREDENTIALS_PATH)
+        build_block['global_target_progress_firestore_fallback_to_file'] = bool(FIRESTORE_FALLBACK_TO_FILE)
         build_block['global_target_samples'] = int(GLOBAL_TARGET_SAMPLES)
         build_block['global_target_stabilization_polls'] = int(GLOBAL_TARGET_STABILIZATION_POLLS)
         build_block['workers'] = int(DATASET_BUILD_WORKERS)
@@ -884,6 +997,10 @@ cells = [
         print('RUNTIME_SUMMARY                =', runtime_summary)
         print('DATASET_GENERATE_CONFIG_ACTIVE =', DATASET_GENERATE_CONFIG_ACTIVE)
         print('DATASET_BUILD_CONFIG_ACTIVE    =', DATASET_BUILD_CONFIG_ACTIVE)
+        print('GLOBAL_PROGRESS_BACKEND        =', GLOBAL_PROGRESS_BACKEND)
+        print('FIRESTORE_PROJECT_ID           =', FIRESTORE_PROJECT_ID)
+        print('FIRESTORE_COLLECTION           =', FIRESTORE_COLLECTION)
+        print('FIRESTORE_DOCUMENT             =', FIRESTORE_DOCUMENT)
         print('TRAIN_CONTINUE_CONFIG_ACTIVE   =', TRAIN_CONTINUE_CONFIG_ACTIVE)
         print('TRAIN_SCRATCH_CONFIG_ACTIVE    =', TRAIN_SCRATCH_CONFIG_ACTIVE)
         print('TRAIN_CONTINUE_20M_CONFIG_ACTIVE =', TRAIN_CONTINUE_20M_CONFIG_ACTIVE)
@@ -1160,7 +1277,6 @@ cells = [
         REFRESH_SECONDS = 15
         MAX_LOOPS = 40
 
-        global_progress_path = Path(DRIVE_ROOT) / 'data' / 'global_generation_progress' / f'{GLOBAL_TARGET_ID}.json'
         registry_path = Path(DRIVE_ROOT) / 'data' / 'dataset_registry.json'
 
         def _load_json_retry(path: Path, retries: int = 6, wait_seconds: float = 0.25, default=None):
@@ -1186,15 +1302,11 @@ cells = [
             return (100.0 * float(value)) / float(target)
 
         for loop_idx in range(MAX_LOOPS):
-            global_payload = {
-                'total_samples': 0,
-                'total_games': 0,
-                'target_samples': int(GLOBAL_TARGET_SAMPLES),
-                'workers': {},
-                'updated_at': '<none>',
-            }
-            if global_progress_path.exists():
-                global_payload = _load_json_retry(global_progress_path)
+            global_payload = _load_global_progress_payload(
+                drive_root=DRIVE_ROOT,
+                global_target_id=GLOBAL_TARGET_ID,
+                target_samples=int(GLOBAL_TARGET_SAMPLES),
+            )
 
             global_total_samples = int(global_payload.get('total_samples', 0))
             global_total_games = int(global_payload.get('total_games', 0))
@@ -1238,7 +1350,6 @@ cells = [
         from pathlib import Path
 
         ACTIVE_THRESHOLD_SECONDS = 600
-        global_progress_path = Path(DRIVE_ROOT) / 'data' / 'global_generation_progress' / f'{GLOBAL_TARGET_ID}.json'
 
         def _load_json_retry(path: Path, retries: int = 6, wait_seconds: float = 0.25, default=None):
             fallback = {} if default is None else default
@@ -1266,51 +1377,52 @@ cells = [
             except Exception:
                 return 0.0
 
-        if not global_progress_path.exists():
-            print('global progress introuvable:', global_progress_path)
+        payload = _load_global_progress_payload(
+            drive_root=DRIVE_ROOT,
+            global_target_id=GLOBAL_TARGET_ID,
+            target_samples=int(GLOBAL_TARGET_SAMPLES),
+        )
+        workers = payload.get('workers', {})
+        if not isinstance(workers, dict) or not workers:
+            print('Aucun worker global enregistre')
         else:
-            payload = _load_json_retry(global_progress_path)
-            workers = payload.get('workers', {})
-            if not isinstance(workers, dict) or not workers:
-                print('Aucun worker global enregistre')
-            else:
-                now_ts = time.time()
-                rows = []
-                for worker_job_id, info in workers.items():
-                    if not isinstance(info, dict):
-                        continue
-                    updated_at = str(info.get('updated_at', ''))
-                    updated_ts = _parse_iso_to_epoch(updated_at)
-                    age_seconds = (now_ts - updated_ts) if updated_ts > 0 else float('inf')
-                    status = 'active' if age_seconds <= ACTIVE_THRESHOLD_SECONDS else 'inactive'
-                    rows.append(
-                        {
-                            'status': status,
-                            'age_seconds': age_seconds,
-                            'worker_job_id': worker_job_id,
-                            'dataset_source_id': str(info.get('dataset_source_id', '')),
-                            'contributed_samples': int(info.get('contributed_samples', 0)),
-                            'contributed_games': int(info.get('contributed_games', 0)),
-                            'updated_at': updated_at or '<none>',
-                        }
-                    )
-
-                rows.sort(key=lambda row: (0 if row['status'] == 'active' else 1, row['age_seconds']))
-
-                active_count = sum(1 for row in rows if row['status'] == 'active')
-                inactive_count = len(rows) - active_count
-                print(
-                    f'Workers global: total={len(rows)} | active={active_count} | inactive={inactive_count} '
-                    f'| active_threshold_seconds={ACTIVE_THRESHOLD_SECONDS}'
+            now_ts = time.time()
+            rows = []
+            for worker_job_id, info in workers.items():
+                if not isinstance(info, dict):
+                    continue
+                updated_at = str(info.get('updated_at', ''))
+                updated_ts = _parse_iso_to_epoch(updated_at)
+                age_seconds = (now_ts - updated_ts) if updated_ts > 0 else float('inf')
+                status = 'active' if age_seconds <= ACTIVE_THRESHOLD_SECONDS else 'inactive'
+                rows.append(
+                    {
+                        'status': status,
+                        'age_seconds': age_seconds,
+                        'worker_job_id': worker_job_id,
+                        'dataset_source_id': str(info.get('dataset_source_id', '')),
+                        'contributed_samples': int(info.get('contributed_samples', 0)),
+                        'contributed_games': int(info.get('contributed_games', 0)),
+                        'updated_at': updated_at or '<none>',
+                    }
                 )
-                for row in rows:
-                    age_display = 'inf' if row['age_seconds'] == float('inf') else str(int(row['age_seconds']))
-                    print(
-                        f"- status={row['status']:8s} | age_s={age_display:>5s} | "
-                        f"job={row['worker_job_id']} | source={row['dataset_source_id']} | "
-                        f"samples={row['contributed_samples']} | games={row['contributed_games']} | "
-                        f"updated_at={row['updated_at']}"
-                    )
+
+            rows.sort(key=lambda row: (0 if row['status'] == 'active' else 1, row['age_seconds']))
+
+            active_count = sum(1 for row in rows if row['status'] == 'active')
+            inactive_count = len(rows) - active_count
+            print(
+                f'Workers global: total={len(rows)} | active={active_count} | inactive={inactive_count} '
+                f'| active_threshold_seconds={ACTIVE_THRESHOLD_SECONDS}'
+            )
+            for row in rows:
+                age_display = 'inf' if row['age_seconds'] == float('inf') else str(int(row['age_seconds']))
+                print(
+                    f"- status={row['status']:8s} | age_s={age_display:>5s} | "
+                    f"job={row['worker_job_id']} | source={row['dataset_source_id']} | "
+                    f"samples={row['contributed_samples']} | games={row['contributed_games']} | "
+                    f"updated_at={row['updated_at']}"
+                )
         """
     ),
     code(
@@ -1322,7 +1434,6 @@ cells = [
         from pathlib import Path
 
         ACTIVE_THRESHOLD_SECONDS = 600
-        global_progress_path = Path(DRIVE_ROOT) / 'data' / 'global_generation_progress' / f'{GLOBAL_TARGET_ID}.json'
         registry_path = Path(DRIVE_ROOT) / 'data' / 'dataset_registry.json'
         health_state_path = Path(DRIVE_ROOT) / 'logs' / 'pipeline' / f'health_snapshot_{GLOBAL_TARGET_ID}_{WORKER_TAG}.json'
 
@@ -1357,13 +1468,11 @@ cells = [
                 return 0.0
             return (100.0 * float(value)) / float(target)
 
-        payload = _load_json_retry(global_progress_path, default={
-            'total_samples': 0,
-            'total_games': 0,
-            'target_samples': int(GLOBAL_TARGET_SAMPLES),
-            'workers': {},
-            'updated_at': '<none>',
-        })
+        payload = _load_global_progress_payload(
+            drive_root=DRIVE_ROOT,
+            global_target_id=GLOBAL_TARGET_ID,
+            target_samples=int(GLOBAL_TARGET_SAMPLES),
+        )
         workers = payload.get('workers', {})
         if not isinstance(workers, dict):
             workers = {}

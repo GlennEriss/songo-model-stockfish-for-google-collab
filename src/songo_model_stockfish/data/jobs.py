@@ -5,6 +5,7 @@ import functools
 import hashlib
 import json
 import multiprocessing
+import os
 import shutil
 import time
 from pathlib import Path
@@ -62,6 +63,306 @@ def _acquire_lock_dir(lock_dir: Path, timeout_seconds: float = 30.0, poll_second
 
 def _release_lock_dir(lock_dir: Path) -> None:
     release_lock_dir(lock_dir)
+
+
+def _resolve_global_progress_backend_config(
+    *,
+    cfg: dict[str, Any],
+    global_target_id: str,
+    target_samples: int,
+) -> dict[str, Any]:
+    backend_raw = str(
+        cfg.get(
+            "global_progress_backend",
+            cfg.get(
+                "global_target_progress_backend",
+                "file",
+            ),
+        )
+    ).strip().lower() or "file"
+    firestore_enabled_flag = bool(
+        cfg.get(
+            "global_progress_firestore_enabled",
+            cfg.get("global_target_progress_firestore_enabled", False),
+        )
+    )
+    use_firestore = backend_raw == "firestore" or firestore_enabled_flag
+    project_id = str(
+        cfg.get(
+            "global_progress_firestore_project_id",
+            cfg.get(
+                "global_target_progress_firestore_project_id",
+                os.environ.get("FIREBASE_PROJECT_ID", "") or os.environ.get("GOOGLE_CLOUD_PROJECT", ""),
+            ),
+        )
+    ).strip()
+    collection = str(
+        cfg.get(
+            "global_progress_firestore_collection",
+            cfg.get("global_target_progress_firestore_collection", "global_generation_progress"),
+        )
+    ).strip() or "global_generation_progress"
+    document = str(
+        cfg.get(
+            "global_progress_firestore_document",
+            cfg.get("global_target_progress_firestore_document", global_target_id),
+        )
+    ).strip() or global_target_id
+    credentials_path = str(
+        cfg.get(
+            "global_progress_firestore_credentials_path",
+            cfg.get("global_target_progress_firestore_credentials_path", os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")),
+        )
+    ).strip()
+    fallback_to_file = bool(
+        cfg.get(
+            "global_progress_firestore_fallback_to_file",
+            cfg.get("global_target_progress_firestore_fallback_to_file", True),
+        )
+    )
+    strict = bool(
+        cfg.get(
+            "global_progress_firestore_strict",
+            cfg.get("global_target_progress_firestore_strict", False),
+        )
+    )
+    return {
+        "backend": "firestore" if use_firestore else "file",
+        "global_target_id": str(global_target_id),
+        "target_samples": int(target_samples),
+        "firestore_project_id": project_id,
+        "firestore_collection": collection,
+        "firestore_document": document,
+        "firestore_credentials_path": credentials_path,
+        "firestore_fallback_to_file": fallback_to_file,
+        "firestore_strict": strict,
+    }
+
+
+def _normalize_global_generation_state_payload(
+    *,
+    payload: Any,
+    global_target_id: str,
+    target_samples: int,
+) -> dict[str, Any]:
+    raw = payload if isinstance(payload, dict) else {}
+    state = _default_global_generation_progress_state(global_target_id, target_samples)
+    state["global_target_id"] = str(raw.get("global_target_id", global_target_id) or global_target_id)
+    state["target_samples"] = int(raw.get("target_samples", target_samples) or target_samples or 0)
+    raw_workers = raw.get("workers")
+    workers: dict[str, dict[str, Any]] = {}
+    if isinstance(raw_workers, dict):
+        for worker_job_id, worker_payload in raw_workers.items():
+            normalized = _normalize_worker_progress_entry(job_id=str(worker_job_id), payload=worker_payload)
+            if normalized is None:
+                continue
+            workers[normalized["job_id"]] = {
+                "dataset_source_id": str(normalized.get("dataset_source_id", "")),
+                "contributed_samples": int(normalized.get("contributed_samples", 0)),
+                "contributed_games": int(normalized.get("contributed_games", 0)),
+                "updated_at": str(normalized.get("updated_at", "")),
+            }
+    worker_total_samples = sum(int(item.get("contributed_samples", 0)) for item in workers.values())
+    worker_total_games = sum(int(item.get("contributed_games", 0)) for item in workers.values())
+    state["workers"] = workers
+    state["total_samples"] = max(int(raw.get("total_samples", 0) or 0), int(worker_total_samples))
+    state["total_games"] = max(int(raw.get("total_games", 0) or 0), int(worker_total_games))
+    state["updated_at"] = str(raw.get("updated_at", "")).strip() or utc_now_iso()
+    return state
+
+
+@functools.lru_cache(maxsize=16)
+def _build_firestore_progress_endpoint(
+    project_id: str,
+    credentials_path: str,
+    collection: str,
+    document: str,
+) -> tuple[Any, Any, Any]:
+    from google.cloud import firestore
+
+    credentials = None
+    if credentials_path:
+        from google.oauth2 import service_account
+
+        credentials = service_account.Credentials.from_service_account_file(credentials_path)
+    client = firestore.Client(project=(project_id or None), credentials=credentials)
+    doc_ref = client.collection(collection).document(document)
+    return client, doc_ref, firestore
+
+
+def _resolve_firestore_progress_endpoint(progress_backend: dict[str, Any] | None) -> tuple[Any, Any, Any] | None:
+    backend = progress_backend if isinstance(progress_backend, dict) else {}
+    if str(backend.get("backend", "file")).strip().lower() != "firestore":
+        return None
+    project_id = str(backend.get("firestore_project_id", "")).strip()
+    collection = str(backend.get("firestore_collection", "global_generation_progress")).strip() or "global_generation_progress"
+    document = str(backend.get("firestore_document", backend.get("global_target_id", ""))).strip()
+    credentials_path = str(backend.get("firestore_credentials_path", "")).strip()
+    if not document:
+        return None
+    return _build_firestore_progress_endpoint(project_id, credentials_path, collection, document)
+
+
+def _mirror_global_generation_progress_state(progress_path: Path, state: dict[str, Any]) -> None:
+    try:
+        progress_path.parent.mkdir(parents=True, exist_ok=True)
+        write_json_atomic(progress_path, state, ensure_ascii=True, indent=2)
+    except Exception:
+        return
+
+
+def _update_global_generation_progress_firestore(
+    *,
+    progress_path: Path,
+    global_target_id: str,
+    target_samples: int,
+    job_id: str,
+    dataset_source_id: str,
+    delta_samples: int = 0,
+    delta_games: int = 0,
+    progress_backend: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    endpoint = _resolve_firestore_progress_endpoint(progress_backend)
+    if endpoint is None:
+        return {}
+    client, doc_ref, firestore_mod = endpoint
+    transaction = client.transaction()
+
+    @firestore_mod.transactional
+    def _tx(tx):
+        snap = doc_ref.get(transaction=tx)
+        state = _normalize_global_generation_state_payload(
+            payload=(snap.to_dict() if snap.exists else {}),
+            global_target_id=global_target_id,
+            target_samples=target_samples,
+        )
+        workers = state.get("workers")
+        if not isinstance(workers, dict):
+            workers = {}
+        current = _normalize_worker_progress_entry(
+            job_id=job_id,
+            payload=workers.get(job_id, {}),
+            fallback_dataset_source_id=dataset_source_id,
+        ) or {
+            "job_id": str(job_id),
+            "dataset_source_id": str(dataset_source_id),
+            "contributed_samples": 0,
+            "contributed_games": 0,
+            "updated_at": utc_now_iso(),
+        }
+        current["dataset_source_id"] = str(dataset_source_id)
+        current["contributed_samples"] = int(current.get("contributed_samples", 0)) + int(max(0, delta_samples))
+        current["contributed_games"] = int(current.get("contributed_games", 0)) + int(max(0, delta_games))
+        current["updated_at"] = utc_now_iso()
+        workers[str(job_id)] = {
+            "dataset_source_id": str(current.get("dataset_source_id", "")),
+            "contributed_samples": int(current.get("contributed_samples", 0)),
+            "contributed_games": int(current.get("contributed_games", 0)),
+            "updated_at": str(current.get("updated_at", "")),
+        }
+        state["workers"] = workers
+        state["total_samples"] = sum(int(item.get("contributed_samples", 0)) for item in workers.values() if isinstance(item, dict))
+        state["total_games"] = sum(int(item.get("contributed_games", 0)) for item in workers.values() if isinstance(item, dict))
+        state["updated_at"] = utc_now_iso()
+        tx.set(doc_ref, state)
+        return state
+
+    state = _tx(transaction)
+    _mirror_global_generation_progress_state(progress_path, state)
+    return state
+
+
+def _reserve_global_generation_budget_firestore(
+    *,
+    progress_path: Path,
+    global_target_id: str,
+    target_samples: int,
+    job_id: str,
+    dataset_source_id: str,
+    requested_samples: int,
+    requested_games: int = 1,
+    progress_backend: dict[str, Any] | None = None,
+) -> tuple[int, int, dict[str, Any]]:
+    endpoint = _resolve_firestore_progress_endpoint(progress_backend)
+    if endpoint is None:
+        return 0, 0, {}
+    client, doc_ref, firestore_mod = endpoint
+    transaction = client.transaction()
+
+    @firestore_mod.transactional
+    def _tx(tx):
+        snap = doc_ref.get(transaction=tx)
+        state = _normalize_global_generation_state_payload(
+            payload=(snap.to_dict() if snap.exists else {}),
+            global_target_id=global_target_id,
+            target_samples=target_samples,
+        )
+        state_target = int(state.get("target_samples") or target_samples or 0)
+        state["target_samples"] = state_target
+        state_total_samples = int(state.get("total_samples", 0))
+
+        req_samples = max(0, int(requested_samples))
+        allowed_samples = req_samples
+        if state_target > 0:
+            remaining = max(0, state_target - state_total_samples)
+            allowed_samples = min(req_samples, remaining)
+        allowed_games = int(requested_games) if allowed_samples > 0 else 0
+
+        workers = state.get("workers")
+        if not isinstance(workers, dict):
+            workers = {}
+        current = _normalize_worker_progress_entry(
+            job_id=job_id,
+            payload=workers.get(job_id, {}),
+            fallback_dataset_source_id=dataset_source_id,
+        ) or {
+            "job_id": str(job_id),
+            "dataset_source_id": str(dataset_source_id),
+            "contributed_samples": 0,
+            "contributed_games": 0,
+            "updated_at": utc_now_iso(),
+        }
+        current["dataset_source_id"] = str(dataset_source_id)
+        current["contributed_samples"] = int(current.get("contributed_samples", 0)) + int(max(0, allowed_samples))
+        current["contributed_games"] = int(current.get("contributed_games", 0)) + int(max(0, allowed_games))
+        current["updated_at"] = utc_now_iso()
+        workers[str(job_id)] = {
+            "dataset_source_id": str(current.get("dataset_source_id", "")),
+            "contributed_samples": int(current.get("contributed_samples", 0)),
+            "contributed_games": int(current.get("contributed_games", 0)),
+            "updated_at": str(current.get("updated_at", "")),
+        }
+        state["workers"] = workers
+        state["total_samples"] = sum(int(item.get("contributed_samples", 0)) for item in workers.values() if isinstance(item, dict))
+        state["total_games"] = sum(int(item.get("contributed_games", 0)) for item in workers.values() if isinstance(item, dict))
+        state["updated_at"] = utc_now_iso()
+        tx.set(doc_ref, state)
+        return int(allowed_samples), int(allowed_games), state
+
+    allowed_samples, allowed_games, state = _tx(transaction)
+    _mirror_global_generation_progress_state(progress_path, state)
+    return allowed_samples, allowed_games, state
+
+
+def _read_global_generation_progress_firestore(
+    *,
+    progress_path: Path,
+    global_target_id: str,
+    target_samples: int,
+    progress_backend: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    endpoint = _resolve_firestore_progress_endpoint(progress_backend)
+    if endpoint is None:
+        return {}
+    _client, doc_ref, _firestore_mod = endpoint
+    snap = doc_ref.get()
+    state = _normalize_global_generation_state_payload(
+        payload=(snap.to_dict() if snap.exists else {}),
+        global_target_id=global_target_id,
+        target_samples=target_samples,
+    )
+    _mirror_global_generation_progress_state(progress_path, state)
+    return state
 
 
 def _default_global_generation_progress_state(global_target_id: str, target_samples: int) -> dict[str, Any]:
@@ -226,7 +527,27 @@ def _update_global_generation_progress(
     dataset_source_id: str,
     delta_samples: int = 0,
     delta_games: int = 0,
+    progress_backend: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    backend = progress_backend if isinstance(progress_backend, dict) else {}
+    if str(backend.get("backend", "file")).strip().lower() == "firestore":
+        try:
+            return _update_global_generation_progress_firestore(
+                progress_path=progress_path,
+                global_target_id=global_target_id,
+                target_samples=target_samples,
+                job_id=job_id,
+                dataset_source_id=dataset_source_id,
+                delta_samples=delta_samples,
+                delta_games=delta_games,
+                progress_backend=backend,
+            )
+        except Exception:
+            if bool(backend.get("firestore_strict", False)):
+                raise
+            if not bool(backend.get("firestore_fallback_to_file", True)):
+                raise
+
     lock_ok = _acquire_lock_dir(lock_dir)
     if not lock_ok:
         return {}
@@ -282,7 +603,27 @@ def _reserve_global_generation_budget(
     dataset_source_id: str,
     requested_samples: int,
     requested_games: int = 1,
+    progress_backend: dict[str, Any] | None = None,
 ) -> tuple[int, int, dict[str, Any]]:
+    backend = progress_backend if isinstance(progress_backend, dict) else {}
+    if str(backend.get("backend", "file")).strip().lower() == "firestore":
+        try:
+            return _reserve_global_generation_budget_firestore(
+                progress_path=progress_path,
+                global_target_id=global_target_id,
+                target_samples=target_samples,
+                job_id=job_id,
+                dataset_source_id=dataset_source_id,
+                requested_samples=requested_samples,
+                requested_games=requested_games,
+                progress_backend=backend,
+            )
+        except Exception:
+            if bool(backend.get("firestore_strict", False)):
+                raise
+            if not bool(backend.get("firestore_fallback_to_file", True)):
+                raise
+
     lock_ok = _acquire_lock_dir(lock_dir)
     if not lock_ok:
         return 0, 0, {}
@@ -339,7 +680,30 @@ def _reserve_global_generation_budget(
         _release_lock_dir(lock_dir)
 
 
-def _read_global_generation_progress(progress_path: Path, global_target_id: str, target_samples: int) -> dict[str, Any]:
+def _read_global_generation_progress(
+    progress_path: Path,
+    global_target_id: str,
+    target_samples: int,
+    *,
+    progress_backend: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    backend = progress_backend if isinstance(progress_backend, dict) else {}
+    if str(backend.get("backend", "file")).strip().lower() == "firestore":
+        try:
+            state = _read_global_generation_progress_firestore(
+                progress_path=progress_path,
+                global_target_id=global_target_id,
+                target_samples=target_samples,
+                progress_backend=backend,
+            )
+            if state:
+                return state
+        except Exception:
+            if bool(backend.get("firestore_strict", False)):
+                raise
+            if not bool(backend.get("firestore_fallback_to_file", True)):
+                raise
+
     state = _sync_global_generation_progress_state(
         progress_path=progress_path,
         global_target_id=global_target_id,
@@ -2183,6 +2547,11 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
         cfg.get("global_progress_path"),
         job.paths.data_root / "global_generation_progress" / f"{global_target_id}.json",
     )
+    global_progress_backend = _resolve_global_progress_backend_config(
+        cfg=cfg,
+        global_target_id=global_target_id,
+        target_samples=global_target_samples,
+    )
     global_progress_lock_dir = Path(str(global_progress_path) + ".lock")
 
     dataset_dir = job.job_dir / "dataset_generation"
@@ -2235,13 +2604,15 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
             dataset_source_id=dataset_source_id,
             delta_samples=0,
             delta_games=0,
+            progress_backend=global_progress_backend,
         )
         job.logger.info(
-            "dataset generation global target enabled | global_target_id=%s | target_samples=%s | current_global_samples=%s | progress_path=%s",
+            "dataset generation global target enabled | global_target_id=%s | target_samples=%s | current_global_samples=%s | progress_path=%s | backend=%s",
             global_target_id,
             global_target_samples,
             int(state.get("total_samples", 0)),
             global_progress_path,
+            str(global_progress_backend.get("backend", "file")),
         )
 
     if source_mode not in {"benchmatch", "clone_existing", "derive_existing", "augment_existing", "merge_existing"}:
@@ -2744,6 +3115,7 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
                 global_progress_path,
                 global_target_id=global_target_id,
                 target_samples=global_target_samples,
+                progress_backend=global_progress_backend,
             )
             return int(state.get("total_samples", 0)) >= int(global_target_samples)
 
@@ -2770,6 +3142,7 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
                 dataset_source_id=dataset_source_id,
                 requested_samples=admitted,
                 requested_games=1,
+                progress_backend=global_progress_backend,
             )
             return int(admitted_samples)
 
@@ -3104,6 +3477,12 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         job.paths.data_root / "global_generation_progress" / "bench_models_20m_global.json",
     )
     global_target_samples_cfg = int(cfg.get("global_target_samples", 0))
+    global_target_id = str(cfg.get("global_target_id", "")).strip() or str(Path(global_target_progress_path).stem)
+    global_progress_backend = _resolve_global_progress_backend_config(
+        cfg=cfg,
+        global_target_id=global_target_id,
+        target_samples=global_target_samples_cfg,
+    )
     global_target_stabilization_polls = max(1, int(cfg.get("global_target_stabilization_polls", 3)))
     global_target_reached_polls = 0
     effective_max_tasks_per_child = _resolve_pool_max_tasks_per_child(
@@ -3114,7 +3493,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
     )
 
     job.logger.info(
-        "dataset build startup | dataset=%s | source_dataset_id=%s | configured_input_sampled_dir=%s | workers=%s | max_pending_futures=%s | include_tactical_analysis=%s | dedupe_sample_ids=%s | export_partial_every_n_files=%s | follow_source_updates=%s | source_poll_interval_seconds=%.1f | adaptive_source_polling=%s",
+        "dataset build startup | dataset=%s | source_dataset_id=%s | configured_input_sampled_dir=%s | workers=%s | max_pending_futures=%s | include_tactical_analysis=%s | dedupe_sample_ids=%s | export_partial_every_n_files=%s | follow_source_updates=%s | source_poll_interval_seconds=%.1f | adaptive_source_polling=%s | global_target_backend=%s",
         dataset_id,
         source_dataset_id or "<auto>",
         str(cfg.get("input_sampled_dir", "")),
@@ -3126,6 +3505,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         configured_follow_source_updates,
         source_poll_interval_seconds,
         adaptive_source_polling,
+        str(global_progress_backend.get("backend", "file")),
     )
 
     dataset_dir = job.job_dir / "dataset_build"
@@ -3214,12 +3594,11 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
     def _global_generation_target_reached_for_build() -> bool:
         if not stop_when_global_target_reached:
             return False
-        payload = _read_json_file(
+        payload = _read_global_generation_progress(
             global_target_progress_path,
-            {
-                "total_samples": 0,
-                "target_samples": int(global_target_samples_cfg),
-            },
+            global_target_id=global_target_id,
+            target_samples=int(global_target_samples_cfg),
+            progress_backend=global_progress_backend,
         )
         total = int(payload.get("total_samples", 0))
         target = int(payload.get("target_samples") or global_target_samples_cfg or 0)
