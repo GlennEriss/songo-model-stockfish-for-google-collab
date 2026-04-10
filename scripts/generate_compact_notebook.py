@@ -1324,7 +1324,7 @@ cells = [
         ACTIVE_THRESHOLD_SECONDS = 600
         global_progress_path = Path(DRIVE_ROOT) / 'data' / 'global_generation_progress' / f'{GLOBAL_TARGET_ID}.json'
         registry_path = Path(DRIVE_ROOT) / 'data' / 'dataset_registry.json'
-        health_state_path = Path(DRIVE_ROOT) / 'logs' / 'pipeline' / f'health_snapshot_{GLOBAL_TARGET_ID}.json'
+        health_state_path = Path(DRIVE_ROOT) / 'logs' / 'pipeline' / f'health_snapshot_{GLOBAL_TARGET_ID}_{WORKER_TAG}.json'
 
         def _load_json_retry(path: Path, retries: int = 6, wait_seconds: float = 0.25, default=None):
             fallback = {} if default is None else default
@@ -1414,9 +1414,17 @@ cells = [
         previous = _load_json_retry(health_state_path, default={})
         prev_ts = float(previous.get('ts', 0.0) or 0.0)
         elapsed = max(0.0, current['ts'] - prev_ts) if prev_ts > 0 else 0.0
-        delta_global_samples = int(current['global_samples'] - int(previous.get('global_samples', 0) or 0))
-        delta_global_games = int(current['global_games'] - int(previous.get('global_games', 0) or 0))
-        delta_build_total = int(current['build_total'] - int(previous.get('build_total', 0) or 0))
+        previous_global_samples = int(previous.get('global_samples', 0) or 0)
+        previous_global_games = int(previous.get('global_games', 0) or 0)
+        previous_build_total = int(previous.get('build_total', 0) or 0)
+        delta_global_samples = int(current['global_samples'] - previous_global_samples)
+        delta_global_games = int(current['global_games'] - previous_global_games)
+        delta_build_total = int(current['build_total'] - previous_build_total)
+        regression_detected = (
+            delta_global_samples < 0
+            or delta_global_games < 0
+            or delta_build_total < 0
+        )
 
         health_state_path.parent.mkdir(parents=True, exist_ok=True)
         health_state_path.write_text(json.dumps(current, indent=2, ensure_ascii=True), encoding='utf-8')
@@ -1429,6 +1437,8 @@ cells = [
         health = 'ok'
         if len(active_rows) == 0:
             health = 'critical'
+        elif regression_detected:
+            health = 'warning'
         elif elapsed > 0 and delta_global_samples <= 0 and delta_build_total <= 0:
             health = 'warning'
 
@@ -1444,6 +1454,11 @@ cells = [
             )
         else:
             print('TREND: premier snapshot (relance la cellule pour voir les deltas)')
+        if regression_detected:
+            print(
+                'TREND_NOTE: regression detectee (lecture/lag multi-Colab possible). '
+                'Verifier avec la cellule Workers global qui reste la reference principale.'
+            )
 
         for row in active_rows[:5]:
             print(
