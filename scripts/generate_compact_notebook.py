@@ -890,15 +890,22 @@ cells = [
 
         registry_path = Path(DRIVE_ROOT) / 'data' / 'dataset_registry.json'
 
-        def _load_json_retry(path: Path, retries: int = 6, wait_seconds: float = 0.25):
+        def _load_json_retry(path: Path, retries: int = 6, wait_seconds: float = 0.25, default=None):
+            fallback = {} if default is None else default
             last_exc = None
-            for _ in range(retries):
+            for attempt in range(retries):
                 try:
                     return json.loads(path.read_text(encoding='utf-8'))
+                except (FileNotFoundError, OSError):
+                    if attempt + 1 >= retries:
+                        return fallback
+                    time.sleep(wait_seconds)
                 except json.JSONDecodeError as exc:
                     last_exc = exc
                     time.sleep(wait_seconds)
-            raise last_exc
+            if last_exc is not None:
+                return fallback
+            return fallback
 
         if not registry_path.exists():
             print('dataset_registry.json introuvable:', registry_path)
@@ -943,15 +950,22 @@ cells = [
         registry_path = Path(DRIVE_ROOT) / 'data' / 'dataset_registry.json'
         jobs_root = Path(DRIVE_ROOT) / 'jobs'
 
-        def _load_json_retry(path: Path, retries: int = 6, wait_seconds: float = 0.25):
+        def _load_json_retry(path: Path, retries: int = 6, wait_seconds: float = 0.25, default=None):
+            fallback = {} if default is None else default
             last_exc = None
-            for _ in range(retries):
+            for attempt in range(retries):
                 try:
                     return json.loads(path.read_text(encoding='utf-8'))
+                except (FileNotFoundError, OSError):
+                    if attempt + 1 >= retries:
+                        return fallback
+                    time.sleep(wait_seconds)
                 except json.JSONDecodeError as exc:
                     last_exc = exc
                     time.sleep(wait_seconds)
-            raise last_exc
+            if last_exc is not None:
+                return fallback
+            return fallback
 
         def _safe_pct(value: int, target: int) -> float:
             if target <= 0:
@@ -1014,15 +1028,22 @@ cells = [
         global_progress_path = Path(DRIVE_ROOT) / 'data' / 'global_generation_progress' / f'{GLOBAL_TARGET_ID}.json'
         registry_path = Path(DRIVE_ROOT) / 'data' / 'dataset_registry.json'
 
-        def _load_json_retry(path: Path, retries: int = 6, wait_seconds: float = 0.25):
+        def _load_json_retry(path: Path, retries: int = 6, wait_seconds: float = 0.25, default=None):
+            fallback = {} if default is None else default
             last_exc = None
-            for _ in range(retries):
+            for attempt in range(retries):
                 try:
                     return json.loads(path.read_text(encoding='utf-8'))
+                except (FileNotFoundError, OSError):
+                    if attempt + 1 >= retries:
+                        return fallback
+                    time.sleep(wait_seconds)
                 except json.JSONDecodeError as exc:
                     last_exc = exc
                     time.sleep(wait_seconds)
-            raise last_exc
+            if last_exc is not None:
+                return fallback
+            return fallback
 
         def _safe_pct(value: int, target: int) -> float:
             if target <= 0:
@@ -1084,15 +1105,22 @@ cells = [
         ACTIVE_THRESHOLD_SECONDS = 600
         global_progress_path = Path(DRIVE_ROOT) / 'data' / 'global_generation_progress' / f'{GLOBAL_TARGET_ID}.json'
 
-        def _load_json_retry(path: Path, retries: int = 6, wait_seconds: float = 0.25):
+        def _load_json_retry(path: Path, retries: int = 6, wait_seconds: float = 0.25, default=None):
+            fallback = {} if default is None else default
             last_exc = None
-            for _ in range(retries):
+            for attempt in range(retries):
                 try:
                     return json.loads(path.read_text(encoding='utf-8'))
+                except (FileNotFoundError, OSError):
+                    if attempt + 1 >= retries:
+                        return fallback
+                    time.sleep(wait_seconds)
                 except json.JSONDecodeError as exc:
                     last_exc = exc
                     time.sleep(wait_seconds)
-            raise last_exc
+            if last_exc is not None:
+                return fallback
+            return fallback
 
         def _parse_iso_to_epoch(value: object) -> float:
             text = str(value or '').strip()
