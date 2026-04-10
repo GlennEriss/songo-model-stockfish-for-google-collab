@@ -84,10 +84,18 @@ def _update_model_card_after_evaluation(models_root: Path, model_id: str, summar
 def run_evaluation(job: JobContext) -> dict[str, object]:
     cfg = job.config.get("evaluation", {})
     runtime_cfg = job.config.get("runtime", {})
+    firestore_cfg = {
+        "backend": str(cfg.get("dataset_registry_backend", cfg.get("global_progress_backend", "file"))).strip().lower() or "file",
+        "project_id": str(cfg.get("dataset_registry_firestore_project_id", cfg.get("global_progress_firestore_project_id", ""))).strip(),
+        "collection": str(cfg.get("dataset_registry_firestore_collection", "dataset_registry")).strip() or "dataset_registry",
+        "document": str(cfg.get("dataset_registry_firestore_document", "primary")).strip() or "primary",
+        "credentials_path": str(cfg.get("dataset_registry_firestore_credentials_path", cfg.get("global_progress_firestore_credentials_path", ""))).strip(),
+        "api_key": str(cfg.get("dataset_registry_firestore_api_key", cfg.get("global_progress_firestore_api_key", ""))).strip(),
+    }
     model_id, checkpoint_path = _resolve_evaluation_target(job, cfg)
     dataset_selection_mode = str(cfg.get("dataset_selection_mode", "configured")).strip().lower() or "configured"
     if dataset_selection_mode == "largest_built":
-        selected_dataset = _select_largest_built_dataset(job.paths.data_root)
+        selected_dataset = _select_largest_built_dataset(job.paths.data_root, firestore_cfg=firestore_cfg)
         dataset_id = str(selected_dataset.get("dataset_id", "dataset_v1"))
         selected_output_dir = Path(str(selected_dataset["output_dir"]))
         test_dataset_path = selected_output_dir / "test.npz"
@@ -104,7 +112,7 @@ def run_evaluation(job: JobContext) -> dict[str, object]:
         dataset_id = str(cfg.get("dataset_id", "dataset_v1"))
         configured_test_dataset_path = str(cfg.get("test_dataset_path", "")).strip()
         if dataset_id not in {"", "auto"} and not configured_test_dataset_path:
-            selected_dataset = _resolve_built_dataset_by_id(job.paths.data_root, dataset_id)
+            selected_dataset = _resolve_built_dataset_by_id(job.paths.data_root, dataset_id, firestore_cfg=firestore_cfg)
             selected_output_dir = Path(str(selected_dataset["output_dir"]))
             test_dataset_path = selected_output_dir / "test.npz"
             dataset_resolution = {
