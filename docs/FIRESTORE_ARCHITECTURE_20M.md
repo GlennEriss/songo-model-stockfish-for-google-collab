@@ -1,234 +1,208 @@
-# Firestore Architecture 20M
+# Multi-Colab Architecture 20M (Drive + Firestore + Redis)
 
 ## 1. Objectif
 
-Definir une architecture multi-Colab claire, robuste et economique en quota pour atteindre `20_000_000` samples sans divergence d'etat entre workers.
+Definir une architecture multi-Colab claire et scalable pour atteindre `20_000_000` samples, en reduisant les quotas Firestore sans perdre la reprise fiable.
 
-Ce document fixe:
+## 2. Architecture cible
 
-- la separation des responsabilites (data plane vs control plane)
-- ce qui doit etre ecrit dans Firestore, et a quelle frequence
-- le mode economique quota par defaut
-- le plan d'implementation P0/P1/P2
+### 2.1 Data plane
 
-## 2. Constats Actuels
+- Google Drive = artefacts lourds:
+  - raw/sampled/labeled JSONL
+  - datasets NPZ
+  - checkpoints modeles
+  - logs et rapports
 
-### 2.1 Ce qui marche deja
+### 2.2 Control plane durable
 
-- Firestore est deja utilise comme source de verite pour:
-  - `global_generation_progress`
-  - `dataset_registry`
-  - `worker_leases`
-  - `pipeline_manifests`
-  - `worker_checkpoints`
-- Le mode `global_budget_enforcement_mode=batched` existe et reduit fortement les ecritures globales.
-- Le notebook compact expose deja un `LOW_QUOTA_PROFILE`.
+- Firestore = source de verite durable:
+  - `global_generation_progress/{global_target_id}`
+  - `dataset_registry/primary`
+  - `worker_checkpoints/{job_id}`
+  - `worker_leases/{global_target_id}`
+  - `pipeline_manifests/{worker_tag}`
 
-### 2.2 Ce qui cree encore des tensions de quota
+### 2.3 Real-time plane
 
-- Trop d'ecritures checkpoint si `write_state()` est appele tres souvent (notamment pendant `dataset-build`).
-- Trop de lectures quand plusieurs Colabs monitorent en parallele avec polling court.
-- Des writes utiles mais non critiques (ex: manifest Firestore tres frequent) peuvent etre desactives ou reduites.
+- Redis = couche temps reel:
+  - compteurs frequents (`samples`, `games`, heartbeat)
+  - leases/locks rapides
+  - cache de lecture pour monitoring
+  - pub/sub pour dashboard live
 
-### 2.3 Pourquoi les valeurs divergent entre Colabs
+Regle:
 
-- Chaque Colab lit a un instant different.
-- Si un worker est stale/inactif, il reste visible dans l'etat global.
-- Si des cellules de monitoring tournent en parallele, elles peuvent afficher des snapshots differents de quelques secondes.
+- Redis ne remplace pas Firestore comme source durable.
+- Firestore ne doit pas etre pollue par des ecritures ultra frequentes.
 
-Ce comportement est normal tant que:
+## 3. Repartition des ecritures
 
-- les compteurs globaux sont monotones
-- l'etat converge en quelques polls
-- un seul backend vivant fait foi (Firestore)
+### 3.1 Ecritures frequentes -> Redis
 
-## 3. Architecture Cible
+- increment par game terminee
+- heartbeat worker
+- etat court terme de progression
 
-## 3.1 Principe directeur
+### 3.2 Ecritures consolidees -> Firestore
 
-- Google Drive = `data plane` (fichiers lourds: raw/sampled/labeled/checkpoints/modeles/logs).
-- Firestore = `control plane` (etat vivant, coordination, reprise, monitoring).
+- flush periodique depuis Redis vers Firestore
+- snapshots registry/checkpoints/throughput
+- transitions critiques (`running`, `failed`, `completed`)
 
-Firestore ne stocke jamais les donnees lourdes de dataset, uniquement des metadonnees et des compteurs.
+Cadence recommandee:
 
-## 3.2 Collections Firestore (source de verite)
+- flush Redis -> Firestore toutes `60` a `120` secondes
+- ou tous `N` games/fichiers (batch)
 
-1. `global_generation_progress/{GLOBAL_TARGET_ID}`
-- role: compteur global cross-workers
-- champs: `target_samples`, `total_samples`, `total_games`, `workers`, `updated_at`
-- ecrit par: workers `dataset-generate`
-- cadence: batch par `g` games, pas par game
+## 3.3 Mode d'execution par blocs de matchs
 
-2. `worker_leases/{GLOBAL_TARGET_ID}`
-- role: attribution de `WORKER_INDEX` et protection anti-collision
-- champs: `leases.{worker_tag}.index`, `updated_at`
-- ecrit par: bootstrap notebook (auto-assign)
-- cadence: faible (startup/restart)
+Strategie recommande pour multi-Colab (5 -> 20 workers):
 
-3. `dataset_registry/primary`
-- role: registre unique des `dataset_sources` et `built_datasets`
-- ecrit par: `dataset-generate`, `dataset-build`, `dataset-merge-final`
-- cadence: snapshots partiels + completions
+1. Un worker prend un bloc de matchup (ex: `minimax:medium vs mcts:insane`) avec un quota de games (ex: `500`).
+2. Il joue ces games localement avec son parallellisme interne (ex: `16` parties en parallele).
+3. Pendant ce bloc, il ecrit uniquement ses artefacts dans ses dossiers worker sur Drive (pas de melange direct avec les autres).
+4. Un autre worker prend un autre bloc matchup libre (ex: `minimax:medium vs minimax:beginner`).
+5. En fin de bloc (`500/500`), le worker publie son mini-dataset et lance la fusion vers le dataset principal.
+6. Une fois fusion terminee et committee, le worker prend un nouveau bloc matchup.
 
-4. `worker_checkpoints/{job_id}`
-- role: reprise fine d'un job (status/state)
-- ecrit par: `JobContext` (`write_status`, `write_state`, `set_phase`)
-- cadence cible: throttlee (voir section 6)
+Regle de gouvernance:
 
-5. `pipeline_manifests/{WORKER_TAG}`
-- role: pid/log paths du pipeline lance
-- ecrit par: notebook launch
-- cadence: lancement uniquement (ou changement majeur)
+- un bloc matchup actif ne doit pas etre pris par deux workers simultanement
+- allocation/lease du bloc geree via `worker_leases`
+- completion du bloc marquee explicitement dans l'etat global
 
-## 3.3 Regles de coherence
+## 4. Règles notebook anti-energie
 
-- Firestore doit etre le seul backend vivant pour l'etat runtime.
-- Les compteurs doivent etre monotones (jamais de decrement visible hors rollback explicite).
-- Les updates doivent etre idempotentes (rejouables sans corruption).
-- Les metadonnees doivent pointer vers des chemins Drive stables.
+Pour eviter les cellules energivores:
 
-## 4. Budget Quota (modele simple)
+1. Un seul notebook "monitor live" actif.
+2. Les notebooks workers ne font pas de polling Firestore en boucle.
+3. Monitoring lit Redis en priorite, Firestore seulement pour verification/snapshot.
+4. Pas d'ecriture Firestore depuis des cellules bouclees sauf cellule de consolidation dediee.
 
-## 4.1 Glossaire des variables
+## 4.1 Frequence de mise a jour globale (recommandation)
 
-- `g`: `GLOBAL_PROGRESS_FLUSH_EVERY_N_GAMES`
-- `b`: `DATASET_BUILD_EXPORT_PARTIAL_EVERY_N_FILES`
-- `c`: checkpoint flush interval (a introduire) en nb de fichiers ou secondes
-- `m`: intervalle de monitoring en secondes
-- `W`: nombre de workers Colab actifs
+Ne pas choisir "uniquement 30 min" ni "uniquement fin de bloc".  
+Le modele robuste est hybride:
 
-## 4.2 Formules d'ordre de grandeur
+- micro-batch periodique pendant execution (toutes `N` games finies ou `60..120s`)
+- update finale obligatoire a la fin de chaque bloc (`500/500`)
+- update supplementaire sur evenements critiques (`failed`, `recovered`, `merged`)
 
-1. Ecritures progression globale:
-- `writes_global ~= total_games / g`
+Ce modele donne:
 
-2. Ecritures snapshots build partiels:
-- `writes_build_partial ~= total_labeled_files / b`
+- visibilite quasi temps reel
+- quota controle
+- etat global coherent meme si un worker tombe avant fin de bloc
 
-3. Ecritures checkpoints:
-- actuel: proche de `O(total_files)` si write per file
-- cible: `writes_checkpoints ~= total_labeled_files / c` (ou `runtime_seconds / c_seconds`)
+## 5. Quota model (ordre de grandeur)
 
-4. Lectures monitoring:
-- `reads_monitor ~= monitors * docs_per_loop * (86400 / m)`
+Variables:
 
-## 4.3 Exemple 20M (ordre de grandeur)
+- `g`: flush global progress (games)
+- `b`: partial export build (files)
+- `f`: flush Redis -> Firestore (secondes)
+- `m`: refresh monitor (secondes)
+- `W`: nombre de workers
 
-Hypothese de travail:
+Approx:
 
-- `20_000_000` samples
-- ~`300` samples/game en moyenne
-- donc ~`66_667` games total
+- `writes_firestore_global ~= total_games / g`
+- `writes_firestore_build ~= total_files / b`
+- `writes_firestore_consolidation ~= 86400 / f`
+- `reads_firestore_monitor ~= monitors * docs_per_loop * (86400 / m)`
 
-Avec `g=200`:
+Redis absorbe la frequence elevee qui sinon saturerait Firestore.
 
-- `writes_global ~= 66_667 / 200 ~= 334` writes (ordre de grandeur, cluster total)
-
-Si `b=500` et ~`66_000` fichiers labels:
-
-- `writes_build_partial ~= 66_000 / 500 ~= 132`
-
-Si `c=100`:
-
-- `writes_checkpoints ~= 66_000 / 100 ~= 660`
-
-Conclusion: le vrai levier quota est la reduction des writes checkpoint et du polling monitor.
-
-## 5. Parametres Recommandes (mode economique)
-
-Profil recommande pour multi-Colab:
+## 6. Parametres cibles (20M)
 
 - `GLOBAL_BUDGET_ENFORCEMENT_MODE='batched'`
 - `GLOBAL_PROGRESS_FLUSH_EVERY_N_GAMES=200`
-- `GLOBAL_TARGET_POLL_INTERVAL_SECONDS=60`
-- `SOURCE_POLL_INTERVAL_SECONDS=45` (ou `60`)
-- `DATASET_BUILD_EXPORT_PARTIAL_EVERY_N_FILES=200` a `500`
-- `MONITOR_REFRESH_SECONDS=90` a `120`
-- `PIPELINE_MANIFEST_FIRESTORE_WRITE_ENABLED=False` (sauf besoin debug)
+- `DATASET_BUILD_EXPORT_PARTIAL_EVERY_N_FILES=200..500`
+- `MONITOR_REFRESH_SECONDS=90..120`
+- `SOURCE_POLL_INTERVAL_SECONDS=45..60`
+- `PIPELINE_MANIFEST_FIRESTORE_WRITE_ENABLED=false`
+- `REDIS_SYNC_FLUSH_SECONDS=60..120`
+- `MATCHUP_BLOCK_GAMES=200..500` (recommande `500`)
+- `WORKER_PARALLEL_GAMES=8..16` selon CPU
 
-Et ajout recommande (P1):
+## 7. Plan d'implementation doc-first
 
-- `WORKER_CHECKPOINT_FLUSH_EVERY_N_FILES=100`
-- `WORKER_CHECKPOINT_FLUSH_INTERVAL_SECONDS=60`
-- flush force sur `start`, `phase_change`, `completed`, `failed`
+### P0
 
-## 6. Plan D'Implementation
+- figer l'architecture Drive + Firestore + Redis dans la doc
+- definir la gouvernance des ecritures (qui ecrit quoi, ou, et quand)
 
-## P0 (priorite immediate)
+### P1
 
-Objectif: supprimer les causes majeures de quota sans changer le comportement metier.
+- introduire client Redis + schema de cles
+- router compteurs frequents vers Redis
+- garder Firestore pour snapshots consolides
 
-Actions:
+### P2
 
-1. Conserver Firestore comme backend runtime unique.
-2. Garder `global progress` en mode batched (`g>=200`).
-3. Garder `manifest Firestore` optionnel/desactive par defaut.
-4. Limiter monitoring live a un seul Colab "observateur".
+- throttler `worker_checkpoints`
+- monitor unique Redis-first
+- alertes stale worker / lag consolidation
 
-Definition of done P0:
+### P3 (optimisations restantes prioritaires)
 
-- plus de regressions de compteur dues a multi-sources
-- chute nette des writes/reads Firestore journaliers
+1. Throttle strict des `worker_checkpoints`
+- ne pas ecrire Firestore a chaque fichier
+- flush checkpoint toutes `60..120s` ou tous `N` fichiers
+- flush force sur transitions critiques (`phase`, `failed`, `completed`)
 
-## P1 (checkpointing robuste et economique)
+2. Reduction des writes `dataset_registry`
+- update uniquement en micro-batch + fin de bloc
+- eviter les updates "cosmetiques" intermediaires
 
-Objectif: garder une reprise exacte sans write Firestore par fichier.
+3. Consolidateur unique Redis -> Firestore
+- un seul writer de consolidation actif a la fois
+- lock distribue pour eviter les double writes concurrentes
 
-Actions:
+4. Merge idempotent des mini-datasets
+- chaque bloc a un `block_id` unique
+- une fusion deja marquee `merged` ne doit pas etre rejouee
 
-1. Ajouter un buffer checkpoint dans `JobContext`:
-  - accumuler updates locales
-  - flush sur timer ou palier (fichiers/games)
-2. Flush force sur evenements critiques:
-  - `write_status(running/completed/failed)`
-  - changement de phase
-  - exception non geree
-3. Garder la reprise exacte via state local Drive + checkpoint Firestore throttle.
+5. Durcissement des leases matchup
+- lease TTL + heartbeat
+- reprise automatique des blocs stale
+- prevention explicite des collisions de bloc actif
 
-Definition of done P1:
+6. Monitoring notebook optimise
+- cache local (memo courte) pour eviter relectures inutiles
+- une seule session monitor live en continu
 
-- aucune perte de reprise apres interruption
-- writes checkpoint reduites d'un facteur important (x10 a x100 selon runs)
+7. Alerting operationnel
+- alerte worker stale
+- alerte lag de consolidation
+- alerte quota approaching (read/write)
 
-## P2 (monitoring unifie Firestore)
+## 8. Schema de cles Redis (propose)
 
-Objectif: arreter le polling redondant et clarifier la lecture de l'etat global.
+- `songo:global:{target_id}:samples` (counter)
+- `songo:global:{target_id}:games` (counter)
+- `songo:worker:{worker_tag}:heartbeat` (ttl key)
+- `songo:worker:{worker_tag}:samples` (counter)
+- `songo:worker:{worker_tag}:games` (counter)
+- `songo:sync:{target_id}:last_flush_ts` (timestamp)
+- `songo:block:{target_id}:{block_id}:status` (`running|completed|merged|failed`)
+- `songo:block:{target_id}:{block_id}:progress` (`games_done`, `samples_done`)
+- `songo:matchup:{target_id}:{matchup_id}:lease` (ttl lease)
+- `songo:lock:{target_id}:consolidation` (distributed lock)
+- `songo:alert:{target_id}:stale_workers` (set/list)
+- `songo:alert:{target_id}:consolidation_lag` (value)
 
-Actions:
+## 9. Source de verite et reprise
 
-1. Un seul notebook monitor lit Firestore en boucle.
-2. Les notebooks workers n'executent pas les cellules de monitoring continue.
-3. Ajouter un resume compact:
-  - workers actifs/inactifs
-  - trend 5 min
-  - alertes quota/latence
-4. Documenter runbook operator:
-  - qui lance
-  - qui monitor
-  - qui relance un worker stale
+- Reprise durable: Firestore + fichiers Drive.
+- Redis peut etre perdu sans perte de verite durable, car la consolidation periodique persiste l'etat dans Firestore.
 
-Definition of done P2:
+## 10. Decision
 
-- lecture globale stable, sans "bruit" multi-monitors
-- baisse nette des reads Firestore
+Pour la cible 20M et 5 -> 20 Colabs:
 
-## 7. Runbook Multi-Colab Recommande
-
-1. Mettre les credentials Firestore dans Drive (`/content/drive/MyDrive/songo-stockfish/secrets/...json`).
-2. Exporter ce chemin dans `FIRESTORE_CREDENTIALS_PATH` sur chaque Colab.
-3. Lancer workers avec `LOW_QUOTA_PROFILE=True`.
-4. Garder une seule session avec cellules monitor live.
-5. Si un worker devient stale:
-  - verifier logs pipeline
-  - relancer seulement ce worker
-  - ne pas redemarrer tous les workers inutilement.
-
-## 8. Limites et Evolution Future
-
-- Firestore suffit pour ce niveau (5 a 10 Colabs) si writes/reads sont throttlees.
-- Redis/Kafka ne deviennent utiles que si:
-  - tres forte frequence evenementielle
-  - besoin de streaming sub-second
-  - beaucoup plus de workers concurrents
-
-Pour la cible actuelle 20M, la priorite est l'architecture economique ci-dessus, pas un changement de stack.
+- architecture officielle = Drive + Firestore + Redis
+- Firestore reste le registre durable
+- Redis devient la couche temps reel par defaut

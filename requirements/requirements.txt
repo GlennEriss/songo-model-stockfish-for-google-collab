@@ -3,3 +3,4 @@ numpy>=1.26
 tqdm>=4.66
 torch>=2.2
 google-cloud-firestore>=2.16
+upstash-redis>=1.4.0

@@ -166,6 +166,11 @@ cells = [
         FIRESTORE_WORKER_LEASES_COLLECTION = 'worker_leases'
         FIRESTORE_PIPELINE_MANIFESTS_COLLECTION = 'pipeline_manifests'
         FIRESTORE_WORKER_CHECKPOINTS_COLLECTION = 'worker_checkpoints'
+        GLOBAL_PROGRESS_REDIS_ENABLED = True
+        GLOBAL_PROGRESS_REDIS_URL = os.environ.get('UPSTASH_REDIS_REST_URL', '').strip()
+        GLOBAL_PROGRESS_REDIS_TOKEN = os.environ.get('UPSTASH_REDIS_REST_TOKEN', '').strip()
+        GLOBAL_PROGRESS_REDIS_KEY_PREFIX = f'songo:{GLOBAL_TARGET_ID}'
+        GLOBAL_PROGRESS_REDIS_CACHE_TTL_SECONDS = 120
         SOURCE_POLL_INTERVAL_SECONDS = 20
         DATASET_BUILD_EXPORT_PARTIAL_EVERY_N_FILES = 20
         MONITOR_REFRESH_SECONDS = 15
@@ -180,6 +185,7 @@ cells = [
             MONITOR_REFRESH_SECONDS = float(LOW_QUOTA_MONITOR_REFRESH_SECONDS)
             MONITOR_MAX_LOOPS = int(LOW_QUOTA_MONITOR_MAX_LOOPS)
             PIPELINE_MANIFEST_FIRESTORE_WRITE_ENABLED = bool(LOW_QUOTA_WRITE_PIPELINE_MANIFEST_FIRESTORE)
+            GLOBAL_PROGRESS_REDIS_CACHE_TTL_SECONDS = max(120, int(GLOBAL_PROGRESS_REDIS_CACHE_TTL_SECONDS))
         if str(GLOBAL_PROGRESS_BACKEND).strip().lower() != 'firestore':
             raise ValueError("GLOBAL_PROGRESS_BACKEND doit rester 'firestore' (fallback fichier desactive).")
         DATASET_GENERATE_WORKERS = 16
@@ -220,6 +226,7 @@ cells = [
 
         import hashlib
         import json
+        import os
         import re
         import socket
         import time
@@ -347,6 +354,33 @@ cells = [
                 'updated_at': str(raw.get('updated_at', '<none>') or '<none>'),
             }
 
+        def _read_global_progress_from_redis(*, global_target_id: str, target_samples: int) -> dict | None:
+            if not bool(GLOBAL_PROGRESS_REDIS_ENABLED):
+                return None
+            redis_url = str(GLOBAL_PROGRESS_REDIS_URL).strip()
+            redis_token = str(GLOBAL_PROGRESS_REDIS_TOKEN).strip()
+            if not redis_url or not redis_token:
+                return None
+            try:
+                from upstash_redis import Redis
+                redis_client = Redis(url=redis_url, token=redis_token)
+                key_prefix = str(GLOBAL_PROGRESS_REDIS_KEY_PREFIX).strip() or f'songo:{global_target_id}'
+                key = f'{key_prefix}:global_progress'
+                raw_payload = redis_client.get(key)
+                if raw_payload is None:
+                    return None
+                if isinstance(raw_payload, str):
+                    payload = json.loads(raw_payload)
+                elif isinstance(raw_payload, dict):
+                    payload = raw_payload
+                else:
+                    return None
+                if not isinstance(payload, dict):
+                    return None
+                return _normalize_global_payload(payload, int(target_samples))
+            except Exception:
+                return None
+
         def _firestore_monitor_debug_context(*, global_target_id: str) -> dict:
             credentials_path = str(FIRESTORE_CREDENTIALS_PATH).strip()
             api_key = str(FIRESTORE_API_KEY).strip()
@@ -394,6 +428,12 @@ cells = [
                 'workers': {},
                 'updated_at': '<none>',
             }
+            redis_payload = _read_global_progress_from_redis(
+                global_target_id=str(global_target_id),
+                target_samples=int(target_samples),
+            )
+            if redis_payload is not None:
+                return redis_payload
             backend = str(GLOBAL_PROGRESS_BACKEND).strip().lower()
             if backend == 'firestore':
                 debug_context = _firestore_monitor_debug_context(global_target_id=str(global_target_id))
@@ -726,6 +766,11 @@ cells = [
         print('FIRESTORE_CREDENTIALS_PATH =', FIRESTORE_CREDENTIALS_PATH)
         print('FIRESTORE_CREDENTIALS_EXISTS =', Path(str(FIRESTORE_CREDENTIALS_PATH)).exists())
         print('FIRESTORE_API_KEY_SET    =', bool(str(FIRESTORE_API_KEY).strip()))
+        print('GLOBAL_PROGRESS_REDIS_ENABLED =', GLOBAL_PROGRESS_REDIS_ENABLED)
+        print('GLOBAL_PROGRESS_REDIS_URL_SET =', bool(str(GLOBAL_PROGRESS_REDIS_URL).strip()))
+        print('GLOBAL_PROGRESS_REDIS_TOKEN_SET =', bool(str(GLOBAL_PROGRESS_REDIS_TOKEN).strip()))
+        print('GLOBAL_PROGRESS_REDIS_KEY_PREFIX =', GLOBAL_PROGRESS_REDIS_KEY_PREFIX)
+        print('GLOBAL_PROGRESS_REDIS_CACHE_TTL_SECONDS =', GLOBAL_PROGRESS_REDIS_CACHE_TTL_SECONDS)
         print('DATASET_GENERATE_JOB_ID =', DATASET_GENERATE_JOB_ID)
         print('DATASET_BUILD_JOB_ID    =', DATASET_BUILD_JOB_ID)
         print('TRAIN_CONTINUE_JOB_ID   =', TRAIN_CONTINUE_JOB_ID)
@@ -1097,6 +1142,11 @@ cells = [
         generate_block['global_progress_firestore_document'] = str(FIRESTORE_DOCUMENT)
         generate_block['global_progress_firestore_credentials_path'] = str(FIRESTORE_CREDENTIALS_PATH)
         generate_block['global_progress_firestore_api_key'] = str(FIRESTORE_API_KEY)
+        generate_block['global_progress_redis_enabled'] = bool(GLOBAL_PROGRESS_REDIS_ENABLED)
+        generate_block['global_progress_redis_url'] = str(GLOBAL_PROGRESS_REDIS_URL)
+        generate_block['global_progress_redis_token'] = str(GLOBAL_PROGRESS_REDIS_TOKEN)
+        generate_block['global_progress_redis_key_prefix'] = str(GLOBAL_PROGRESS_REDIS_KEY_PREFIX)
+        generate_block['global_progress_redis_cache_ttl_seconds'] = int(GLOBAL_PROGRESS_REDIS_CACHE_TTL_SECONDS)
         generate_block['dataset_registry_backend'] = str(GLOBAL_PROGRESS_BACKEND)
         generate_block['dataset_registry_firestore_project_id'] = str(FIRESTORE_PROJECT_ID)
         generate_block['dataset_registry_firestore_collection'] = str(FIRESTORE_DATASET_REGISTRY_COLLECTION)
@@ -1132,6 +1182,11 @@ cells = [
         build_block['global_target_progress_firestore_document'] = str(FIRESTORE_DOCUMENT)
         build_block['global_target_progress_firestore_credentials_path'] = str(FIRESTORE_CREDENTIALS_PATH)
         build_block['global_target_progress_firestore_api_key'] = str(FIRESTORE_API_KEY)
+        build_block['global_target_progress_redis_enabled'] = bool(GLOBAL_PROGRESS_REDIS_ENABLED)
+        build_block['global_target_progress_redis_url'] = str(GLOBAL_PROGRESS_REDIS_URL)
+        build_block['global_target_progress_redis_token'] = str(GLOBAL_PROGRESS_REDIS_TOKEN)
+        build_block['global_target_progress_redis_key_prefix'] = str(GLOBAL_PROGRESS_REDIS_KEY_PREFIX)
+        build_block['global_target_progress_redis_cache_ttl_seconds'] = int(GLOBAL_PROGRESS_REDIS_CACHE_TTL_SECONDS)
         build_block['dataset_registry_backend'] = str(GLOBAL_PROGRESS_BACKEND)
         build_block['dataset_registry_firestore_project_id'] = str(FIRESTORE_PROJECT_ID)
         build_block['dataset_registry_firestore_collection'] = str(FIRESTORE_DATASET_REGISTRY_COLLECTION)

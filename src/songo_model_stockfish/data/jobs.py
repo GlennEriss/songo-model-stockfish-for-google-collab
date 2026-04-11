@@ -120,6 +120,45 @@ def _resolve_global_progress_backend_config(
             cfg.get("global_target_progress_firestore_api_key", os.environ.get("FIREBASE_API_KEY", "")),
         )
     ).strip()
+    redis_enabled = bool(
+        cfg.get(
+            "global_progress_redis_enabled",
+            cfg.get("global_target_progress_redis_enabled", False),
+        )
+    )
+    redis_url = str(
+        cfg.get(
+            "global_progress_redis_url",
+            cfg.get(
+                "global_target_progress_redis_url",
+                os.environ.get("UPSTASH_REDIS_REST_URL", ""),
+            ),
+        )
+    ).strip()
+    redis_token = str(
+        cfg.get(
+            "global_progress_redis_token",
+            cfg.get(
+                "global_target_progress_redis_token",
+                os.environ.get("UPSTASH_REDIS_REST_TOKEN", ""),
+            ),
+        )
+    ).strip()
+    redis_key_prefix = str(
+        cfg.get(
+            "global_progress_redis_key_prefix",
+            cfg.get("global_target_progress_redis_key_prefix", f"songo:{global_target_id}"),
+        )
+    ).strip() or f"songo:{global_target_id}"
+    redis_cache_ttl_seconds = max(
+        1,
+        int(
+            cfg.get(
+                "global_progress_redis_cache_ttl_seconds",
+                cfg.get("global_target_progress_redis_cache_ttl_seconds", 120),
+            )
+        ),
+    )
     return {
         "backend": "firestore" if use_firestore else "file",
         "global_target_id": str(global_target_id),
@@ -129,6 +168,11 @@ def _resolve_global_progress_backend_config(
         "firestore_document": document,
         "firestore_credentials_path": credentials_path,
         "firestore_api_key": api_key,
+        "redis_enabled": bool(redis_enabled),
+        "redis_url": redis_url,
+        "redis_token": redis_token,
+        "redis_key_prefix": redis_key_prefix,
+        "redis_cache_ttl_seconds": int(redis_cache_ttl_seconds),
     }
 
 
@@ -183,6 +227,9 @@ def _firestore_backend_diagnostics(progress_backend: dict[str, Any] | None) -> d
         "credentials_path": credentials_path,
         "credentials_path_exists": bool(Path(credentials_path).exists()) if credentials_path else False,
         "api_key_set": bool(api_key),
+        "redis_enabled": bool(backend.get("redis_enabled", False)),
+        "redis_url_set": bool(str(backend.get("redis_url", "")).strip()),
+        "redis_token_set": bool(str(backend.get("redis_token", "")).strip()),
     }
 
 
@@ -294,6 +341,93 @@ def _build_firestore_progress_endpoint(
     return client, doc_ref, firestore
 
 
+@functools.lru_cache(maxsize=16)
+def _build_redis_progress_client(redis_url: str, redis_token: str):
+    url = str(redis_url).strip()
+    token = str(redis_token).strip()
+    if not url or not token:
+        return None
+    from upstash_redis import Redis
+
+    return Redis(url=url, token=token)
+
+
+def _resolve_redis_progress_client(progress_backend: dict[str, Any] | None):
+    backend = progress_backend if isinstance(progress_backend, dict) else {}
+    if not bool(backend.get("redis_enabled", False)):
+        return None
+    redis_url = str(backend.get("redis_url", "")).strip()
+    redis_token = str(backend.get("redis_token", "")).strip()
+    if not redis_url or not redis_token:
+        return None
+    try:
+        return _build_redis_progress_client(redis_url, redis_token)
+    except Exception:
+        return None
+
+
+def _redis_global_progress_key(progress_backend: dict[str, Any] | None, global_target_id: str) -> str:
+    backend = progress_backend if isinstance(progress_backend, dict) else {}
+    prefix = str(backend.get("redis_key_prefix", "")).strip() or f"songo:{global_target_id}"
+    return f"{prefix}:global_progress"
+
+
+def _read_global_generation_progress_redis_cache(
+    *,
+    global_target_id: str,
+    target_samples: int,
+    progress_backend: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    backend = progress_backend if isinstance(progress_backend, dict) else {}
+    client = _resolve_redis_progress_client(backend)
+    if client is None:
+        return None
+    key = _redis_global_progress_key(backend, global_target_id)
+    try:
+        raw_payload = client.get(key)
+    except Exception:
+        return None
+    if raw_payload is None:
+        return None
+    payload: dict[str, Any] | None = None
+    if isinstance(raw_payload, dict):
+        payload = raw_payload
+    elif isinstance(raw_payload, str):
+        try:
+            parsed = json.loads(raw_payload)
+            if isinstance(parsed, dict):
+                payload = parsed
+        except Exception:
+            payload = None
+    if payload is None:
+        return None
+    return _normalize_global_generation_state_payload(
+        payload=payload,
+        global_target_id=global_target_id,
+        target_samples=target_samples,
+    )
+
+
+def _write_global_generation_progress_redis_cache(
+    *,
+    global_target_id: str,
+    state: dict[str, Any],
+    progress_backend: dict[str, Any] | None = None,
+) -> None:
+    backend = progress_backend if isinstance(progress_backend, dict) else {}
+    client = _resolve_redis_progress_client(backend)
+    if client is None:
+        return
+    key = _redis_global_progress_key(backend, global_target_id)
+    ttl_seconds = max(1, int(backend.get("redis_cache_ttl_seconds", 120) or 120))
+    payload = dict(state)
+    payload["_redis_cached_at"] = utc_now_iso()
+    try:
+        client.set(key, json.dumps(payload, ensure_ascii=True), ex=ttl_seconds)
+    except Exception:
+        return
+
+
 def _resolve_firestore_progress_endpoint(progress_backend: dict[str, Any] | None) -> tuple[Any, Any, Any] | None:
     backend = progress_backend if isinstance(progress_backend, dict) else {}
     if str(backend.get("backend", "file")).strip().lower() != "firestore":
@@ -397,6 +531,11 @@ def _update_global_generation_progress_firestore(
             exc=exc,
             details=f"job_id={job_id} dataset_source_id={dataset_source_id}",
         )
+    _write_global_generation_progress_redis_cache(
+        global_target_id=global_target_id,
+        state=state,
+        progress_backend=backend,
+    )
     return state
 
 
@@ -484,6 +623,11 @@ def _reserve_global_generation_budget_firestore(
                 f"requested_samples={requested_samples} requested_games={requested_games}"
             ),
         )
+    _write_global_generation_progress_redis_cache(
+        global_target_id=global_target_id,
+        state=state,
+        progress_backend=backend,
+    )
     return allowed_samples, allowed_games, state
 
 
@@ -495,6 +639,14 @@ def _read_global_generation_progress_firestore(
     progress_backend: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     backend = progress_backend if isinstance(progress_backend, dict) else {}
+    cached = _read_global_generation_progress_redis_cache(
+        global_target_id=global_target_id,
+        target_samples=target_samples,
+        progress_backend=backend,
+    )
+    if cached is not None:
+        _mirror_global_generation_progress_state(progress_path, cached)
+        return cached
     endpoint = _resolve_firestore_progress_endpoint(backend)
     if endpoint is None:
         _raise_firestore_progress_error(
@@ -515,6 +667,11 @@ def _read_global_generation_progress_firestore(
         payload=(snap.to_dict() if snap.exists else {}),
         global_target_id=global_target_id,
         target_samples=target_samples,
+    )
+    _write_global_generation_progress_redis_cache(
+        global_target_id=global_target_id,
+        state=state,
+        progress_backend=backend,
     )
     _mirror_global_generation_progress_state(progress_path, state)
     return state

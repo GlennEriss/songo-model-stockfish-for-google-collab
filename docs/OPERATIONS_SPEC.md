@@ -30,10 +30,17 @@ En mode multi-Colab, le runtime synchronise aussi un etat Firestore:
 - `worker_leases/{global_target_id}`
 - `pipeline_manifests/{worker_tag}`
 
+Et un etat Redis temps reel:
+
+- compteurs globaux/worker haute frequence
+- heartbeat workers
+- cache monitoring live
+
 Regle:
 
 - Drive reste la persistance principale des artefacts lourds
-- Firestore reste la source de verite pour la coordination runtime
+- Firestore reste la source de verite durable pour la coordination runtime
+- Redis absorbe la frequence temps reel
 
 ## 3. `job_id`
 

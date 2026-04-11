@@ -19,7 +19,7 @@ Le projet suit ces principes:
 
 - code versionne sur GitHub
 - artefacts persistants sur Google Drive
-- etat vivant multi-Colab centralise dans Firestore
+- etat vivant multi-Colab via Redis (temps reel) + Firestore (durable)
 - jobs toujours resumables
 - logs lisibles en direct et enregistrés
 - erreurs detaillees et exploitables
@@ -68,7 +68,17 @@ Firestore contient uniquement l'etat de coordination runtime:
 
 Les donnees lourdes ne doivent pas etre stockees dans Firestore.
 
-### 3.4 Regle importante
+### 3.4 Redis
+
+Redis contient l'etat runtime haute frequence:
+
+- compteurs incrementaux globaux et par worker
+- heartbeat et TTL workers
+- cache monitoring temps reel
+
+Redis sert a absorber la frequence des updates qui seraient trop couteuses en Firestore.
+
+### 3.5 Regle importante
 
 Une mise a jour du code ne doit jamais supprimer ni ecraser les artefacts de Drive.
 
@@ -224,6 +234,12 @@ En mode multi-Colab, l'etat vivant doit etre sync aussi dans Firestore:
 - `dataset_registry/primary` est mis a jour transactionnellement pour eviter les races
 
 Le backend Firestore est la source de verite runtime recommandee pour l'etat global.
+
+### 7.7 Sync runtime Redis -> Firestore
+
+- Les updates frequentes vont dans Redis.
+- Firestore est mis a jour par consolidation periodique (batch/intervalle).
+- En cas de perte Redis, la reprise durable se fait via Firestore + Drive.
 
 ## 8. Logging
 

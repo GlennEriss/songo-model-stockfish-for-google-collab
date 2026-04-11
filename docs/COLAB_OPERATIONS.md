@@ -12,7 +12,7 @@ Les artefacts vivent sur Google Drive.
 
 Cette separation ne doit jamais etre rompue.
 
-L'etat vivant multi-Colab est centralise dans Firestore.
+L'etat vivant multi-Colab utilise Redis (temps reel) + Firestore (durable).
 
 ## 3. Arborescence Drive recommandee
 
@@ -53,6 +53,13 @@ Important:
 - Firestore Python (`google-cloud-firestore`) doit etre utilise avec un service account (`FIRESTORE_CREDENTIALS_PATH`)
 - le mode API key seul n'est pas supporte pour ce client serveur
 
+## 4.2 Ce qui doit etre stocke dans Redis
+
+- compteurs frequents globaux (`samples`, `games`)
+- heartbeat workers (TTL)
+- compteurs frequents par worker
+- etat temps reel de monitoring
+
 ## 5. Ce qui doit rester dans GitHub
 
 - `src/`
@@ -68,11 +75,29 @@ Important:
 2. cloner ou mettre a jour le repo GitHub
 3. installer les dependances
 4. definir les chemins Drive + `FIRESTORE_CREDENTIALS_PATH`
-5. activer le backend runtime Firestore (`GLOBAL_PROGRESS_BACKEND='firestore'`)
+5. activer Redis pour le temps reel + Firestore pour le durable
 6. lancer le pipeline (`dataset-generate` + `dataset-build`) avec `job_id` dedie worker
 7. activer le mode quota economique (`LOW_QUOTA_PROFILE=True`) en multi-Colab
-8. garder un seul notebook de monitoring live pour eviter les lectures redondantes
+8. garder un seul notebook de monitoring live (Redis-first) pour eviter les lectures Firestore redondantes
 9. reprendre si la session tombe
+
+## 6.1 Workflow par bloc matchup (recommande)
+
+Pour chaque worker:
+
+1. reserver un matchup libre via lease
+2. executer un bloc de `200..500` games pour ce matchup
+3. ecrire les fichiers worker-local sur Drive (pas de melange direct)
+4. publier progression globale en micro-batch (N games ou intervalle)
+5. a la fin du bloc, merger le mini-dataset worker vers le dataset principal
+6. marquer le bloc comme `merged`
+7. reserver le matchup/bloc suivant
+
+Regle anti-collision:
+
+- un seul worker actif par bloc matchup
+- si worker stale, la lease expire et le bloc devient reprenable
+- la fusion du bloc doit etre idempotente (`block_id`) pour eviter double merge
 
 ## 7. Strategie de mise a jour du code
 
@@ -103,7 +128,7 @@ Notebook principal actuel:
   - bootstrap runtime
   - generation des configs actives
   - lancement parallele `dataset-generate` + `dataset-build`
-  - monitoring global Firestore
+  - monitoring global Redis-first + Firestore snapshot
   - health check workers actifs/inactifs
 
 ## 10. Commandes Git a standardiser
@@ -127,6 +152,7 @@ Les scripts devront sauvegarder:
 - metriques progressives
 - resume final de job
 - checkpoint runtime Firestore pour reprise multi-session
+- buffer runtime Redis pour temps reel
 
 ## 11.1 Profil quota recommande (multi-Colab)
 
@@ -138,6 +164,26 @@ Par defaut sur plusieurs workers:
 - `export_partial_every_n_files >= 200`
 - `monitor_refresh_seconds >= 90`
 - `pipeline_manifest_firestore_write_enabled=false`
+- `redis_sync_flush_seconds=60..120`
+- `matchup_block_games=500` (ou `200` si tests)
+- `worker_checkpoint_flush_seconds=60..120`
+- `dataset_registry_update_mode=micro_batch_plus_end_of_block`
+- `single_consolidator_lock_enabled=true`
+
+## 11.2 Regles d'ecriture Firestore (obligatoires)
+
+1. `worker_checkpoints`:
+- pas de write par fichier
+- write par intervalle + transitions critiques
+
+2. `dataset_registry`:
+- write micro-batch + fin de bloc uniquement
+
+3. `global_generation_progress`:
+- write batch (`N games` ou intervalle), plus write fin de bloc
+
+4. consolidation Redis -> Firestore:
+- un seul consolidateur actif (lock distribue)
 
 ## 12. Exigence de robustesse
 
@@ -147,4 +193,5 @@ Une execution Colab sera consideree robuste si:
 - les artefacts precedents ne sont pas perdus
 - une mise a jour de code reste propre
 - les logs permettent de comprendre l'etat du run
-- les compteurs globaux convergent dans Firestore sans divergence durable entre Colabs
+- les compteurs globaux convergent (Redis temps reel, Firestore durable) sans divergence durable entre Colabs
+- les merges de bloc sont idempotents et sans double comptage

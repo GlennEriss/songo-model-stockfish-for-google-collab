@@ -43,6 +43,7 @@ La ligne technique retenue est:
 - architecture cible `policy + value`
 - pas de fine-tuning d'un modele generaliste comme base principale
 - jobs resumables et artefacts persistants sur Drive
+- coordination multi-Colab via Redis (temps reel) + Firestore (durable)
 
 ## Contenu initial
 
@@ -58,6 +59,7 @@ La ligne technique retenue est:
 - `docs/DATASET_AND_BENCHMARK_ARCHITECTURE.md` : pipeline dataset et benchmatch
 - `docs/COLAB_OPERATIONS.md` : operations Colab, Drive, GitHub, reprise
 - `docs/FIRESTORE_ARCHITECTURE_20M.md` : architecture multi-Colab quota-first et plan P0/P1/P2
+  - Drive + Firestore + Redis
 - `docs/OPERATIONS_SPEC.md` : schemas des jobs, fichiers de reprise et model cards
 - `docs/REPO_STRUCTURE_SPEC.md` : structure cible du repository
 - `docs/ARTIFACTS_AND_LOGGING_SPEC.md` : conventions d'artefacts et de logs
@@ -214,7 +216,7 @@ Important pour Colab:
 - toutes les commandes du notebook s'executent donc directement avec `python`
 - il n'a plus besoin de cloner `songo-ai`
 - le moteur de reference, `minimax` et `mcts` necessaires au dataset et au benchmark sont maintenant embarques dans ce repo
-- le runtime multi-Colab utilise Firestore comme source de verite de coordination
+- le runtime multi-Colab utilise Redis (temps reel) + Firestore (source durable de coordination)
 - en pratique, il faut renseigner `FIRESTORE_CREDENTIALS_PATH` avec un service account JSON
 - en multi-workers, activer `LOW_QUOTA_PROFILE=True` pour limiter les reads/writes Firestore
 

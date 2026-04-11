@@ -80,8 +80,8 @@ Si tu veux comprendre rapidement le projet, lis dans cet ordre:
   - Drive, GitHub, reprise
 
 - `FIRESTORE_ARCHITECTURE_20M.md`
-  - architecture multi-Colab quota-first
-  - source de verite Firestore
+  - architecture multi-Colab Drive + Firestore + Redis
+  - Firestore durable + Redis temps reel
   - plan P0/P1/P2 pour viser 20M sans exploser les quotas
 
 - `OPERATIONS_SPEC.md`
