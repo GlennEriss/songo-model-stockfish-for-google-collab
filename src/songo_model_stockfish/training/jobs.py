@@ -530,38 +530,59 @@ def run_train(job: JobContext) -> dict[str, object]:
         parent_use_layer_norm = bool(parent_model_config.get("use_layer_norm", False))
         parent_dropout = float(parent_model_config.get("dropout", 0.0))
         parent_residual_connections = bool(parent_model_config.get("residual_connections", False))
-        if (
+        incompatible = (
             parent_hidden_sizes != hidden_sizes
             or parent_input_dim != input_dim
             or parent_policy_dim != 7
             or parent_use_layer_norm != use_layer_norm
             or parent_dropout != dropout
             or parent_residual_connections != residual_connections
-        ):
-            raise ValueError(
+        )
+        if incompatible:
+            compatibility_message = (
                 "Le checkpoint parent n'est pas compatible avec la config d'entrainement actuelle "
                 f"(parent hidden_sizes={parent_hidden_sizes}, current hidden_sizes={hidden_sizes}, "
+                f"parent input_dim={parent_input_dim}, current input_dim={input_dim}, "
+                f"parent policy_dim={parent_policy_dim}, current policy_dim=7, "
                 f"parent use_layer_norm={parent_use_layer_norm}, current use_layer_norm={use_layer_norm}, "
                 f"parent dropout={parent_dropout}, current dropout={dropout}, "
                 f"parent residual_connections={parent_residual_connections}, current residual_connections={residual_connections})"
             )
-        model.load_state_dict(parent_checkpoint["model_state"])
-        lineage_dir.mkdir(parents=True, exist_ok=True)
-        parent_checkpoint_snapshot_path = lineage_dir / f"{model_id}_parent_snapshot.pt"
-        shutil.copy2(init_checkpoint_path, parent_checkpoint_snapshot_path)
-        best_metric = 0.0
-        job.logger.info(
-            "training init checkpoint loaded | model=%s | parent_checkpoint=%s | promoted_best=%s",
-            model_id,
-            init_checkpoint_path,
-            init_from_promoted_best,
-        )
-        job.write_event(
-            "train_init_checkpoint_loaded",
-            model_id=model_id,
-            init_checkpoint_path=str(init_checkpoint_path),
-            parent_snapshot_path=str(parent_checkpoint_snapshot_path),
-        )
+            # If parent comes from auto promoted-best fallback, degrade gracefully to scratch.
+            if init_from_promoted_best and init_checkpoint_path == promoted_best_checkpoint_path:
+                job.logger.warning(
+                    "training parent checkpoint incompatible, fallback to scratch | model=%s | parent_checkpoint=%s | reason=%s",
+                    model_id,
+                    init_checkpoint_path,
+                    compatibility_message,
+                )
+                job.write_event(
+                    "train_init_checkpoint_incompatible_fallback_scratch",
+                    model_id=model_id,
+                    init_checkpoint_path=str(init_checkpoint_path),
+                    reason=compatibility_message,
+                )
+                init_checkpoint_path = None
+            else:
+                raise ValueError(compatibility_message)
+        if init_checkpoint_path is not None:
+            model.load_state_dict(parent_checkpoint["model_state"])
+            lineage_dir.mkdir(parents=True, exist_ok=True)
+            parent_checkpoint_snapshot_path = lineage_dir / f"{model_id}_parent_snapshot.pt"
+            shutil.copy2(init_checkpoint_path, parent_checkpoint_snapshot_path)
+            best_metric = 0.0
+            job.logger.info(
+                "training init checkpoint loaded | model=%s | parent_checkpoint=%s | promoted_best=%s",
+                model_id,
+                init_checkpoint_path,
+                init_from_promoted_best,
+            )
+            job.write_event(
+                "train_init_checkpoint_loaded",
+                model_id=model_id,
+                init_checkpoint_path=str(init_checkpoint_path),
+                parent_snapshot_path=str(parent_checkpoint_snapshot_path),
+            )
 
     if start_epoch > 0:
         job.logger.info(
