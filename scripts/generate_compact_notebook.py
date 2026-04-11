@@ -54,6 +54,8 @@ cells = [
     code(
         """
         import os
+        import json
+        from pathlib import Path
         import sys
         import shutil
         import subprocess
@@ -114,6 +116,21 @@ cells = [
             if text in {'0', 'false', 'no', 'off', 'n', 'f'}:
                 return False
             return bool(default)
+
+        def _load_env_file(path: str) -> bool:
+            file_path = Path(str(path).strip())
+            if not file_path.exists():
+                return False
+            for raw_line in file_path.read_text(encoding='utf-8').splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                key, value = line.split('=', 1)
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key:
+                    os.environ[key] = value
+            return True
 
         DATASET_GENERATE_CONFIG = 'config/dataset_generation.full_matrix.colab_pro.yaml'
         DATASET_BUILD_CONFIG = 'config/dataset_build.full_matrix.colab_pro.yaml'
@@ -180,6 +197,34 @@ cells = [
         FIRESTORE_WORKER_LEASES_COLLECTION = 'worker_leases'
         FIRESTORE_PIPELINE_MANIFESTS_COLLECTION = 'pipeline_manifests'
         FIRESTORE_WORKER_CHECKPOINTS_COLLECTION = 'worker_checkpoints'
+        REDIS_SECRET_ENV_PATH = '/content/drive/MyDrive/songo-stockfish/secrets/upstash_redis.env'
+        REDIS_SECRET_JSON_PATH = '/content/drive/MyDrive/songo-stockfish/secrets/upstash_redis.json'
+        REDIS_URL_OVERRIDE = 'https://touching-sculpin-69695.upstash.io'
+        REDIS_TOKEN_OVERRIDE = ''
+        REDIS_SECRET_ENV_LOADED = _load_env_file(REDIS_SECRET_ENV_PATH)
+        REDIS_SECRET_JSON_LOADED = False
+        redis_secret_json_path = Path(REDIS_SECRET_JSON_PATH)
+        if redis_secret_json_path.exists():
+            try:
+                secret_payload = json.loads(redis_secret_json_path.read_text(encoding='utf-8'))
+                if isinstance(secret_payload, dict):
+                    url_candidate = str(
+                        secret_payload.get('UPSTASH_REDIS_REST_URL', '') or secret_payload.get('url', '')
+                    ).strip()
+                    token_candidate = str(
+                        secret_payload.get('UPSTASH_REDIS_REST_TOKEN', '') or secret_payload.get('token', '')
+                    ).strip()
+                    if url_candidate and not os.environ.get('UPSTASH_REDIS_REST_URL'):
+                        os.environ['UPSTASH_REDIS_REST_URL'] = url_candidate
+                    if token_candidate and not os.environ.get('UPSTASH_REDIS_REST_TOKEN'):
+                        os.environ['UPSTASH_REDIS_REST_TOKEN'] = token_candidate
+                    REDIS_SECRET_JSON_LOADED = True
+            except Exception:
+                REDIS_SECRET_JSON_LOADED = False
+        if str(REDIS_URL_OVERRIDE).strip():
+            os.environ['UPSTASH_REDIS_REST_URL'] = str(REDIS_URL_OVERRIDE).strip()
+        if str(REDIS_TOKEN_OVERRIDE).strip():
+            os.environ['UPSTASH_REDIS_REST_TOKEN'] = str(REDIS_TOKEN_OVERRIDE).strip()
         GLOBAL_PROGRESS_REDIS_ENABLED = _as_bool(os.environ.get('GLOBAL_PROGRESS_REDIS_ENABLED', '1'), default=True)
         GLOBAL_PROGRESS_REDIS_URL = os.environ.get('UPSTASH_REDIS_REST_URL', '').strip()
         GLOBAL_PROGRESS_REDIS_TOKEN = os.environ.get('UPSTASH_REDIS_REST_TOKEN', '').strip()
@@ -785,6 +830,10 @@ cells = [
         print('FIRESTORE_CREDENTIALS_EXISTS =', Path(str(FIRESTORE_CREDENTIALS_PATH)).exists())
         print('FIRESTORE_API_KEY_SET    =', bool(str(FIRESTORE_API_KEY).strip()))
         print('GLOBAL_PROGRESS_REDIS_ENABLED =', GLOBAL_PROGRESS_REDIS_ENABLED)
+        print('REDIS_SECRET_ENV_PATH    =', REDIS_SECRET_ENV_PATH)
+        print('REDIS_SECRET_ENV_LOADED  =', REDIS_SECRET_ENV_LOADED)
+        print('REDIS_SECRET_JSON_PATH   =', REDIS_SECRET_JSON_PATH)
+        print('REDIS_SECRET_JSON_LOADED =', REDIS_SECRET_JSON_LOADED)
         print('GLOBAL_PROGRESS_REDIS_URL_SET =', bool(str(GLOBAL_PROGRESS_REDIS_URL).strip()))
         print('GLOBAL_PROGRESS_REDIS_TOKEN_SET =', bool(str(GLOBAL_PROGRESS_REDIS_TOKEN).strip()))
         print('GLOBAL_PROGRESS_REDIS_KEY_PREFIX =', GLOBAL_PROGRESS_REDIS_KEY_PREFIX)
