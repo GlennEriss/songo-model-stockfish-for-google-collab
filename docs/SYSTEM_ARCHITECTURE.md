@@ -19,10 +19,12 @@ Le projet suit ces principes:
 
 - code versionne sur GitHub
 - artefacts persistants sur Google Drive
+- etat vivant multi-Colab centralise dans Firestore
 - jobs toujours resumables
 - logs lisibles en direct et enregistrés
 - erreurs detaillees et exploitables
 - separation stricte entre code et donnees produites
+- mode quota-first pour les executions multi-workers
 
 ## 3. Separation Code / Artefacts
 
@@ -49,7 +51,24 @@ Google Drive contient uniquement:
 - etats de reprise des jobs
 - exports de modeles
 
-### 3.3 Regle importante
+### 3.3 Firestore
+
+Firestore contient uniquement l'etat de coordination runtime:
+
+- `global_generation_progress/{global_target_id}`
+  - compteur global cross-workers (`total_samples`, `total_games`, `workers`, `updated_at`)
+- `dataset_registry/primary`
+  - registre des `dataset_sources` et `built_datasets`
+- `worker_leases/{global_target_id}`
+  - attribution des workers pour eviter les collisions (`worker_index`, lease)
+- `worker_checkpoints/{job_id}`
+  - miroir resumable de `run_status` et `state`
+- `pipeline_manifests/{worker_tag}`
+  - metadata du lancement de pipeline (pid/logs)
+
+Les donnees lourdes ne doivent pas etre stockees dans Firestore.
+
+### 3.4 Regle importante
 
 Une mise a jour du code ne doit jamais supprimer ni ecraser les artefacts de Drive.
 
@@ -194,6 +213,17 @@ jobs/<job_id>/
 ### 7.5 `metrics.jsonl`
 
 - metriques progressives lisibles par machine
+
+### 7.6 Sync runtime Firestore
+
+En mode multi-Colab, l'etat vivant doit etre sync aussi dans Firestore:
+
+- `run_status.json` et `state.json` sont conserves en local Drive
+- `worker_checkpoints/{job_id}` est mis a jour pour reprise cross-session
+- `global_generation_progress/{global_target_id}` est mis a jour en mode batched pour limiter les quotas
+- `dataset_registry/primary` est mis a jour transactionnellement pour eviter les races
+
+Le backend Firestore est la source de verite runtime recommandee pour l'etat global.
 
 ## 8. Logging
 

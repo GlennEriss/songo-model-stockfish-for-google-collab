@@ -140,11 +140,22 @@ cells = [
         BENCHMATCH_CYCLE_MATCHUPS_UNTIL_TARGET = True
         BENCHMATCH_MAX_MATCHUP_CYCLES = 0  # 0 = illimite
         BENCHMATCH_MODEL_AGENT_DEVICE = 'cpu'
+        LOW_QUOTA_PROFILE = True
+        LOW_QUOTA_GLOBAL_PROGRESS_FLUSH_EVERY_N_GAMES = 200
+        LOW_QUOTA_GLOBAL_TARGET_POLL_INTERVAL_SECONDS = 60.0
+        LOW_QUOTA_SOURCE_POLL_INTERVAL_SECONDS = 45
+        LOW_QUOTA_DATASET_BUILD_EXPORT_PARTIAL_EVERY_N_FILES = 200
+        LOW_QUOTA_MONITOR_REFRESH_SECONDS = 90
+        LOW_QUOTA_MONITOR_MAX_LOOPS = 20
+        LOW_QUOTA_WRITE_PIPELINE_MANIFEST_FIRESTORE = False
         GLOBAL_TARGET_ENABLED = True
         GLOBAL_TARGET_ID = 'bench_models_20m_global'
         GLOBAL_TARGET_SAMPLES = 20000000
         GLOBAL_PROGRESS_PATH = f'data/global_generation_progress/{GLOBAL_TARGET_ID}.json'
         GLOBAL_PROGRESS_BACKEND = 'firestore'  # Firestore est la source de verite
+        GLOBAL_BUDGET_ENFORCEMENT_MODE = 'batched'  # 'batched' (recommande pour quota Firestore) ou 'strict'
+        GLOBAL_PROGRESS_FLUSH_EVERY_N_GAMES = 20
+        GLOBAL_TARGET_POLL_INTERVAL_SECONDS = 15.0
         FIRESTORE_PROJECT_ID = 'songo-model-ai'
         FIRESTORE_COLLECTION = 'global_generation_progress'
         FIRESTORE_DOCUMENT = GLOBAL_TARGET_ID
@@ -155,9 +166,22 @@ cells = [
         FIRESTORE_WORKER_LEASES_COLLECTION = 'worker_leases'
         FIRESTORE_PIPELINE_MANIFESTS_COLLECTION = 'pipeline_manifests'
         FIRESTORE_WORKER_CHECKPOINTS_COLLECTION = 'worker_checkpoints'
+        SOURCE_POLL_INTERVAL_SECONDS = 20
+        DATASET_BUILD_EXPORT_PARTIAL_EVERY_N_FILES = 20
+        MONITOR_REFRESH_SECONDS = 15
+        MONITOR_MAX_LOOPS = 40
+        PIPELINE_MANIFEST_FIRESTORE_WRITE_ENABLED = True
+        if LOW_QUOTA_PROFILE:
+            GLOBAL_BUDGET_ENFORCEMENT_MODE = 'batched'
+            GLOBAL_PROGRESS_FLUSH_EVERY_N_GAMES = int(LOW_QUOTA_GLOBAL_PROGRESS_FLUSH_EVERY_N_GAMES)
+            GLOBAL_TARGET_POLL_INTERVAL_SECONDS = float(LOW_QUOTA_GLOBAL_TARGET_POLL_INTERVAL_SECONDS)
+            SOURCE_POLL_INTERVAL_SECONDS = int(LOW_QUOTA_SOURCE_POLL_INTERVAL_SECONDS)
+            DATASET_BUILD_EXPORT_PARTIAL_EVERY_N_FILES = int(LOW_QUOTA_DATASET_BUILD_EXPORT_PARTIAL_EVERY_N_FILES)
+            MONITOR_REFRESH_SECONDS = float(LOW_QUOTA_MONITOR_REFRESH_SECONDS)
+            MONITOR_MAX_LOOPS = int(LOW_QUOTA_MONITOR_MAX_LOOPS)
+            PIPELINE_MANIFEST_FIRESTORE_WRITE_ENABLED = bool(LOW_QUOTA_WRITE_PIPELINE_MANIFEST_FIRESTORE)
         if str(GLOBAL_PROGRESS_BACKEND).strip().lower() != 'firestore':
             raise ValueError("GLOBAL_PROGRESS_BACKEND doit rester 'firestore' (fallback fichier desactive).")
-        SOURCE_POLL_INTERVAL_SECONDS = 20
         DATASET_GENERATE_WORKERS = 16
         DATASET_GENERATE_MAX_PENDING_FUTURES = 32
         DATASET_BUILD_WORKERS = 16
@@ -437,8 +461,31 @@ cells = [
             return payload if isinstance(payload, dict) else dict(fallback)
 
         def _write_firestore_doc(collection: str, document: str, payload: dict) -> None:
-            client = _get_firestore_client()
-            client.collection(str(collection)).document(str(document)).set(dict(payload))
+            retries = 4
+            wait_seconds = 1.0
+            last_exc = None
+            for attempt in range(retries):
+                try:
+                    client = _get_firestore_client()
+                    client.collection(str(collection)).document(str(document)).set(dict(payload))
+                    return
+                except Exception as exc:
+                    last_exc = exc
+                    text = f'{type(exc).__name__}: {exc}'.lower()
+                    retryable = (
+                        'resourceexhausted' in text
+                        or 'quota exceeded' in text
+                        or 'deadlineexceeded' in text
+                        or 'serviceunavailable' in text
+                        or 'temporarily unavailable' in text
+                    )
+                    if (not retryable) or (attempt + 1 >= retries):
+                        break
+                    time.sleep(wait_seconds)
+                    wait_seconds = min(10.0, wait_seconds * 2.0)
+            if last_exc is None:
+                raise RuntimeError('Ecriture Firestore impossible (erreur inconnue).')
+            raise RuntimeError(f'Ecriture Firestore impossible: {type(last_exc).__name__}: {last_exc}') from last_exc
 
         def _load_dataset_registry_payload() -> dict:
             payload = _read_firestore_doc(
@@ -652,6 +699,12 @@ cells = [
         print('PIPELINE_MANIFEST_PATH  =', PIPELINE_MANIFEST_PATH)
         print('TARGET_SAMPLES          =', TARGET_SAMPLES)
         print('TARGET_LABELED_SAMPLES  =', TARGET_LABELED_SAMPLES)
+        print('LOW_QUOTA_PROFILE       =', LOW_QUOTA_PROFILE)
+        print('SOURCE_POLL_INTERVAL_SECONDS =', SOURCE_POLL_INTERVAL_SECONDS)
+        print('DATASET_BUILD_EXPORT_PARTIAL_EVERY_N_FILES =', DATASET_BUILD_EXPORT_PARTIAL_EVERY_N_FILES)
+        print('MONITOR_REFRESH_SECONDS =', MONITOR_REFRESH_SECONDS)
+        print('MONITOR_MAX_LOOPS       =', MONITOR_MAX_LOOPS)
+        print('PIPELINE_MANIFEST_FIRESTORE_WRITE_ENABLED =', PIPELINE_MANIFEST_FIRESTORE_WRITE_ENABLED)
         print('AUTO_TUNE_RESOURCES     =', AUTO_TUNE_RESOURCES)
         print('DATASET_GENERATE_WORKERS =', DATASET_GENERATE_WORKERS)
         print('DATASET_BUILD_WORKERS    =', DATASET_BUILD_WORKERS)
@@ -664,9 +717,14 @@ cells = [
         print('GLOBAL_TARGET_ID         =', GLOBAL_TARGET_ID)
         print('GLOBAL_TARGET_SAMPLES    =', GLOBAL_TARGET_SAMPLES)
         print('GLOBAL_PROGRESS_BACKEND  =', GLOBAL_PROGRESS_BACKEND)
+        print('GLOBAL_BUDGET_ENFORCEMENT_MODE =', GLOBAL_BUDGET_ENFORCEMENT_MODE)
+        print('GLOBAL_PROGRESS_FLUSH_EVERY_N_GAMES =', GLOBAL_PROGRESS_FLUSH_EVERY_N_GAMES)
+        print('GLOBAL_TARGET_POLL_INTERVAL_SECONDS =', GLOBAL_TARGET_POLL_INTERVAL_SECONDS)
         print('FIRESTORE_PROJECT_ID     =', FIRESTORE_PROJECT_ID)
         print('FIRESTORE_COLLECTION     =', FIRESTORE_COLLECTION)
         print('FIRESTORE_DOCUMENT       =', FIRESTORE_DOCUMENT)
+        print('FIRESTORE_CREDENTIALS_PATH =', FIRESTORE_CREDENTIALS_PATH)
+        print('FIRESTORE_CREDENTIALS_EXISTS =', Path(str(FIRESTORE_CREDENTIALS_PATH)).exists())
         print('FIRESTORE_API_KEY_SET    =', bool(str(FIRESTORE_API_KEY).strip()))
         print('DATASET_GENERATE_JOB_ID =', DATASET_GENERATE_JOB_ID)
         print('DATASET_BUILD_JOB_ID    =', DATASET_BUILD_JOB_ID)
@@ -1045,7 +1103,10 @@ cells = [
         generate_block['dataset_registry_firestore_document'] = str(FIRESTORE_DATASET_REGISTRY_DOCUMENT)
         generate_block['dataset_registry_firestore_credentials_path'] = str(FIRESTORE_CREDENTIALS_PATH)
         generate_block['dataset_registry_firestore_api_key'] = str(FIRESTORE_API_KEY)
-        generate_block['progress_update_every_n_games'] = 1
+        generate_block['progress_update_every_n_games'] = int(GLOBAL_PROGRESS_FLUSH_EVERY_N_GAMES)
+        generate_block['global_budget_enforcement_mode'] = str(GLOBAL_BUDGET_ENFORCEMENT_MODE)
+        generate_block['global_progress_flush_every_n_games'] = int(GLOBAL_PROGRESS_FLUSH_EVERY_N_GAMES)
+        generate_block['global_target_poll_interval_seconds'] = float(GLOBAL_TARGET_POLL_INTERVAL_SECONDS)
         generate_cfg['dataset_generation'] = generate_block
         DATASET_GENERATE_CONFIG_ACTIVE = _write_yaml(generate_cfg, DATASET_GENERATE_CONFIG_ACTIVE_PATH)
 
@@ -1081,7 +1142,7 @@ cells = [
         build_block['global_target_stabilization_polls'] = int(GLOBAL_TARGET_STABILIZATION_POLLS)
         build_block['workers'] = int(DATASET_BUILD_WORKERS)
         build_block['max_pending_futures'] = int(DATASET_BUILD_MAX_PENDING_FUTURES)
-        build_block['export_partial_every_n_files'] = int(min(20, int(build_block.get('export_partial_every_n_files', 100) or 100)))
+        build_block['export_partial_every_n_files'] = int(max(1, int(DATASET_BUILD_EXPORT_PARTIAL_EVERY_N_FILES)))
         build_cfg['dataset_build'] = build_block
         DATASET_BUILD_CONFIG_ACTIVE = _write_yaml(build_cfg, DATASET_BUILD_CONFIG_ACTIVE_PATH)
 
@@ -1225,7 +1286,16 @@ cells = [
         latest_path = Path(DRIVE_ROOT) / PIPELINE_MANIFEST_PATH
         latest_path.parent.mkdir(parents=True, exist_ok=True)
         latest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=True), encoding='utf-8')
-        _write_firestore_doc(FIRESTORE_PIPELINE_MANIFESTS_COLLECTION, WORKER_TAG, manifest)
+        firestore_manifest_written = False
+        firestore_manifest_error = ''
+        if PIPELINE_MANIFEST_FIRESTORE_WRITE_ENABLED:
+            try:
+                _write_firestore_doc(FIRESTORE_PIPELINE_MANIFESTS_COLLECTION, WORKER_TAG, manifest)
+                firestore_manifest_written = True
+            except Exception as exc:
+                firestore_manifest_error = f'{type(exc).__name__}: {exc}'
+        else:
+            firestore_manifest_error = 'disabled_by_low_quota_profile'
 
         print('Pipeline lance en parallele')
         print('  dataset-generate pid =', generate_pid)
@@ -1234,6 +1304,9 @@ cells = [
         print('  build log            =', build_log_path)
         print('  manifest             =', latest_path)
         print('  firestore_manifest   =', f'{FIRESTORE_PIPELINE_MANIFESTS_COLLECTION}/{WORKER_TAG}')
+        print('  firestore_written    =', firestore_manifest_written)
+        if firestore_manifest_error:
+            print('  firestore_error      =', firestore_manifest_error)
         """
     ),
     md("## 5bis. Suivre le pipeline dataset"),
@@ -1317,8 +1390,8 @@ cells = [
         import time
         from pathlib import Path
 
-        REFRESH_SECONDS = 15
-        MAX_LOOPS = 40
+        REFRESH_SECONDS = float(MONITOR_REFRESH_SECONDS)
+        MAX_LOOPS = int(MONITOR_MAX_LOOPS)
 
         jobs_root = Path(DRIVE_ROOT) / 'jobs'
 
@@ -1390,8 +1463,8 @@ cells = [
         import time
         from pathlib import Path
 
-        REFRESH_SECONDS = 15
-        MAX_LOOPS = 40
+        REFRESH_SECONDS = float(MONITOR_REFRESH_SECONDS)
+        MAX_LOOPS = int(MONITOR_MAX_LOOPS)
 
         def _load_json_retry(path: Path, retries: int = 6, wait_seconds: float = 0.25, default=None):
             fallback = {} if default is None else default

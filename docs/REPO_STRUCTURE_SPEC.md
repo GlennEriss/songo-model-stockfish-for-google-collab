@@ -2,7 +2,7 @@
 
 ## 1. Objectif
 
-Definir la structure finale recommandee du repository avant implementation.
+Definir la structure recommandee du repository et son role par dossier.
 
 ## 2. Structure cible
 
@@ -143,3 +143,9 @@ La structure finale doit:
 - rester simple
 - permettre la croissance
 - separer clairement les responsabilites
+
+Convention d'architecture:
+
+- code et docs dans le repo
+- artefacts lourds sur Drive
+- coordination runtime multi-Colab dans Firestore

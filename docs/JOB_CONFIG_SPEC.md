@@ -2,19 +2,20 @@
 
 ## 1. Objectif
 
-Definir le format YAML des futures configurations de jobs.
+Definir le format YAML des configurations de jobs utilisees par le projet.
 
 Les jobs concernes sont:
 
 - dataset generation
 - dataset build
+- dataset merge final
 - train
 - benchmark
 - evaluation
 
 ## 2. Structure generale
 
-Chaque config YAML doit contenir:
+Chaque config YAML contient:
 
 - `project`
 - `runtime`
@@ -29,7 +30,6 @@ Exemple:
 ```yaml
 project:
   name: songo-model-stockfish-for-google-collab
-  git_commit: auto
 
 runtime:
   device: cuda
@@ -49,7 +49,7 @@ job:
 
 ## 4. Config `dataset_generation`
 
-Exemple:
+Exemple runtime multi-Colab quota-first:
 
 ```yaml
 project:
@@ -57,50 +57,106 @@ project:
 
 runtime:
   seed: 42
+  num_workers: 16
+  multiprocessing_start_method: spawn
+  max_tasks_per_child: 25
 
 storage:
   drive_root: /content/drive/MyDrive/songo-stockfish
+  repo_root: /content/songo-model-stockfish-for-google-collab
 
 job:
   run_type: dataset_generation
   job_id: auto
   resume: true
+  auto_rollover_completed_job: true
 
 dataset_generation:
+  source_mode: benchmatch
+  dataset_source_id: sampled_full_matrix_colab_pro
+  source_dataset_id: ""
+  source_dataset_ids: []
   matchups:
     - minimax:medium vs minimax:hard
-    - minimax:medium vs mcts:medium
-  games: 200
-  sample_strategy: uniform_by_ply
+    - minimax:hard vs mcts:hard
+  games: 400
+  target_samples: 20000000
   sample_every_n_plies: 2
-  output_raw_dir: data/raw
-  output_sampled_dir: data/sampled
+  max_moves: 400
+  output_raw_dir: data/raw_full_matrix_colab_pro
+  output_sampled_dir: data/sampled_full_matrix_colab_pro
+  progress_update_every_n_games: 20
+  max_pending_futures: 32
+
+  global_progress_backend: firestore
+  global_progress_firestore_project_id: songo-model-ai
+  global_progress_firestore_collection: global_generation_progress
+  global_progress_firestore_document: bench_models_20m_global
+  global_progress_firestore_credentials_path: /content/drive/MyDrive/songo-stockfish/secrets/service-account.json
+  global_budget_enforcement_mode: batched
+  global_progress_flush_every_n_games: 200
+  global_target_poll_interval_seconds: 60
 ```
 
 ## 5. Config `dataset_build`
 
-Exemple:
+Exemple runtime multi-Colab:
 
 ```yaml
 project:
   name: songo-model-stockfish-for-google-collab
 
+runtime:
+  multiprocessing_start_method: fork
+  max_tasks_per_child: 200
+
 storage:
   drive_root: /content/drive/MyDrive/songo-stockfish
+  repo_root: /content/songo-model-stockfish-for-google-collab
 
 job:
   run_type: dataset_build
   job_id: auto
   resume: true
+  auto_rollover_completed_job: true
 
 dataset_build:
-  input_labeled_dir: data/labeled
-  dataset_id: dataset_v1_20260402
-  output_dir: data/datasets/dataset_v1_20260402
+  source_dataset_id: sampled_full_matrix_colab_pro
+  input_sampled_dir: data/sampled_full_matrix_colab_pro
+  dataset_id: dataset_v2_full_matrix_colab_pro_insane_20m
+  output_dir: data/datasets/dataset_v2_full_matrix_colab_pro_insane_20m
+  label_cache_dir: data/label_cache/dataset_v2_full_matrix_colab_pro_insane_20m
+  target_labeled_samples: 20000000
+  follow_source_updates: true
+  source_poll_interval_seconds: 45
+  num_workers: 16
+  max_pending_futures: 32
+  export_partial_every_n_files: 200
+  include_tactical_analysis: true
+  dedupe_sample_ids: true
+  stop_when_global_target_reached: true
+  global_target_id: bench_models_20m_global
+  global_target_samples: 20000000
+  global_target_stabilization_polls: 3
   split:
     train: 0.8
     validation: 0.1
     test: 0.1
+  teacher:
+    engine: minimax
+    level: insane
+
+  global_progress_backend: firestore
+  global_progress_firestore_project_id: songo-model-ai
+  global_progress_firestore_collection: global_generation_progress
+  global_progress_firestore_document: bench_models_20m_global
+  global_progress_firestore_credentials_path: /content/drive/MyDrive/songo-stockfish/secrets/service-account.json
+
+  dataset_registry_backend: firestore
+  dataset_registry_firestore_project_id: songo-model-ai
+  dataset_registry_firestore_collection: dataset_registry
+  dataset_registry_firestore_document: primary
+  dataset_registry_firestore_credentials_path: /content/drive/MyDrive/songo-stockfish/secrets/service-account.json
 ```
 
 ## 6. Config `train`
@@ -114,10 +170,14 @@ project:
 runtime:
   device: cuda
   seed: 42
-  num_workers: 2
+  num_workers: 12
+  pin_memory: true
+  persistent_workers: true
+  mixed_precision: true
 
 storage:
   drive_root: /content/drive/MyDrive/songo-stockfish
+  repo_root: /content/songo-model-stockfish-for-google-collab
 
 job:
   run_type: train
@@ -126,14 +186,19 @@ job:
   save_every_minutes: 5
 
 train:
-  dataset_id: dataset_v1_20260402
-  dataset_path: data/datasets/dataset_v1_20260402/train.npz
-  validation_path: data/datasets/dataset_v1_20260402/validation.npz
-  model_family: policy_value
-  backbone: mlp
-  batch_size: 64
-  epochs: 20
-  learning_rate: 0.0003
+  dataset_selection_mode: largest_built
+  dataset_id: auto
+  model_id: auto
+  model_id_prefix: songo_policy_value_colab_pro
+  init_from_promoted_best: true
+  batch_size: 4096
+  epochs: 40
+  learning_rate: 0.0005
+  gradient_clip_norm: 1.0
+  early_stopping_patience: 6
+  scheduler:
+    type: cosine
+    min_lr: 0.00005
   checkpoint_dir: models/checkpoints
   final_dir: models/final
 ```
@@ -158,7 +223,7 @@ job:
   resume: true
 
 benchmark:
-  target: engine_v1
+  target: auto_latest
   matchups:
     - minimax:medium
     - minimax:hard
@@ -189,10 +254,8 @@ job:
   resume: true
 
 evaluation:
-  model_id: songo_policy_value_v1
-  checkpoint_path: models/final/songo_policy_value_v1.pt
-  dataset_id: dataset_v1_20260402
-  test_dataset_path: data/datasets/dataset_v1_20260402/test.npz
+  dataset_selection_mode: largest_built
+  checkpoint_path: models/final/latest.pt
   output_dir: reports/evaluations
 ```
 
@@ -204,6 +267,11 @@ Toutes les configs doivent:
 - pouvoir etre copiees dans le dossier du job
 - servir de source de verite de l'execution
 
+En mode Firestore:
+
+- ne pas utiliser API key seule avec `google-cloud-firestore`
+- fournir un `credentials_path` service account lisible depuis Colab
+
 ## 10. Decision V1
 
-Les scripts du projet devront lire une config YAML unique par job.
+Les scripts du projet lisent une config YAML unique par job.

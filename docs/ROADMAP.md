@@ -74,3 +74,4 @@
 - enrichir les rapports d'evaluation avec des metriques plus lisibles
 - clarifier l'etat du projet et les priorites dans une doc courte et reutilisable
 - preparer l'activation future de variantes MLP plus robustes sans casser la compatibilite des checkpoints
+- stabiliser l'architecture multi-Colab quota-first avec Firestore comme source de verite runtime

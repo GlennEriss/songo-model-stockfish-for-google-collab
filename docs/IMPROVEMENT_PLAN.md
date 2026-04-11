@@ -42,7 +42,8 @@ Le teacher principal pour la construction du dataset est:
   - mode `parallel`, `sequential`, `sequential_fallback`
   - `files_per_sec`, `samples_per_sec` et `eta`
 - debut de gestion explicite du versionning dataset:
-  - registre central `data/dataset_registry.json`
+  - registre central `dataset_registry/primary` en mode Firestore
+  - compatibilite locale via `data/dataset_registry.json` hors mode Firestore
   - sources de datasets enregistrees separement des datasets construits
   - selection explicite de la source pour `dataset-build`
 
@@ -381,7 +382,8 @@ Etat:
   - `dataset-list`
   - pour voir rapidement les sources et datasets deja enregistres
 - les metadonnees sont enregistrees dans:
-  - `data/dataset_registry.json`
+  - `dataset_registry/primary` dans Firestore (mode runtime recommande)
+  - et localement dans `data/dataset_registry.json` seulement pour compatibilite hors Firestore
 
 Strategies de derivation deja disponibles:
 
@@ -580,6 +582,34 @@ Ce mode `derive_existing` serait ideal pour:
   - `endgame_focus`
   - `high_branching`
 - ajouter plus tard une cellule de comparaison rapide entre deux `dataset_metadata.json`
+
+### Priorite 1 ter - Quotas Firestore multi-Colab
+
+Objectif:
+
+- garder Firestore comme source de verite runtime
+- reduire fortement les reads/writes pour tenir les quotas sur runs longs
+
+Etat:
+
+- mode `global_budget_enforcement_mode=batched` disponible
+- flush global progression configurable (`global_progress_flush_every_n_games`)
+- polling global configurable (`global_target_poll_interval_seconds`)
+- profil notebook `LOW_QUOTA_PROFILE` disponible dans `colab_compact`
+
+Profil recommande:
+
+- `GLOBAL_BUDGET_ENFORCEMENT_MODE='batched'`
+- `GLOBAL_PROGRESS_FLUSH_EVERY_N_GAMES=200`
+- `GLOBAL_TARGET_POLL_INTERVAL_SECONDS=60`
+- `SOURCE_POLL_INTERVAL_SECONDS=45` a `60`
+- `DATASET_BUILD_EXPORT_PARTIAL_EVERY_N_FILES=200` a `500`
+- `MONITOR_REFRESH_SECONDS=90` a `120`
+- `PIPELINE_MANIFEST_FIRESTORE_WRITE_ENABLED=False`
+
+Prochaine etape:
+
+- throttle explicite des `worker_checkpoints` (flush par intervalle/lot) pour supprimer les writes excessives par fichier
 
 ### Priorite 2 - Architecture du modele
 

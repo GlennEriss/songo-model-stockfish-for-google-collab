@@ -3232,10 +3232,36 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
     initial_total_games = _count_jsonl_files(sampled_dir)
     total_samples_after_run = initial_total_samples
     last_completed_game_id = str(state.get("last_completed_game_id", "")).strip()
-    global_budget_reservation_enabled = bool(
-        global_target_enabled and source_mode == "benchmatch" and global_target_samples > 0
+    progress_update_every_n_games = max(
+        1,
+        int(job.config.get("dataset_generation", {}).get("progress_update_every_n_games", 25)),
     )
-    progress_update_every_n_games = max(1, int(job.config.get("dataset_generation", {}).get("progress_update_every_n_games", 25)))
+    global_budget_mode_cfg = str(cfg.get("global_budget_enforcement_mode", "")).strip().lower()
+    if global_budget_mode_cfg not in {"strict", "batched"}:
+        backend_name = str(global_progress_backend.get("backend", "file")).strip().lower()
+        global_budget_mode_cfg = "batched" if backend_name == "firestore" else "strict"
+    global_budget_reservation_enabled = bool(
+        global_target_enabled
+        and source_mode == "benchmatch"
+        and global_target_samples > 0
+        and global_budget_mode_cfg == "strict"
+    )
+    global_progress_flush_every_n_games = max(
+        1,
+        int(cfg.get("global_progress_flush_every_n_games", progress_update_every_n_games)),
+    )
+    global_target_poll_interval_seconds = max(
+        1.0,
+        float(cfg.get("global_target_poll_interval_seconds", 15.0)),
+    )
+    global_target_poll_cache: dict[str, Any] = {"checked_at": 0.0, "reached": False}
+    job.logger.info(
+        "dataset generation global budget control | mode=%s | strict_reservation=%s | progress_flush_every_n_games=%s | target_poll_interval_seconds=%.1f",
+        global_budget_mode_cfg,
+        global_budget_reservation_enabled,
+        global_progress_flush_every_n_games,
+        global_target_poll_interval_seconds,
+    )
 
     job.logger.info("dataset generation started")
     job.set_phase("dataset_generation")
@@ -3335,6 +3361,8 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
             matchup_sample_count = 0
             matchup_failed_game_count = 0
             global_stop_requested = False
+            pending_global_delta_samples = 0
+            pending_global_delta_games = 0
             existing_numbers = _existing_game_numbers(raw_dir, sampled_dir, matchup_id)
             existing_game_count = len(existing_numbers)
             job.logger.info(
@@ -3415,18 +3443,63 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
             def _global_target_reached() -> bool:
                 if not (global_target_enabled and source_mode == "benchmatch" and global_target_samples > 0):
                     return False
+                now_ts = time.time()
+                cached_checked_at = float(global_target_poll_cache.get("checked_at", 0.0) or 0.0)
+                if (now_ts - cached_checked_at) < float(global_target_poll_interval_seconds):
+                    return bool(global_target_poll_cache.get("reached", False))
                 state = _read_global_generation_progress(
                     global_progress_path,
                     global_target_id=global_target_id,
                     target_samples=global_target_samples,
                     progress_backend=global_progress_backend,
                 )
-                return int(state.get("total_samples", 0)) >= int(global_target_samples)
+                reached = int(state.get("total_samples", 0)) >= int(global_target_samples)
+                global_target_poll_cache["checked_at"] = now_ts
+                global_target_poll_cache["reached"] = bool(reached)
+                return bool(reached)
     
             def _local_target_remaining() -> int:
                 if target_samples <= 0:
                     return 1_000_000_000
                 return max(0, int(target_samples) - int(total_samples_after_run))
+
+            def _flush_global_progress_deltas(*, force: bool = False) -> None:
+                nonlocal pending_global_delta_samples, pending_global_delta_games
+                if global_budget_reservation_enabled:
+                    return
+                if not (global_target_enabled and source_mode == "benchmatch"):
+                    return
+                if pending_global_delta_samples <= 0 and pending_global_delta_games <= 0:
+                    return
+                if not force and (matchup_game_count % global_progress_flush_every_n_games != 0):
+                    return
+                state = _update_global_generation_progress(
+                    progress_path=global_progress_path,
+                    lock_dir=global_progress_lock_dir,
+                    global_target_id=global_target_id,
+                    target_samples=global_target_samples,
+                    job_id=job.job_id,
+                    dataset_source_id=dataset_source_id,
+                    delta_samples=int(pending_global_delta_samples),
+                    delta_games=int(pending_global_delta_games),
+                    progress_backend=global_progress_backend,
+                )
+                pending_global_delta_samples = 0
+                pending_global_delta_games = 0
+                global_target_poll_cache["checked_at"] = time.time()
+                global_target_poll_cache["reached"] = (
+                    int(state.get("total_samples", 0)) >= int(global_target_samples)
+                )
+
+            def _accumulate_global_progress_deltas(*, games_inc: int, samples_inc: int) -> None:
+                nonlocal pending_global_delta_samples, pending_global_delta_games
+                if global_budget_reservation_enabled:
+                    return
+                if int(games_inc) <= 0 and int(samples_inc) <= 0:
+                    return
+                pending_global_delta_samples += max(0, int(samples_inc))
+                pending_global_delta_games += max(0, int(games_inc))
+                _flush_global_progress_deltas(force=False)
 
             def _release_reserved_global_budget(
                 *,
@@ -3503,6 +3576,8 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
                 if admitted <= 0:
                     return 0
                 if not global_budget_reservation_enabled:
+                    if _global_target_reached():
+                        return 0
                     return admitted
                 admitted_samples, _admitted_games, _state = _reserve_global_generation_budget(
                     progress_path=global_progress_path,
@@ -3520,10 +3595,15 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
             def _make_sequential_progress_callback(base_games: int, base_samples: int) -> Callable[[dict[str, Any], int, int], None]:
                 def _on_sequential_game_completed(pending: dict[str, Any], completed_games_so_far: int, completed_samples_so_far: int) -> None:
                     nonlocal matchup_game_count, matchup_sample_count, total_samples_after_run, last_completed_game_id
+                    previous_games = int(matchup_game_count)
+                    previous_samples = int(matchup_sample_count)
                     matchup_game_count = int(base_games) + int(completed_games_so_far)
                     matchup_sample_count = int(base_samples) + int(completed_samples_so_far)
+                    games_inc = max(0, int(matchup_game_count) - previous_games)
+                    samples_inc = max(0, int(matchup_sample_count) - previous_samples)
                     total_samples_after_run = initial_total_samples + sum(int(item.get("samples_added", 0)) for item in summaries) + matchup_sample_count
                     last_completed_game_id = str(pending["game_id"])
+                    _accumulate_global_progress_deltas(games_inc=games_inc, samples_inc=samples_inc)
                     if matchup_game_count % progress_update_every_n_games == 0:
                         _update_benchmatch_progress(str(pending["game_id"]))
 
@@ -3580,6 +3660,7 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
                 matchup_sample_count = int(completed_samples)
                 if last_completed_game_id:
                     _update_benchmatch_progress(last_completed_game_id)
+                _flush_global_progress_deltas(force=True)
             else:
                 job.logger.info(
                     "dataset matchup parallel execution | matchup=%s | workers=%s | pending_games=%s | max_pending=%s | start_method=%s | max_tasks_per_child=%s",
@@ -3710,6 +3791,7 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
                                 matchup_game_count += games_inc
                                 matchup_sample_count += samples_inc
                                 total_samples_after_run += samples_inc
+                                _accumulate_global_progress_deltas(games_inc=games_inc, samples_inc=samples_inc)
                                 if games_inc > 0:
                                     last_completed_game_id = str(pending["game_id"])
                                 if _global_target_reached():
@@ -3762,6 +3844,7 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
                                 "target_samples": target_samples,
                             }
                         )
+                _flush_global_progress_deltas(force=True)
             if global_stop_requested:
                 job.logger.info(
                     "dataset generation global target reached, stopping early | global_target_id=%s | target_samples=%s",

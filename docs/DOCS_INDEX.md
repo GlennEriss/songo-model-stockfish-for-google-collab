@@ -79,6 +79,11 @@ Si tu veux comprendre rapidement le projet, lis dans cet ordre:
   - operations Colab
   - Drive, GitHub, reprise
 
+- `FIRESTORE_ARCHITECTURE_20M.md`
+  - architecture multi-Colab quota-first
+  - source de verite Firestore
+  - plan P0/P1/P2 pour viser 20M sans exploser les quotas
+
 - `OPERATIONS_SPEC.md`
   - schemas de `run_status.json`, `state.json`, `events.jsonl`, `metrics.jsonl`
   - `model_card.json`
@@ -147,6 +152,7 @@ Lis:
 
 - `COLAB_PIPELINE.md`
 - `COLAB_OPERATIONS.md`
+- `FIRESTORE_ARCHITECTURE_20M.md`
 - `OPERATIONS_SPEC.md`
 - `ARTIFACTS_AND_LOGGING_SPEC.md`
 

@@ -16,6 +16,14 @@ Le projet produira principalement:
 - resumes evaluation
 - model cards
 
+En mode multi-Colab, Firestore conserve aussi des artefacts runtime de coordination:
+
+- `global_generation_progress/{global_target_id}`
+- `dataset_registry/primary`
+- `worker_leases/{global_target_id}`
+- `worker_checkpoints/{job_id}`
+- `pipeline_manifests/{worker_tag}`
+
 ## 3. Niveaux de logs
 
 Niveaux recommandes:
@@ -60,6 +68,14 @@ Les logs persistants doivent etre:
 - warning notable
 - failure
 - completion
+
+### Pour le runtime Firestore
+
+- auth/firestore config resolved
+- sync checkpoint write success/failure
+- global progress update success/failure
+- dataset registry update success/failure
+- worker lease assignment
 
 ### Pour `benchmark`
 
@@ -121,3 +137,8 @@ Chaque job doit produire un resume final:
 Les artefacts existants ne doivent pas etre supprimes automatiquement lors d'une mise a jour du code.
 
 Toute politique de nettoyage devra etre explicite et manuelle.
+
+Regle complementaire:
+
+- Drive reste la persistance des gros artefacts.
+- Firestore reste la source de verite de coordination runtime.

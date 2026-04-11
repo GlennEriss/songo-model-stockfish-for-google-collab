@@ -57,21 +57,22 @@ La ligne technique retenue est:
 - `docs/MODEL_STRATEGY.md` : strategie modele et decision from scratch
 - `docs/DATASET_AND_BENCHMARK_ARCHITECTURE.md` : pipeline dataset et benchmatch
 - `docs/COLAB_OPERATIONS.md` : operations Colab, Drive, GitHub, reprise
+- `docs/FIRESTORE_ARCHITECTURE_20M.md` : architecture multi-Colab quota-first et plan P0/P1/P2
 - `docs/OPERATIONS_SPEC.md` : schemas des jobs, fichiers de reprise et model cards
 - `docs/REPO_STRUCTURE_SPEC.md` : structure cible du repository
 - `docs/ARTIFACTS_AND_LOGGING_SPEC.md` : conventions d'artefacts et de logs
 - `docs/DATASET_V1_SPEC.md` : specification du premier dataset
 - `docs/JOB_CONFIG_SPEC.md` : specification des fichiers YAML de jobs
-- `docs/CLI_SPEC.md` : specification des futures commandes CLI
+- `docs/CLI_SPEC.md` : specification des commandes CLI disponibles
 - `docs/STATE_REPRESENTATION_SPEC.md` : specification de la representation d'etat V1
 - `docs/MODEL_V1_SPEC.md` : specification du premier modele neuronal
 - `docs/BENCHMARK_V1_SPEC.md` : specification du protocole benchmark V1
 - `docs/DECISIONS_REGISTER.md` : registre central des decisions prises et points ouverts
 - `docs/OPEN_DECISIONS_V1.md` : recommandations tranchees sur les derniers points ouverts V1
-- `src/songo_model_stockfish/` : futur package Python du projet
-- `config/` : futures configurations du nouveau pipeline
-- `notebooks/` : futurs notebooks Colab
-- `scripts/` : futurs scripts utilitaires
+- `src/songo_model_stockfish/` : package Python principal du projet
+- `config/` : configurations YAML du pipeline dataset/train/evaluation/benchmark
+- `notebooks/colab_compact.ipynb` : notebook principal multi-Colab
+- `scripts/` : scripts utilitaires (generation notebook, bootstrap, operations)
 
 ## Regle de lecture importante
 
@@ -203,8 +204,8 @@ Donc:
 
 Le projet contient maintenant une couche Colab dediee pour mettre a jour le code sans toucher aux artefacts persistants:
 
-- `notebooks/colab_all_in_one.ipynb`
-  Notebook unique pour monter Drive, mettre a jour le code, lancer dataset-generate, dataset-build, train, evaluate et benchmark avec des `job_id` resumables.
+- `notebooks/colab_compact.ipynb`
+  Notebook principal pour monter Drive, generer les configs actives, lancer `dataset-generate` + `dataset-build` en parallele, monitorer la progression globale, puis enchainer train/evaluation/benchmark.
 
 Important pour Colab:
 
@@ -213,6 +214,9 @@ Important pour Colab:
 - toutes les commandes du notebook s'executent donc directement avec `python`
 - il n'a plus besoin de cloner `songo-ai`
 - le moteur de reference, `minimax` et `mcts` necessaires au dataset et au benchmark sont maintenant embarques dans ce repo
+- le runtime multi-Colab utilise Firestore comme source de verite de coordination
+- en pratique, il faut renseigner `FIRESTORE_CREDENTIALS_PATH` avec un service account JSON
+- en multi-workers, activer `LOW_QUOTA_PROFILE=True` pour limiter les reads/writes Firestore
 
 Scripts utiles:
 
@@ -329,7 +333,7 @@ Sur le lot actuel, les evolutions concretes ajoutees sont:
   - `clone_existing`
   - `derive_existing`
 - `dataset-build` peut maintenant choisir explicitement quelle source de dataset il enrichit
-- debut de versionning dataset via `data/dataset_registry.json`
+- versionning dataset via `dataset_registry/primary` (Firestore) avec compatibilite locale `data/dataset_registry.json`
 - `train` avec `gradient clipping`, scheduler `cosine` et `early stopping`
 - export du meilleur checkpoint comme modele final
 - `evaluation` enrichie avec `value_mae`

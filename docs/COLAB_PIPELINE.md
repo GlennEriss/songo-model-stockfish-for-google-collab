@@ -2,17 +2,19 @@
 
 ## Objectif
 
-Definir une organisation solide pour entrainer le nouveau modele dans Google Colab sans reutiliser l'ancien stack de `songo-ai`.
+Definir une organisation solide pour executer le pipeline dataset/train dans Google Colab, avec coordination multi-workers via Firestore et artefacts lourds sur Drive.
 
 ## Schema cible
 
 1. cloner le repo GitHub
 2. installer `requirements.txt`
-3. charger ou generer le dataset du nouveau projet
-4. lancer le train
-5. sauvegarder les checkpoints dans Drive
-6. lancer l'evaluation
-7. reprendre automatiquement si une session est interrompue
+3. configurer Drive + Firestore credentials
+4. generer les configs actives runtime
+5. lancer `dataset-generate` en parallele
+6. lancer `dataset-build` en parallele
+7. monitorer la progression globale dans Firestore
+8. reprendre automatiquement si session interrompue
+9. lancer train/evaluation/benchmark sur dataset final
 
 ## Organisation recommandee
 
@@ -28,17 +30,25 @@ Definir une organisation solide pour entrainer le nouveau modele dans Google Col
   - logs
   - rapports
   - etats de jobs
+- Firestore:
+  - etat vivant global (`global_generation_progress`)
+  - registre datasets (`dataset_registry`)
+  - coordination workers (`worker_leases`)
+  - checkpoints runtime (`worker_checkpoints`)
+  - manifests pipeline (`pipeline_manifests`)
 
-## Premier notebook cible
+## Notebook principal actuel
 
-Le premier notebook devra faire seulement:
+- `notebooks/colab_compact.ipynb`
 
-- installation
-- verification GPU
-- chargement d'un mini dataset
-- entrainement smoke test
-- sauvegarde d'un checkpoint
-- reprise depuis un checkpoint existant
+Il couvre:
+
+- bootstrap runtime Colab
+- generation des YAML actifs
+- lancement parallele `dataset-generate` + `dataset-build`
+- monitoring source/build/global/workers/health
+- mode quota economique (`LOW_QUOTA_PROFILE`)
+- reprise auto via `job_id` + checkpoints
 
 ## Point de cadrage important
 
@@ -58,6 +68,18 @@ Il peut seulement s'appuyer sur `songo-ai` pour:
 - necessite de reprendre facilement un run interrompu
 - importance de sauvegarder regulièrement les artefacts
 - separation stricte entre code mis a jour et artefacts existants
+- quotas Firestore read/write en multi-Colab
+
+## Parametres quota-first recommandes
+
+- `GLOBAL_PROGRESS_BACKEND='firestore'`
+- `GLOBAL_BUDGET_ENFORCEMENT_MODE='batched'`
+- `GLOBAL_PROGRESS_FLUSH_EVERY_N_GAMES=200`
+- `GLOBAL_TARGET_POLL_INTERVAL_SECONDS=60`
+- `SOURCE_POLL_INTERVAL_SECONDS=45` a `60`
+- `DATASET_BUILD_EXPORT_PARTIAL_EVERY_N_FILES=200` a `500`
+- `MONITOR_REFRESH_SECONDS=90` a `120`
+- `PIPELINE_MANIFEST_FIRESTORE_WRITE_ENABLED=False`
 
 ## Documents complementaires
 
@@ -65,5 +87,6 @@ Voir aussi:
 
 - `docs/COLAB_OPERATIONS.md`
 - `docs/SYSTEM_ARCHITECTURE.md`
+- `docs/FIRESTORE_ARCHITECTURE_20M.md`
 - `docs/MODEL_STRATEGY.md`
 - `docs/DATASET_AND_BENCHMARK_ARCHITECTURE.md`

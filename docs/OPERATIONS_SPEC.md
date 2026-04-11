@@ -22,6 +22,19 @@ Toutes les executions importantes du projet doivent avoir:
 - un `events.jsonl`
 - un `metrics.jsonl`
 
+En mode multi-Colab, le runtime synchronise aussi un etat Firestore:
+
+- `global_generation_progress/{global_target_id}`
+- `dataset_registry/primary`
+- `worker_checkpoints/{job_id}`
+- `worker_leases/{global_target_id}`
+- `pipeline_manifests/{worker_tag}`
+
+Regle:
+
+- Drive reste la persistance principale des artefacts lourds
+- Firestore reste la source de verite pour la coordination runtime
+
 ## 3. `job_id`
 
 Format recommande:
@@ -243,12 +256,14 @@ Un job est resumable si:
 - `run_status.json` existe
 - `state.json` existe
 - les artefacts partiels precedents existent encore
+- `worker_checkpoints/{job_id}` est accessible (mode Firestore)
 
 Regles:
 
 - ne jamais relancer les unites deja marquees `completed`
 - conserver le meme `job_id`
 - ajouter de nouveaux evenements dans les memes fichiers JSONL
+- en multi-Colab, verifier aussi l'etat global `global_generation_progress` avant relance
 
 ## 11. Etats standards d'un job
 
