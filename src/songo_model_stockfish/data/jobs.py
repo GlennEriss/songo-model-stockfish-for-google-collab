@@ -363,8 +363,8 @@ def _update_global_generation_progress_firestore(
             "updated_at": utc_now_iso(),
         }
         current["dataset_source_id"] = str(dataset_source_id)
-        current["contributed_samples"] = int(current.get("contributed_samples", 0)) + int(max(0, delta_samples))
-        current["contributed_games"] = int(current.get("contributed_games", 0)) + int(max(0, delta_games))
+        current["contributed_samples"] = max(0, int(current.get("contributed_samples", 0)) + int(delta_samples))
+        current["contributed_games"] = max(0, int(current.get("contributed_games", 0)) + int(delta_games))
         current["updated_at"] = utc_now_iso()
         workers[str(job_id)] = {
             "dataset_source_id": str(current.get("dataset_source_id", "")),
@@ -713,8 +713,8 @@ def _update_global_generation_progress(
             "updated_at": utc_now_iso(),
         }
         current["dataset_source_id"] = str(dataset_source_id)
-        current["contributed_samples"] = int(current.get("contributed_samples", 0)) + int(max(0, delta_samples))
-        current["contributed_games"] = int(current.get("contributed_games", 0)) + int(max(0, delta_games))
+        current["contributed_samples"] = max(0, int(current.get("contributed_samples", 0)) + int(delta_samples))
+        current["contributed_games"] = max(0, int(current.get("contributed_games", 0)) + int(delta_games))
         current["updated_at"] = utc_now_iso()
         workers[str(job_id)] = {
             "dataset_source_id": str(current.get("dataset_source_id", "")),
@@ -1182,6 +1182,20 @@ def _register_dataset_source(
         "updated_at": utc_now_iso(),
     }
     def _upsert_source(registry: dict[str, Any]) -> None:
+        existing_entry: dict[str, Any] | None = None
+        for entry in registry.get("dataset_sources", []):
+            if str(entry.get("dataset_source_id", "")) == dataset_source_id:
+                existing_entry = entry if isinstance(entry, dict) else None
+                break
+        # Keep source counters monotonic across restarts/checkpoints to avoid
+        # visible regressions in monitoring when a worker resumes.
+        if existing_entry is not None:
+            payload["raw_files"] = max(int(payload.get("raw_files", 0)), int(existing_entry.get("raw_files", 0) or 0))
+            payload["sampled_files"] = max(int(payload.get("sampled_files", 0)), int(existing_entry.get("sampled_files", 0) or 0))
+            payload["sampled_positions"] = max(
+                int(payload.get("sampled_positions", 0)),
+                int(existing_entry.get("sampled_positions", 0) or 0),
+            )
         _upsert_registry_entry(
             registry["dataset_sources"],
             key="dataset_source_id",
@@ -1292,7 +1306,6 @@ def _write_dataset_generation_progress_snapshot(
 ) -> dict[str, Any]:
     added_games = sum(int(item.get("games_added", 0)) for item in summaries)
     added_samples = sum(int(item.get("samples_added", 0)) for item in summaries)
-    total_game_files = sum(int(item.get("existing_games", 0)) + int(item.get("games_added", 0)) for item in summaries)
     metadata = _register_dataset_source(
         job,
         dataset_source_id=dataset_source_id,
@@ -1350,7 +1363,6 @@ def _write_benchmatch_progress_snapshot(
 ) -> dict[str, Any]:
     added_games = sum(int(item.get("games_added", 0)) for item in summaries)
     added_samples = sum(int(item.get("samples_added", 0)) for item in summaries)
-    total_game_files = sum(int(item.get("existing_games", 0)) + int(item.get("games_added", 0)) for item in summaries)
     metadata = _register_dataset_source(
         job,
         dataset_source_id=dataset_source_id,
@@ -1372,8 +1384,6 @@ def _write_benchmatch_progress_snapshot(
             "added_samples": added_samples,
             "total_samples": int(total_samples),
         },
-        raw_files_override=total_game_files,
-        sampled_files_override=total_game_files,
         sampled_positions_override=int(total_samples),
     )
     summary = {
@@ -2144,6 +2154,28 @@ def _build_pending_incremental_games(
     return pending
 
 
+def _accumulate_matchup_summary(summaries: list[dict[str, Any]], summary_payload: dict[str, Any]) -> None:
+    matchup_id = str(summary_payload.get("matchup_id", "")).strip()
+    if not matchup_id:
+        summaries.append(summary_payload)
+        return
+    for index, entry in enumerate(summaries):
+        if str(entry.get("matchup_id", "")).strip() != matchup_id:
+            continue
+        merged = dict(entry)
+        merged["games_added"] = int(entry.get("games_added", 0)) + int(summary_payload.get("games_added", 0))
+        merged["games_failed"] = int(entry.get("games_failed", 0)) + int(summary_payload.get("games_failed", 0))
+        merged["samples_added"] = int(entry.get("samples_added", 0)) + int(summary_payload.get("samples_added", 0))
+        # Keep latest metadata for observability.
+        merged["cycle_index"] = int(summary_payload.get("cycle_index", entry.get("cycle_index", 0) or 0))
+        merged["existing_games"] = int(summary_payload.get("existing_games", entry.get("existing_games", 0) or 0))
+        merged["sample_every_n_plies"] = int(summary_payload.get("sample_every_n_plies", entry.get("sample_every_n_plies", 0) or 0))
+        merged["num_workers"] = int(summary_payload.get("num_workers", entry.get("num_workers", 0) or 0))
+        summaries[index] = merged
+        return
+    summaries.append(summary_payload)
+
+
 def _resolve_model_checkpoint_for_generation(model_spec: str, *, models_root: Path) -> tuple[str, Path]:
     requested = str(model_spec).strip()
     if requested in {"auto", "auto_latest"}:
@@ -2678,6 +2710,8 @@ def _run_pending_games_sequential(
     model_agent_device: str,
     on_game_completed: Callable[[dict[str, Any], int, int], None] | None = None,
     sample_cap_resolver: Callable[[dict[str, Any], int], int] | None = None,
+    on_game_failed: Callable[[dict[str, Any], Exception], None] | None = None,
+    on_materialization_error: Callable[[dict[str, Any], int, Exception], None] | None = None,
 ) -> tuple[int, int, str]:
     agent_a = _build_external_agent(matchup_a, models_root=models_root, device=model_agent_device)
     agent_b = _build_external_agent(matchup_b, models_root=models_root, device=model_agent_device)
@@ -2692,32 +2726,46 @@ def _run_pending_games_sequential(
             pending["seed"],
             pending["starter"],
         )
-        raw_payload, samples = _play_and_sample_game(
-            agent_a,
-            agent_b,
-            matchup_id=matchup_id,
-            game_id=str(pending["game_id"]),
-            seed=int(pending["seed"]),
-            starter=int(pending["starter"]),
-            sample_every_n_plies=sample_every_n_plies,
-            max_moves=max_moves,
-        )
+        try:
+            raw_payload, samples = _play_and_sample_game(
+                agent_a,
+                agent_b,
+                matchup_id=matchup_id,
+                game_id=str(pending["game_id"]),
+                seed=int(pending["seed"]),
+                starter=int(pending["starter"]),
+                sample_every_n_plies=sample_every_n_plies,
+                max_moves=max_moves,
+            )
+        except Exception as exc:
+            if on_game_failed is not None:
+                on_game_failed(pending, exc)
+                continue
+            raise
         max_samples_to_write = len(samples)
         if sample_cap_resolver is not None:
             max_samples_to_write = max(0, int(sample_cap_resolver(pending, len(samples))))
-        games_inc, samples_inc = _materialize_completed_game(
-            job,
-            pending=pending,
-            raw_payload=raw_payload,
-            samples=samples,
-            matchup_id=matchup_id,
-            games=games,
-            execution_mode="sequential",
-            max_samples_to_write=max_samples_to_write,
-        )
+        try:
+            games_inc, samples_inc = _materialize_completed_game(
+                job,
+                pending=pending,
+                raw_payload=raw_payload,
+                samples=samples,
+                matchup_id=matchup_id,
+                games=games,
+                execution_mode="sequential",
+                max_samples_to_write=max_samples_to_write,
+            )
+        except Exception as exc:
+            if on_materialization_error is not None:
+                on_materialization_error(pending, int(max_samples_to_write), exc)
+            if on_game_failed is not None:
+                on_game_failed(pending, exc)
+                continue
+            raise
         completed_games += games_inc
         completed_samples += samples_inc
-        if on_game_completed is not None:
+        if on_game_completed is not None and games_inc > 0:
             on_game_completed(pending, completed_games, completed_samples)
     return completed_games, completed_samples, "sequential"
 
@@ -2734,6 +2782,16 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
     merge_dedupe_sample_ids = bool(cfg.get("merge_dedupe_sample_ids", True))
     games = int(cfg.get("games", 20))
     matchups = list(cfg.get("matchups", []))
+    cycle_matchups_until_target = bool(
+        cfg.get(
+            "cycle_matchups_until_target",
+            cfg.get("benchmatch_cycle_matchups_until_target", source_mode == "benchmatch"),
+        )
+    )
+    max_matchup_cycles = max(
+        0,
+        int(cfg.get("max_matchup_cycles", cfg.get("benchmatch_max_matchup_cycles", 0))),
+    )
     sample_every_n_plies = int(cfg.get("sample_every_n_plies", 2))
     if sample_every_n_plies <= 0:
         raise ValueError("`sample_every_n_plies` doit etre strictement positif")
@@ -3162,7 +3220,12 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
     state = job.read_state()
     summaries: list[dict[str, Any]] = []
     initial_total_samples = _count_total_jsonl_lines(sampled_dir)
+    initial_total_games = _count_jsonl_files(sampled_dir)
     total_samples_after_run = initial_total_samples
+    last_completed_game_id = str(state.get("last_completed_game_id", "")).strip()
+    global_budget_reservation_enabled = bool(
+        global_target_enabled and source_mode == "benchmatch" and global_target_samples > 0
+    )
     progress_update_every_n_games = max(1, int(job.config.get("dataset_generation", {}).get("progress_update_every_n_games", 25)))
 
     job.logger.info("dataset generation started")
@@ -3241,59 +3304,498 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
         )
         return summary
 
-    for matchup_index, matchup_spec in enumerate(matchups):
-        matchup_a, matchup_b = _parse_matchup(str(matchup_spec))
-        matchup_id = _slugify_matchup(str(matchup_spec))
-        job.set_phase(f"dataset_generation:{matchup_id}")
-        summary_path = dataset_dir / f"{matchup_id}_summary.json"
-        if target_samples > 0 and total_samples_after_run >= target_samples:
+    cycle_index = 0
+    while True:
+        cycle_index += 1
+        cycle_samples_before = total_samples_after_run
+        cycle_stop_requested = False
+        for matchup_index, matchup_spec in enumerate(matchups):
+            matchup_a, matchup_b = _parse_matchup(str(matchup_spec))
+            matchup_id = _slugify_matchup(str(matchup_spec))
+            job.set_phase(f"dataset_generation:{matchup_id}")
+            summary_path = dataset_dir / f"{matchup_id}_summary.json"
+            if target_samples > 0 and total_samples_after_run >= target_samples:
+                job.logger.info(
+                    "dataset generation target reached during run | current_samples=%s | target_samples=%s",
+                    total_samples_after_run,
+                    target_samples,
+                )
+                break
+    
+            matchup_game_count = 0
+            matchup_sample_count = 0
+            matchup_failed_game_count = 0
+            global_stop_requested = False
+            existing_numbers = _existing_game_numbers(raw_dir, sampled_dir, matchup_id)
+            existing_game_count = len(existing_numbers)
             job.logger.info(
-                "dataset generation target reached during run | current_samples=%s | target_samples=%s",
-                total_samples_after_run,
+                "dataset matchup started | %s/%s | %s vs %s | add_games=%s | existing_games=%s | sample_every=%s | workers=%s | target_samples=%s",
+                matchup_index + 1,
+                len(matchups),
+                matchup_a,
+                matchup_b,
+                games,
+                existing_game_count,
+                sample_every_n_plies,
+                num_workers,
                 target_samples,
             )
-            break
+            job.write_event(
+                "dataset_matchup_started",
+                matchup=matchup_id,
+                matchup_index=matchup_index + 1,
+                total_matchups=len(matchups),
+                player_a=matchup_a,
+                player_b=matchup_b,
+                add_games=games,
+                existing_games=existing_game_count,
+                sample_every_n_plies=sample_every_n_plies,
+                num_workers=num_workers,
+            )
+    
+            pending_games = _build_pending_incremental_games(
+                raw_dir=raw_dir,
+                sampled_dir=sampled_dir,
+                matchup_id=matchup_id,
+                games_to_add=games,
+                seed_base=base_seed + (matchup_index * 1_000_000),
+            )
+    
+            def _update_benchmatch_progress(completed_game_id: str) -> None:
+                nonlocal last_completed_game_id
+                resolved_game_id = str(completed_game_id).strip()
+                if resolved_game_id:
+                    last_completed_game_id = resolved_game_id
+                _write_benchmatch_progress_snapshot(
+                    job=job,
+                    dataset_dir=dataset_dir,
+                    dataset_source_id=dataset_source_id,
+                    raw_dir=raw_dir,
+                    sampled_dir=sampled_dir,
+                    target_samples=target_samples,
+                    games_per_matchup=games,
+                    sample_every_n_plies=sample_every_n_plies,
+                    matchups=[str(matchup) for matchup in matchups],
+                    source_dataset_id=source_dataset_id,
+                    source_dataset_ids=source_dataset_ids,
+                    derivation_strategy=derivation_strategy,
+                    derivation_params=derivation_params,
+                    summaries=summaries + [{
+                        "matchup_id": matchup_id,
+                        "player_a": matchup_a,
+                        "player_b": matchup_b,
+                        "existing_games": existing_game_count,
+                        "games_added": matchup_game_count,
+                        "samples_added": matchup_sample_count,
+                        "sample_every_n_plies": sample_every_n_plies,
+                        "num_workers": num_workers,
+                    }],
+                    total_samples=total_samples_after_run,
+                )
+                job.write_state(
+                    {
+                        "current_matchup": matchup_id,
+                        "completed_games": matchup_game_count,
+                        "remaining_games": games - matchup_game_count,
+                        "last_completed_game_id": last_completed_game_id,
+                        "sample_count": total_samples_after_run,
+                        "target_samples": target_samples,
+                    }
+                )
+    
+            def _global_target_reached() -> bool:
+                if not (global_target_enabled and source_mode == "benchmatch" and global_target_samples > 0):
+                    return False
+                state = _read_global_generation_progress(
+                    global_progress_path,
+                    global_target_id=global_target_id,
+                    target_samples=global_target_samples,
+                    progress_backend=global_progress_backend,
+                )
+                return int(state.get("total_samples", 0)) >= int(global_target_samples)
+    
+            def _local_target_remaining() -> int:
+                if target_samples <= 0:
+                    return 1_000_000_000
+                return max(0, int(target_samples) - int(total_samples_after_run))
 
-        matchup_game_count = 0
-        matchup_sample_count = 0
-        matchup_failed_game_count = 0
-        global_stop_requested = False
-        existing_numbers = _existing_game_numbers(raw_dir, sampled_dir, matchup_id)
-        existing_game_count = len(existing_numbers)
-        job.logger.info(
-            "dataset matchup started | %s/%s | %s vs %s | add_games=%s | existing_games=%s | sample_every=%s | workers=%s | target_samples=%s",
-            matchup_index + 1,
-            len(matchups),
-            matchup_a,
-            matchup_b,
-            games,
-            existing_game_count,
-            sample_every_n_plies,
-            num_workers,
-            target_samples,
-        )
-        job.write_event(
-            "dataset_matchup_started",
-            matchup=matchup_id,
-            matchup_index=matchup_index + 1,
-            total_matchups=len(matchups),
-            player_a=matchup_a,
-            player_b=matchup_b,
-            add_games=games,
-            existing_games=existing_game_count,
-            sample_every_n_plies=sample_every_n_plies,
-            num_workers=num_workers,
-        )
+            def _release_reserved_global_budget(
+                *,
+                pending: dict[str, Any],
+                reserved_samples: int,
+                reserved_games: int,
+                reason: str,
+                error: Exception | None = None,
+            ) -> None:
+                release_samples = max(0, int(reserved_samples))
+                release_games = max(0, int(reserved_games))
+                if not global_budget_reservation_enabled or (release_samples <= 0 and release_games <= 0):
+                    return
+                try:
+                    released_state = _update_global_generation_progress(
+                        progress_path=global_progress_path,
+                        lock_dir=global_progress_lock_dir,
+                        global_target_id=global_target_id,
+                        target_samples=global_target_samples,
+                        job_id=job.job_id,
+                        dataset_source_id=dataset_source_id,
+                        delta_samples=-release_samples,
+                        delta_games=-release_games,
+                        progress_backend=global_progress_backend,
+                    )
+                    job.logger.warning(
+                        "dataset global budget released | reason=%s | matchup=%s | game=%s/%s | released_samples=%s | released_games=%s | global_total_samples=%s",
+                        reason,
+                        matchup_id,
+                        pending["game_no"],
+                        games,
+                        release_samples,
+                        release_games,
+                        int(released_state.get("total_samples", 0)),
+                    )
+                    job.write_event(
+                        "dataset_global_budget_released",
+                        reason=reason,
+                        matchup=matchup_id,
+                        game_id=pending["game_id"],
+                        game_index=pending["game_no"],
+                        released_samples=release_samples,
+                        released_games=release_games,
+                        error=f"{type(error).__name__}: {error}" if error is not None else "",
+                    )
+                except Exception as release_exc:
+                    job.logger.error(
+                        "dataset global budget release failed | reason=%s | matchup=%s | game=%s/%s | released_samples=%s | released_games=%s | error=%s: %s",
+                        reason,
+                        matchup_id,
+                        pending["game_no"],
+                        games,
+                        release_samples,
+                        release_games,
+                        type(release_exc).__name__,
+                        release_exc,
+                    )
+                    job.write_event(
+                        "dataset_global_budget_release_failed",
+                        reason=reason,
+                        matchup=matchup_id,
+                        game_id=pending["game_id"],
+                        game_index=pending["game_no"],
+                        released_samples=release_samples,
+                        released_games=release_games,
+                        release_error=f"{type(release_exc).__name__}: {release_exc}",
+                    )
 
-        pending_games = _build_pending_incremental_games(
-            raw_dir=raw_dir,
-            sampled_dir=sampled_dir,
-            matchup_id=matchup_id,
-            games_to_add=games,
-            seed_base=base_seed + (matchup_index * 1_000_000),
-        )
+            def _resolve_admitted_samples(pending: dict[str, Any], requested_samples: int) -> int:
+                requested = max(0, int(requested_samples))
+                if requested <= 0:
+                    return 0
+                admitted = min(requested, _local_target_remaining())
+                if admitted <= 0:
+                    return 0
+                if not global_budget_reservation_enabled:
+                    return admitted
+                admitted_samples, _admitted_games, _state = _reserve_global_generation_budget(
+                    progress_path=global_progress_path,
+                    lock_dir=global_progress_lock_dir,
+                    global_target_id=global_target_id,
+                    target_samples=global_target_samples,
+                    job_id=job.job_id,
+                    dataset_source_id=dataset_source_id,
+                    requested_samples=admitted,
+                    requested_games=1,
+                    progress_backend=global_progress_backend,
+                )
+                return int(admitted_samples)
 
-        def _update_benchmatch_progress(last_completed_game_id: str) -> None:
+            def _make_sequential_progress_callback(base_games: int, base_samples: int) -> Callable[[dict[str, Any], int, int], None]:
+                def _on_sequential_game_completed(pending: dict[str, Any], completed_games_so_far: int, completed_samples_so_far: int) -> None:
+                    nonlocal matchup_game_count, matchup_sample_count, total_samples_after_run, last_completed_game_id
+                    matchup_game_count = int(base_games) + int(completed_games_so_far)
+                    matchup_sample_count = int(base_samples) + int(completed_samples_so_far)
+                    total_samples_after_run = initial_total_samples + sum(int(item.get("samples_added", 0)) for item in summaries) + matchup_sample_count
+                    last_completed_game_id = str(pending["game_id"])
+                    if matchup_game_count % progress_update_every_n_games == 0:
+                        _update_benchmatch_progress(str(pending["game_id"]))
+
+                return _on_sequential_game_completed
+
+            def _on_sequential_game_failed(pending: dict[str, Any], exc: Exception) -> None:
+                nonlocal matchup_failed_game_count
+                matchup_failed_game_count += 1
+                job.logger.warning(
+                    "dataset game failed | matchup=%s | game=%s/%s | error=%s: %s | mode=sequential",
+                    matchup_id,
+                    pending["game_no"],
+                    games,
+                    type(exc).__name__,
+                    exc,
+                )
+                job.write_event(
+                    "dataset_game_failed",
+                    matchup=matchup_id,
+                    game_id=pending["game_id"],
+                    game_index=pending["game_no"],
+                    execution_mode="sequential",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+
+            def _on_sequential_materialization_error(pending: dict[str, Any], reserved_samples: int, exc: Exception) -> None:
+                reserved_games = 1 if (global_budget_reservation_enabled and int(reserved_samples) > 0) else 0
+                _release_reserved_global_budget(
+                    pending=pending,
+                    reserved_samples=int(reserved_samples),
+                    reserved_games=reserved_games,
+                    reason="materialization_failed_sequential",
+                    error=exc,
+                )
+
+            if num_workers <= 1:
+                completed_games, completed_samples, _execution_mode = _run_pending_games_sequential(
+                    job,
+                    pending_games=pending_games,
+                    matchup_a=matchup_a,
+                    matchup_b=matchup_b,
+                    matchup_id=matchup_id,
+                    games=games,
+                    sample_every_n_plies=sample_every_n_plies,
+                    max_moves=max_moves,
+                    models_root=job.paths.models_root,
+                    model_agent_device=model_agent_device,
+                    on_game_completed=_make_sequential_progress_callback(0, 0),
+                    sample_cap_resolver=lambda pending, sample_count: _resolve_admitted_samples(pending, sample_count),
+                    on_game_failed=_on_sequential_game_failed,
+                    on_materialization_error=_on_sequential_materialization_error,
+                )
+                matchup_game_count = int(completed_games)
+                matchup_sample_count = int(completed_samples)
+                if last_completed_game_id:
+                    _update_benchmatch_progress(last_completed_game_id)
+            else:
+                job.logger.info(
+                    "dataset matchup parallel execution | matchup=%s | workers=%s | pending_games=%s | max_pending=%s | start_method=%s | max_tasks_per_child=%s",
+                    matchup_id,
+                    num_workers,
+                    len(pending_games),
+                    max_pending_futures,
+                    multiprocessing_start_method,
+                    effective_max_tasks_per_child,
+                )
+                job.write_event(
+                    "dataset_parallel_execution_started",
+                    matchup=matchup_id,
+                    workers=num_workers,
+                    pending_games=len(pending_games),
+                    max_pending_futures=max_pending_futures,
+                    multiprocessing_start_method=multiprocessing_start_method,
+                    max_tasks_per_child=effective_max_tasks_per_child,
+                )
+    
+                future_map: dict[concurrent.futures.Future, dict[str, Any]] = {}
+                pending_queue = list(pending_games)
+                try:
+                    mp_context = multiprocessing.get_context(multiprocessing_start_method)
+                    with concurrent.futures.ProcessPoolExecutor(
+                        max_workers=num_workers,
+                        mp_context=mp_context,
+                        max_tasks_per_child=effective_max_tasks_per_child,
+                    ) as executor:
+                        while pending_queue or future_map:
+                            if _global_target_reached():
+                                global_stop_requested = True
+                                pending_queue.clear()
+                            while pending_queue and len(future_map) < max_pending_futures:
+                                if _global_target_reached():
+                                    global_stop_requested = True
+                                    pending_queue.clear()
+                                    break
+                                pending = pending_queue.pop(0)
+                                job.logger.info(
+                                    "dataset game scheduled | matchup=%s | game=%s/%s | seed=%s | starter=%s | mode=parallel",
+                                    matchup_id,
+                                    pending["game_no"],
+                                    games,
+                                    pending["seed"],
+                                    pending["starter"],
+                                )
+                                future = executor.submit(
+                                    _play_and_sample_game_from_specs,
+                                    matchup_a,
+                                    matchup_b,
+                                    matchup_id=matchup_id,
+                                    game_id=str(pending["game_id"]),
+                                    seed=int(pending["seed"]),
+                                    starter=int(pending["starter"]),
+                                    sample_every_n_plies=sample_every_n_plies,
+                                    max_moves=max_moves,
+                                    models_root=str(job.paths.models_root),
+                                    model_agent_device=model_agent_device,
+                                )
+                                future_map[future] = pending
+    
+                            done, _not_done = concurrent.futures.wait(
+                                future_map.keys(),
+                                return_when=concurrent.futures.FIRST_COMPLETED,
+                            )
+                            for future in done:
+                                pending = future_map.pop(future)
+                                try:
+                                    raw_payload, samples = future.result()
+                                except Exception as exc:
+                                    matchup_failed_game_count += 1
+                                    job.logger.warning(
+                                        "dataset game failed | matchup=%s | game=%s/%s | error=%s: %s | mode=parallel",
+                                        matchup_id,
+                                        pending["game_no"],
+                                        games,
+                                        type(exc).__name__,
+                                        exc,
+                                    )
+                                    job.write_event(
+                                        "dataset_game_failed",
+                                        matchup=matchup_id,
+                                        game_id=pending["game_id"],
+                                        game_index=pending["game_no"],
+                                        execution_mode="parallel",
+                                        error=f"{type(exc).__name__}: {exc}",
+                                    )
+                                    continue
+                                admitted_samples = _resolve_admitted_samples(pending, len(samples))
+                                try:
+                                    games_inc, samples_inc = _materialize_completed_game(
+                                        job,
+                                        pending=pending,
+                                        raw_payload=raw_payload,
+                                        samples=samples,
+                                        matchup_id=matchup_id,
+                                        games=games,
+                                        execution_mode="parallel",
+                                        max_samples_to_write=admitted_samples,
+                                    )
+                                except Exception as exc:
+                                    _release_reserved_global_budget(
+                                        pending=pending,
+                                        reserved_samples=int(admitted_samples),
+                                        reserved_games=(1 if (global_budget_reservation_enabled and int(admitted_samples) > 0) else 0),
+                                        reason="materialization_failed_parallel",
+                                        error=exc,
+                                    )
+                                    matchup_failed_game_count += 1
+                                    job.logger.warning(
+                                        "dataset game failed at materialization | matchup=%s | game=%s/%s | error=%s: %s | mode=parallel",
+                                        matchup_id,
+                                        pending["game_no"],
+                                        games,
+                                        type(exc).__name__,
+                                        exc,
+                                    )
+                                    job.write_event(
+                                        "dataset_game_failed",
+                                        matchup=matchup_id,
+                                        game_id=pending["game_id"],
+                                        game_index=pending["game_no"],
+                                        execution_mode="parallel",
+                                        error=f"{type(exc).__name__}: {exc}",
+                                    )
+                                    continue
+                                matchup_game_count += games_inc
+                                matchup_sample_count += samples_inc
+                                total_samples_after_run += samples_inc
+                                if games_inc > 0:
+                                    last_completed_game_id = str(pending["game_id"])
+                                if _global_target_reached():
+                                    global_stop_requested = True
+                                    pending_queue.clear()
+                                if games_inc > 0 and matchup_game_count % progress_update_every_n_games == 0:
+                                    _update_benchmatch_progress(str(pending["game_id"]))
+                except concurrent.futures.process.BrokenProcessPool as exc:
+                    failed_pending = list(future_map.values()) + list(pending_queue)
+                    job.logger.warning(
+                        "dataset parallel pool broken | matchup=%s | completed_games=%s | remaining_fallback=%s | error=%s",
+                        matchup_id,
+                        matchup_game_count,
+                        len(failed_pending),
+                        exc,
+                    )
+                    job.write_event(
+                        "dataset_parallel_execution_broken",
+                        matchup=matchup_id,
+                        completed_games=matchup_game_count,
+                        remaining_fallback=len(failed_pending),
+                        error=str(exc),
+                    )
+                    completed_games, completed_samples, _execution_mode = _run_pending_games_sequential(
+                        job,
+                        pending_games=failed_pending,
+                        matchup_a=matchup_a,
+                        matchup_b=matchup_b,
+                        matchup_id=matchup_id,
+                        games=games,
+                        sample_every_n_plies=sample_every_n_plies,
+                        max_moves=max_moves,
+                        models_root=job.paths.models_root,
+                        model_agent_device=model_agent_device,
+                        on_game_completed=_make_sequential_progress_callback(matchup_game_count, matchup_sample_count),
+                        sample_cap_resolver=lambda pending, sample_count: _resolve_admitted_samples(pending, sample_count),
+                        on_game_failed=_on_sequential_game_failed,
+                        on_materialization_error=_on_sequential_materialization_error,
+                    )
+                    matchup_game_count = int(matchup_game_count)
+                    matchup_sample_count = int(matchup_sample_count)
+                    if failed_pending and last_completed_game_id:
+                        job.write_state(
+                            {
+                                "current_matchup": matchup_id,
+                                "completed_games": matchup_game_count,
+                                "remaining_games": games - matchup_game_count,
+                                "last_completed_game_id": last_completed_game_id,
+                                "sample_count": total_samples_after_run,
+                                "target_samples": target_samples,
+                            }
+                        )
+            if global_stop_requested:
+                job.logger.info(
+                    "dataset generation global target reached, stopping early | global_target_id=%s | target_samples=%s",
+                    global_target_id,
+                    global_target_samples,
+                )
+
+            summary_payload = {
+                "matchup_id": matchup_id,
+                "cycle_index": cycle_index,
+                "player_a": matchup_a,
+                "player_b": matchup_b,
+                "existing_games": existing_game_count,
+                "games_added": matchup_game_count,
+                "games_failed": matchup_failed_game_count,
+                "samples_added": matchup_sample_count,
+                "sample_every_n_plies": sample_every_n_plies,
+                "num_workers": num_workers,
+            }
+            _write_json(summary_path, summary_payload)
+            _accumulate_matchup_summary(summaries, summary_payload)
+            job.logger.info(
+                "dataset matchup completed | cycle=%s | %s vs %s | games_added=%s | games_failed=%s | samples_added=%s | total_samples=%s",
+                cycle_index,
+                matchup_a,
+                matchup_b,
+                matchup_game_count,
+                matchup_failed_game_count,
+                matchup_sample_count,
+                total_samples_after_run,
+            )
+            job.write_state(
+                {
+                    "current_matchup": matchup_id,
+                    "completed_games": matchup_game_count,
+                    "remaining_games": 0,
+                    "last_completed_game_id": last_completed_game_id,
+                    "sample_count": total_samples_after_run,
+                    "target_samples": target_samples,
+                }
+            )
+            job.write_metric({"metric_type": "dataset_matchup_completed", **summary_payload})
+            job.write_event("dataset_matchup_completed", matchup=matchup_id, samples=matchup_sample_count, cycle_index=cycle_index)
             _write_benchmatch_progress_snapshot(
                 job=job,
                 dataset_dir=dataset_dir,
@@ -3308,322 +3810,73 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
                 source_dataset_ids=source_dataset_ids,
                 derivation_strategy=derivation_strategy,
                 derivation_params=derivation_params,
-                summaries=summaries + [{
-                    "matchup_id": matchup_id,
-                    "player_a": matchup_a,
-                    "player_b": matchup_b,
-                    "existing_games": existing_game_count,
-                    "games_added": matchup_game_count,
-                    "samples_added": matchup_sample_count,
-                    "sample_every_n_plies": sample_every_n_plies,
-                    "num_workers": num_workers,
-                }],
+                summaries=summaries,
                 total_samples=total_samples_after_run,
             )
-            job.write_state(
-                {
-                    "current_matchup": matchup_id,
-                    "completed_games": matchup_game_count,
-                    "remaining_games": games - matchup_game_count,
-                    "last_completed_game_id": last_completed_game_id,
-                    "sample_count": total_samples_after_run,
-                    "target_samples": target_samples,
-                }
-            )
-
-        def _global_target_reached() -> bool:
-            if not (global_target_enabled and source_mode == "benchmatch" and global_target_samples > 0):
-                return False
-            state = _read_global_generation_progress(
-                global_progress_path,
-                global_target_id=global_target_id,
-                target_samples=global_target_samples,
-                progress_backend=global_progress_backend,
-            )
-            return int(state.get("total_samples", 0)) >= int(global_target_samples)
-
-        def _local_target_remaining() -> int:
-            if target_samples <= 0:
-                return 1_000_000_000
-            return max(0, int(target_samples) - int(total_samples_after_run))
-
-        def _resolve_admitted_samples(requested_samples: int) -> int:
-            requested = max(0, int(requested_samples))
-            if requested <= 0:
-                return 0
-            admitted = min(requested, _local_target_remaining())
-            if admitted <= 0:
-                return 0
-            if not (global_target_enabled and source_mode == "benchmatch" and global_target_samples > 0):
-                return admitted
-            admitted_samples, _admitted_games, _state = _reserve_global_generation_budget(
-                progress_path=global_progress_path,
-                lock_dir=global_progress_lock_dir,
-                global_target_id=global_target_id,
-                target_samples=global_target_samples,
-                job_id=job.job_id,
-                dataset_source_id=dataset_source_id,
-                requested_samples=admitted,
-                requested_games=1,
-                progress_backend=global_progress_backend,
-            )
-            return int(admitted_samples)
-
-        def _make_sequential_progress_callback(base_games: int, base_samples: int) -> Callable[[dict[str, Any], int, int], None]:
-            def _on_sequential_game_completed(pending: dict[str, Any], completed_games_so_far: int, completed_samples_so_far: int) -> None:
-                nonlocal matchup_game_count, matchup_sample_count, total_samples_after_run
-                matchup_game_count = int(base_games) + int(completed_games_so_far)
-                matchup_sample_count = int(base_samples) + int(completed_samples_so_far)
-                total_samples_after_run = initial_total_samples + sum(int(item.get("samples_added", 0)) for item in summaries) + matchup_sample_count
-                if matchup_game_count % progress_update_every_n_games == 0:
-                    _update_benchmatch_progress(str(pending["game_id"]))
-
-            return _on_sequential_game_completed
-
-        if num_workers <= 1:
-            completed_games, completed_samples, _execution_mode = _run_pending_games_sequential(
-                job,
-                pending_games=pending_games,
-                matchup_a=matchup_a,
-                matchup_b=matchup_b,
-                matchup_id=matchup_id,
-                games=games,
-                sample_every_n_plies=sample_every_n_plies,
-                max_moves=max_moves,
-                models_root=job.paths.models_root,
-                model_agent_device=model_agent_device,
-                on_game_completed=_make_sequential_progress_callback(0, 0),
-                sample_cap_resolver=lambda _pending, sample_count: _resolve_admitted_samples(sample_count),
-            )
-            matchup_game_count = int(completed_games)
-            matchup_sample_count = int(completed_samples)
-            if pending_games:
-                _update_benchmatch_progress(str(pending_games[-1]["game_id"]))
-        else:
-            job.logger.info(
-                "dataset matchup parallel execution | matchup=%s | workers=%s | pending_games=%s | max_pending=%s | start_method=%s | max_tasks_per_child=%s",
-                matchup_id,
-                num_workers,
-                len(pending_games),
-                max_pending_futures,
-                multiprocessing_start_method,
-                effective_max_tasks_per_child,
-            )
-            job.write_event(
-                "dataset_parallel_execution_started",
-                matchup=matchup_id,
-                workers=num_workers,
-                pending_games=len(pending_games),
-                max_pending_futures=max_pending_futures,
-                multiprocessing_start_method=multiprocessing_start_method,
-                max_tasks_per_child=effective_max_tasks_per_child,
-            )
-
-            future_map: dict[concurrent.futures.Future, dict[str, Any]] = {}
-            pending_queue = list(pending_games)
-            try:
-                mp_context = multiprocessing.get_context(multiprocessing_start_method)
-                with concurrent.futures.ProcessPoolExecutor(
-                    max_workers=num_workers,
-                    mp_context=mp_context,
-                    max_tasks_per_child=effective_max_tasks_per_child,
-                ) as executor:
-                    while pending_queue or future_map:
-                        if _global_target_reached():
-                            global_stop_requested = True
-                            pending_queue.clear()
-                        while pending_queue and len(future_map) < max_pending_futures:
-                            if _global_target_reached():
-                                global_stop_requested = True
-                                pending_queue.clear()
-                                break
-                            pending = pending_queue.pop(0)
-                            job.logger.info(
-                                "dataset game scheduled | matchup=%s | game=%s/%s | seed=%s | starter=%s | mode=parallel",
-                                matchup_id,
-                                pending["game_no"],
-                                games,
-                                pending["seed"],
-                                pending["starter"],
-                            )
-                            future = executor.submit(
-                                _play_and_sample_game_from_specs,
-                                matchup_a,
-                                matchup_b,
-                                matchup_id=matchup_id,
-                                game_id=str(pending["game_id"]),
-                                seed=int(pending["seed"]),
-                                starter=int(pending["starter"]),
-                                sample_every_n_plies=sample_every_n_plies,
-                                max_moves=max_moves,
-                                models_root=str(job.paths.models_root),
-                                model_agent_device=model_agent_device,
-                            )
-                            future_map[future] = pending
-
-                        done, _not_done = concurrent.futures.wait(
-                            future_map.keys(),
-                            return_when=concurrent.futures.FIRST_COMPLETED,
-                        )
-                        for future in done:
-                            pending = future_map.pop(future)
-                            try:
-                                raw_payload, samples = future.result()
-                            except Exception as exc:
-                                matchup_failed_game_count += 1
-                                job.logger.warning(
-                                    "dataset game failed | matchup=%s | game=%s/%s | error=%s: %s | mode=parallel",
-                                    matchup_id,
-                                    pending["game_no"],
-                                    games,
-                                    type(exc).__name__,
-                                    exc,
-                                )
-                                job.write_event(
-                                    "dataset_game_failed",
-                                    matchup=matchup_id,
-                                    game_id=pending["game_id"],
-                                    game_index=pending["game_no"],
-                                    execution_mode="parallel",
-                                    error=f"{type(exc).__name__}: {exc}",
-                                )
-                                continue
-                            admitted_samples = _resolve_admitted_samples(len(samples))
-                            games_inc, samples_inc = _materialize_completed_game(
-                                job,
-                                pending=pending,
-                                raw_payload=raw_payload,
-                                samples=samples,
-                                matchup_id=matchup_id,
-                                games=games,
-                                execution_mode="parallel",
-                                max_samples_to_write=admitted_samples,
-                            )
-                            matchup_game_count += games_inc
-                            matchup_sample_count += samples_inc
-                            total_samples_after_run += samples_inc
-                            if _global_target_reached():
-                                global_stop_requested = True
-                                pending_queue.clear()
-                            if matchup_game_count % progress_update_every_n_games == 0:
-                                _update_benchmatch_progress(str(pending["game_id"]))
-            except concurrent.futures.process.BrokenProcessPool as exc:
-                failed_pending = list(future_map.values()) + list(pending_queue)
-                job.logger.warning(
-                    "dataset parallel pool broken | matchup=%s | completed_games=%s | remaining_fallback=%s | error=%s",
-                    matchup_id,
-                    matchup_game_count,
-                    len(failed_pending),
-                    exc,
-                )
-                job.write_event(
-                    "dataset_parallel_execution_broken",
-                    matchup=matchup_id,
-                    completed_games=matchup_game_count,
-                    remaining_fallback=len(failed_pending),
-                    error=str(exc),
-                )
-                completed_games, completed_samples, _execution_mode = _run_pending_games_sequential(
-                    job,
-                    pending_games=failed_pending,
-                    matchup_a=matchup_a,
-                    matchup_b=matchup_b,
-                    matchup_id=matchup_id,
-                    games=games,
-                    sample_every_n_plies=sample_every_n_plies,
-                    max_moves=max_moves,
-                    models_root=job.paths.models_root,
-                    model_agent_device=model_agent_device,
-                    on_game_completed=_make_sequential_progress_callback(matchup_game_count, matchup_sample_count),
-                    sample_cap_resolver=lambda _pending, sample_count: _resolve_admitted_samples(sample_count),
-                )
-                matchup_game_count = int(matchup_game_count)
-                matchup_sample_count = int(matchup_sample_count)
-                if failed_pending:
-                    job.write_state(
-                        {
-                            "current_matchup": matchup_id,
-                            "completed_games": matchup_game_count,
-                            "remaining_games": games - matchup_game_count,
-                            "last_completed_game_id": failed_pending[-1]["game_id"],
-                            "sample_count": total_samples_after_run,
-                            "target_samples": target_samples,
-                        }
-                    )
-        if global_stop_requested:
-            job.logger.info(
-                "dataset generation global target reached, stopping early | global_target_id=%s | target_samples=%s",
-                global_target_id,
-                global_target_samples,
-            )
-
-        summary_payload = {
-            "matchup_id": matchup_id,
-            "player_a": matchup_a,
-            "player_b": matchup_b,
-            "existing_games": existing_game_count,
-            "games_added": matchup_game_count,
-            "games_failed": matchup_failed_game_count,
-            "samples_added": matchup_sample_count,
-            "sample_every_n_plies": sample_every_n_plies,
-            "num_workers": num_workers,
-        }
-        _write_json(summary_path, summary_payload)
-        summaries.append(summary_payload)
-        job.logger.info(
-            "dataset matchup completed | %s vs %s | games_added=%s | games_failed=%s | samples_added=%s | total_samples=%s",
-            matchup_a,
-            matchup_b,
-            matchup_game_count,
-            matchup_failed_game_count,
-            matchup_sample_count,
-            total_samples_after_run,
-        )
-        job.write_state(
-            {
-                "current_matchup": matchup_id,
-                "completed_games": matchup_game_count,
-                "remaining_games": 0,
-                "last_completed_game_id": pending_games[-1]["game_id"] if pending_games else state.get("last_completed_game_id"),
-                "sample_count": total_samples_after_run,
-                "target_samples": target_samples,
-            }
-        )
-        job.write_metric({"metric_type": "dataset_matchup_completed", **summary_payload})
-        job.write_event("dataset_matchup_completed", matchup=matchup_id, samples=matchup_sample_count)
-        _write_benchmatch_progress_snapshot(
-            job=job,
-            dataset_dir=dataset_dir,
-            dataset_source_id=dataset_source_id,
-            raw_dir=raw_dir,
-            sampled_dir=sampled_dir,
-            target_samples=target_samples,
-            games_per_matchup=games,
-            sample_every_n_plies=sample_every_n_plies,
-            matchups=[str(matchup) for matchup in matchups],
-            source_dataset_id=source_dataset_id,
-            source_dataset_ids=source_dataset_ids,
-            derivation_strategy=derivation_strategy,
-            derivation_params=derivation_params,
-            summaries=summaries,
-            total_samples=total_samples_after_run,
-        )
-        if global_stop_requested:
+            if global_stop_requested:
+                cycle_stop_requested = True
+                break
+    
+        if cycle_stop_requested:
             break
+        if target_samples > 0 and total_samples_after_run >= target_samples:
+            break
+        if not (source_mode == "benchmatch" and cycle_matchups_until_target):
+            break
+        if max_matchup_cycles > 0 and cycle_index >= max_matchup_cycles:
+            job.logger.info(
+                "dataset generation stopping after max cycles | cycles=%s | max_matchup_cycles=%s | total_samples=%s | target_samples=%s",
+                cycle_index,
+                max_matchup_cycles,
+                total_samples_after_run,
+                target_samples,
+            )
+            break
+        cycle_added_samples = int(total_samples_after_run) - int(cycle_samples_before)
+        if cycle_added_samples <= 0:
+            job.logger.warning(
+                "dataset generation cycle produced no samples, stopping to avoid busy-loop | cycle=%s | total_samples=%s | target_samples=%s",
+                cycle_index,
+                total_samples_after_run,
+                target_samples,
+            )
+            break
+        job.logger.info(
+            "dataset generation cycle completed, continuing | cycle=%s | cycle_added_samples=%s | total_samples=%s | target_samples=%s",
+            cycle_index,
+            cycle_added_samples,
+            total_samples_after_run,
+            target_samples,
+        )
 
-    added_games = sum(int(item["games_added"]) for item in summaries)
+    final_total_samples = _count_total_jsonl_lines(sampled_dir)
+    final_total_games = _count_jsonl_files(sampled_dir)
+    added_games = max(0, int(final_total_games) - int(initial_total_games))
     failed_games = sum(int(item.get("games_failed", 0)) for item in summaries)
-    added_samples = sum(int(item["samples_added"]) for item in summaries)
+    added_samples = max(0, int(final_total_samples) - int(initial_total_samples))
+    global_target_reached_final = False
+    if global_target_enabled and source_mode == "benchmatch" and global_target_samples > 0:
+        global_state = _read_global_generation_progress(
+            global_progress_path,
+            global_target_id=global_target_id,
+            target_samples=global_target_samples,
+            progress_backend=global_progress_backend,
+        )
+        global_target_reached_final = int(global_state.get("total_samples", 0)) >= int(global_target_samples)
+    local_target_reached_final = target_samples > 0 and int(final_total_samples) >= int(target_samples)
+    source_status = "completed" if (local_target_reached_final or global_target_reached_final) else "partial"
     summary = {
         "job_id": job.job_id,
         "dataset_source_id": dataset_source_id,
         "source_mode": source_mode,
         "matchups": summaries,
+        "cycles_completed": cycle_index,
+        "source_status": source_status,
         "existing_samples": initial_total_samples,
         "added_games": added_games,
         "failed_games": failed_games,
         "added_samples": added_samples,
-        "total_samples": initial_total_samples + added_samples,
+        "total_samples": final_total_samples,
         "target_samples": target_samples,
     }
     _register_dataset_source(
@@ -3640,20 +3893,29 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
         source_dataset_ids=source_dataset_ids,
         derivation_strategy=derivation_strategy,
         derivation_params=derivation_params,
-        source_status="completed",
-        partial_summary={},
-        raw_files_override=sum(int(item.get("existing_games", 0)) + int(item.get("games_added", 0)) for item in summaries),
-        sampled_files_override=sum(int(item.get("existing_games", 0)) + int(item.get("games_added", 0)) for item in summaries),
-        sampled_positions_override=initial_total_samples + added_samples,
+        source_status=source_status,
+        partial_summary={} if source_status == "completed" else {
+            "cycles_completed": cycle_index,
+            "added_games": added_games,
+            "failed_games": failed_games,
+            "added_samples": added_samples,
+            "total_samples": final_total_samples,
+            "target_samples": target_samples,
+        },
+        raw_files_override=_count_json_files(raw_dir),
+        sampled_files_override=_count_jsonl_files(sampled_dir),
+        sampled_positions_override=final_total_samples,
     )
     _write_json(dataset_dir / "dataset_generation_summary.json", summary)
     job.logger.info(
-        "dataset generation completed | matchups=%s | added_games=%s | failed_games=%s | added_samples=%s | total_samples=%s | target_samples=%s",
+        "dataset generation completed | source_status=%s | cycles=%s | matchups=%s | added_games=%s | failed_games=%s | added_samples=%s | total_samples=%s | target_samples=%s",
+        source_status,
+        cycle_index,
         len(summaries),
         added_games,
         failed_games,
         added_samples,
-        initial_total_samples + added_samples,
+        final_total_samples,
         target_samples,
     )
     job.write_state(
@@ -3661,8 +3923,8 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
             "current_matchup": None,
             "completed_games": added_games,
             "remaining_games": 0,
-            "last_completed_game_id": state.get("last_completed_game_id"),
-            "sample_count": initial_total_samples + added_samples,
+            "last_completed_game_id": last_completed_game_id,
+            "sample_count": final_total_samples,
             "target_samples": target_samples,
         }
     )

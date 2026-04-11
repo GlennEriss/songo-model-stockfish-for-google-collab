@@ -137,6 +137,8 @@ cells = [
         BENCHMATCH_INCLUDE_SELF_PLAY = True
         BENCHMATCH_ORDERED_MATCHUPS = True
         BENCHMATCH_SHUFFLE_MATCHUPS = True
+        BENCHMATCH_CYCLE_MATCHUPS_UNTIL_TARGET = True
+        BENCHMATCH_MAX_MATCHUP_CYCLES = 0  # 0 = illimite
         BENCHMATCH_MODEL_AGENT_DEVICE = 'cpu'
         GLOBAL_TARGET_ENABLED = True
         GLOBAL_TARGET_ID = 'bench_models_20m_global'
@@ -220,7 +222,6 @@ cells = [
             worker_count = max(1, int(worker_count))
             try:
                 from google.cloud import firestore
-                from google.api_core.client_options import ClientOptions
                 credentials_path = str(FIRESTORE_CREDENTIALS_PATH).strip()
                 project_id = str(FIRESTORE_PROJECT_ID).strip()
                 collection = str(FIRESTORE_WORKER_LEASES_COLLECTION).strip() or 'worker_leases'
@@ -230,9 +231,9 @@ cells = [
                     creds = service_account.Credentials.from_service_account_file(credentials_path)
                     client = firestore.Client(project=(project_id or None), credentials=creds)
                 elif str(FIRESTORE_API_KEY).strip():
-                    client = firestore.Client(
-                        project=(project_id or None),
-                        client_options=ClientOptions(api_key=str(FIRESTORE_API_KEY).strip()),
+                    raise RuntimeError(
+                        'Mode API key non supporte avec google-cloud-firestore; '
+                        'renseigne FIRESTORE_CREDENTIALS_PATH.'
                     )
                 else:
                     client = firestore.Client(project=(project_id or None))
@@ -643,6 +644,8 @@ cells = [
         print('DATASET_GENERATE_WORKERS =', DATASET_GENERATE_WORKERS)
         print('DATASET_BUILD_WORKERS    =', DATASET_BUILD_WORKERS)
         print('BENCHMATCH_SHUFFLE_MATCHUPS =', BENCHMATCH_SHUFFLE_MATCHUPS)
+        print('BENCHMATCH_CYCLE_MATCHUPS_UNTIL_TARGET =', BENCHMATCH_CYCLE_MATCHUPS_UNTIL_TARGET)
+        print('BENCHMATCH_MAX_MATCHUP_CYCLES =', BENCHMATCH_MAX_MATCHUP_CYCLES)
         print('DATASET_BUILD_DEDUPE_SAMPLE_IDS =', DATASET_BUILD_DEDUPE_SAMPLE_IDS)
         print('DATASET_BUILD_ADAPTIVE_POLLING =', DATASET_BUILD_ADAPTIVE_POLLING)
         print('GLOBAL_TARGET_ENABLED    =', GLOBAL_TARGET_ENABLED)
@@ -1010,6 +1013,8 @@ cells = [
         generate_block['max_pending_futures'] = int(DATASET_GENERATE_MAX_PENDING_FUTURES)
         generate_block['games'] = int(BENCHMATCH_GAMES)
         generate_block['matchups'] = matchups
+        generate_block['cycle_matchups_until_target'] = bool(BENCHMATCH_CYCLE_MATCHUPS_UNTIL_TARGET)
+        generate_block['max_matchup_cycles'] = int(BENCHMATCH_MAX_MATCHUP_CYCLES)
         generate_block['model_agent_device'] = str(BENCHMATCH_MODEL_AGENT_DEVICE)
         generate_block['global_target_enabled'] = bool(GLOBAL_TARGET_ENABLED)
         generate_block['global_target_id'] = str(GLOBAL_TARGET_ID)
