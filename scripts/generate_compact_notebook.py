@@ -236,7 +236,9 @@ cells = [
                         'renseigne FIRESTORE_CREDENTIALS_PATH.'
                     )
                 else:
-                    client = firestore.Client(project=(project_id or None))
+                    raise RuntimeError(
+                        'Credentials Firestore absents; renseigne FIRESTORE_CREDENTIALS_PATH.'
+                    )
                 doc_ref = client.collection(collection).document(document)
                 tx = client.transaction()
 
@@ -318,7 +320,7 @@ cells = [
         def _firestore_monitor_debug_context(*, global_target_id: str) -> dict:
             credentials_path = str(FIRESTORE_CREDENTIALS_PATH).strip()
             api_key = str(FIRESTORE_API_KEY).strip()
-            auth_mode = 'adc'
+            auth_mode = 'missing_credentials'
             if credentials_path:
                 auth_mode = 'service_account_file'
             elif api_key:
@@ -339,6 +341,8 @@ cells = [
             auth_mode = str(debug_context.get('auth_mode', '')).strip().lower()
             if auth_mode == 'api_key_anonymous':
                 return 'Firestore Python ne supporte pas API key seule; configure FIRESTORE_CREDENTIALS_PATH (service account JSON).'
+            if auth_mode == 'missing_credentials':
+                return 'Credentials Firestore absents; configure FIRESTORE_CREDENTIALS_PATH (service account JSON).'
             if auth_mode == 'adc' and ('metadata.google.internal' in text or 'compute engine metadata' in text):
                 return 'ADC indisponible ici; configure FIRESTORE_CREDENTIALS_PATH (service account JSON).'
             if 'permissiondenied' in text or 'permission denied' in text:
@@ -365,7 +369,6 @@ cells = [
                 debug_context = _firestore_monitor_debug_context(global_target_id=str(global_target_id))
                 try:
                     from google.cloud import firestore
-                    from google.api_core.client_options import ClientOptions
                     credentials_path = str(FIRESTORE_CREDENTIALS_PATH).strip()
                     project_id = str(FIRESTORE_PROJECT_ID).strip()
                     collection = str(FIRESTORE_COLLECTION).strip() or 'global_generation_progress'
@@ -382,7 +385,9 @@ cells = [
                             'renseigne FIRESTORE_CREDENTIALS_PATH.'
                         )
                     else:
-                        client = firestore.Client(project=(project_id or None))
+                        raise RuntimeError(
+                            'Credentials Firestore absents; renseigne FIRESTORE_CREDENTIALS_PATH.'
+                        )
                     snap = client.collection(collection).document(document).get()
                     if snap.exists:
                         return _normalize_global_payload(snap.to_dict(), int(target_samples))
@@ -401,7 +406,6 @@ cells = [
 
         def _get_firestore_client():
             from google.cloud import firestore
-            from google.api_core.client_options import ClientOptions
             credentials_path = str(FIRESTORE_CREDENTIALS_PATH).strip()
             project_id = str(FIRESTORE_PROJECT_ID).strip()
             if credentials_path:
@@ -413,7 +417,9 @@ cells = [
                     'Mode API key non supporte avec google-cloud-firestore; '
                     'renseigne FIRESTORE_CREDENTIALS_PATH.'
                 )
-            return firestore.Client(project=(project_id or None))
+            raise RuntimeError(
+                'Credentials Firestore absents; renseigne FIRESTORE_CREDENTIALS_PATH.'
+            )
 
         def _read_firestore_doc(collection: str, document: str, default: dict | None = None) -> dict:
             fallback = {} if default is None else default

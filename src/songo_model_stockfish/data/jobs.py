@@ -168,7 +168,7 @@ def _firestore_backend_diagnostics(progress_backend: dict[str, Any] | None) -> d
     backend = progress_backend if isinstance(progress_backend, dict) else {}
     credentials_path = str(backend.get("firestore_credentials_path", "")).strip()
     api_key = str(backend.get("firestore_api_key", "")).strip()
-    auth_mode = "adc"
+    auth_mode = "missing_credentials"
     if credentials_path:
         auth_mode = "service_account_file"
     elif api_key:
@@ -194,6 +194,11 @@ def _firestore_error_hint(*, exc: Exception | None, diagnostics: dict[str, Any])
     if auth_mode == "api_key_anonymous":
         return (
             "Firestore Python ne supporte pas API key seule; configure "
+            "`global_progress_firestore_credentials_path`."
+        )
+    if auth_mode == "missing_credentials":
+        return (
+            "Credentials Firestore absents; configure "
             "`global_progress_firestore_credentials_path`."
         )
     if auth_mode == "adc" and ("metadata.google.internal" in exc_text or "compute engine metadata" in exc_text):
@@ -276,6 +281,10 @@ def _build_firestore_progress_endpoint(
         raise RuntimeError(
             "Mode API key non supporte avec google-cloud-firestore; "
             "configure `global_progress_firestore_credentials_path`."
+        )
+    else:
+        raise RuntimeError(
+            "Credentials Firestore absents; configure `global_progress_firestore_credentials_path`."
         )
     try:
         client = firestore.Client(project=(project_id or None), credentials=credentials, client_options=client_options)

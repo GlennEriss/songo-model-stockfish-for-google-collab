@@ -72,6 +72,8 @@ def _build_firestore_job_client(*, project_id: str, credentials_path: str, api_k
     credentials = None
     client_options = None
     if credentials_path:
+        if not Path(credentials_path).exists():
+            raise FileNotFoundError(f"Fichier credentials Firestore introuvable: {credentials_path}")
         from google.oauth2 import service_account
 
         credentials = service_account.Credentials.from_service_account_file(credentials_path)
@@ -79,6 +81,10 @@ def _build_firestore_job_client(*, project_id: str, credentials_path: str, api_k
         raise RuntimeError(
             "Mode API key non supporte avec google-cloud-firestore; "
             "configure `job_firestore_credentials_path`."
+        )
+    else:
+        raise RuntimeError(
+            "Credentials Firestore absents; configure `job_firestore_credentials_path`."
         )
     return firestore.Client(project=(project_id or None), credentials=credentials, client_options=client_options)
 
