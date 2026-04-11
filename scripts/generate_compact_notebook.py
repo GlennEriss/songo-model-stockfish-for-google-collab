@@ -2571,6 +2571,152 @@ cells = [
             print('  selected_checkpoint =', selected['checkpoint_path'])
             print('  runtime config      =', runtime_eval_cfg_path)
             return runtime_eval_cfg_path, selected['model_id']
+
+        def _load_json_dict(path: Path, default=None):
+            fallback = {} if default is None else default
+            if not path.exists():
+                return fallback
+            try:
+                payload = json.loads(path.read_text(encoding='utf-8'))
+            except Exception:
+                return fallback
+            return payload if isinstance(payload, dict) else fallback
+
+        def _job_prefix_for_rollover(job_id: str) -> str:
+            text = str(job_id).strip()
+            if not text:
+                return text
+            parts = text.rsplit('_', 1)
+            if len(parts) == 2 and parts[1].isdigit():
+                return parts[0]
+            return text
+
+        def _latest_job_dir_for_job_id(job_id: str) -> Path | None:
+            jobs_root = Path(DRIVE_ROOT) / 'jobs'
+            if not jobs_root.exists():
+                return None
+            requested = str(job_id).strip()
+            if not requested:
+                return None
+            direct = jobs_root / requested
+            if direct.exists() and direct.is_dir():
+                return direct
+            prefix = _job_prefix_for_rollover(requested)
+            candidates = []
+            for path in jobs_root.iterdir():
+                if not path.is_dir():
+                    continue
+                name = path.name
+                if name == requested:
+                    candidates.append(path)
+                    continue
+                if prefix and name.startswith(prefix):
+                    candidates.append(path)
+            if not candidates:
+                return None
+            return sorted(candidates, key=lambda p: p.stat().st_mtime)[-1]
+
+        def _read_job_summary(job_id: str, filename: str) -> tuple[dict, Path | None]:
+            job_dir = _latest_job_dir_for_job_id(job_id)
+            if job_dir is None:
+                return {}, None
+            payload = _load_json_dict(job_dir / filename, default={})
+            return payload, job_dir
+
+        def _load_model_registry_record(model_id: str) -> dict:
+            registry_path = Path(DRIVE_ROOT) / 'models' / 'model_registry.json'
+            registry = _load_json_dict(registry_path, default={'models': []})
+            models = registry.get('models', []) if isinstance(registry, dict) else []
+            for item in models:
+                if isinstance(item, dict) and str(item.get('model_id', '')).strip() == str(model_id).strip():
+                    return item
+            return {}
+
+        def _load_promoted_best_metadata() -> dict:
+            metadata_path = Path(DRIVE_ROOT) / 'models' / 'promoted' / 'best' / 'metadata.json'
+            return _load_json_dict(metadata_path, default={})
+
+        def _load_latest_benchmark_for_model(model_id: str) -> dict:
+            history_path = Path(DRIVE_ROOT) / 'models' / 'history' / 'benchmark_history.jsonl'
+            if not history_path.exists():
+                return {}
+            try:
+                lines = history_path.read_text(encoding='utf-8').splitlines()
+            except Exception:
+                return {}
+            target = str(model_id).strip()
+            for line in reversed(lines):
+                text = str(line).strip()
+                if not text:
+                    continue
+                try:
+                    row = json.loads(text)
+                except Exception:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                model_value = str(row.get('model_id', row.get('engine', ''))).strip()
+                if model_value == target:
+                    return row
+            return {}
+
+        def _model_signal(eval_summary: dict, benchmark_summary: dict) -> str:
+            top1 = float(eval_summary.get('policy_accuracy_top1', -1.0) or -1.0)
+            bscore = float(benchmark_summary.get('benchmark_score_weighted', benchmark_summary.get('benchmark_score', -1.0)) or -1.0)
+            if top1 >= 0.92 or bscore >= 0.35:
+                return 'fort (signal positif)'
+            if top1 >= 0.86 or bscore >= 0.15:
+                return 'moyen (progression en cours)'
+            if top1 >= 0.0:
+                return 'faible (a renforcer)'
+            return 'inconnu (donnees insuffisantes)'
+
+        def _print_post_train_eval_report(*, mode: str, train_job_id: str, eval_job_id: str, model_id: str) -> None:
+            train_summary, train_job_dir = _read_job_summary(train_job_id, 'training_summary.json')
+            eval_summary, eval_job_dir = _read_job_summary(eval_job_id, 'evaluation_summary.json')
+            registry_row = _load_model_registry_record(model_id)
+            promoted = _load_promoted_best_metadata()
+            benchmark_row = _load_latest_benchmark_for_model(model_id)
+            promoted_model_id = str(promoted.get('model_id', '')).strip()
+            promoted_status = 'oui' if promoted_model_id and promoted_model_id == str(model_id).strip() else 'non'
+            history = train_summary.get('history', []) if isinstance(train_summary, dict) else []
+            last_epoch = history[-1] if history else {}
+            last_val_loss = float(last_epoch.get('validation_loss_total', 0.0) or 0.0) if isinstance(last_epoch, dict) else 0.0
+            last_val_acc = float(last_epoch.get('validation_policy_accuracy', 0.0) or 0.0) if isinstance(last_epoch, dict) else 0.0
+
+            print('')
+            print('=== Post-Run Report ===')
+            print('mode                   =', mode)
+            print('model_id               =', model_id)
+            print('train_job_id(request)  =', train_job_id)
+            print('train_job_id(resolved) =', train_summary.get('job_id', '<none>'))
+            print('eval_job_id(request)   =', eval_job_id)
+            print('eval_job_id(resolved)  =', eval_summary.get('job_id', '<none>'))
+            print('train_job_dir          =', train_job_dir if train_job_dir is not None else '<none>')
+            print('eval_job_dir           =', eval_job_dir if eval_job_dir is not None else '<none>')
+            print('dataset_id(train)      =', train_summary.get('dataset_id', '<none>'))
+            print('dataset_mode(train)    =', train_summary.get('dataset_selection_mode', '<none>'))
+            print('dataset_id(eval)       =', eval_summary.get('dataset_id', '<none>'))
+            print('epochs                 =', train_summary.get('completed_epochs', 0), '/', train_summary.get('epochs', 0))
+            print('best_epoch             =', train_summary.get('best_epoch', 0))
+            print('best_val_metric        =', float(train_summary.get('best_validation_metric', 0.0) or 0.0))
+            print('last_val_loss          =', last_val_loss)
+            print('last_val_acc           =', last_val_acc)
+            print('eval_examples          =', eval_summary.get('examples', 0))
+            print('eval_top1              =', float(eval_summary.get('policy_accuracy_top1', 0.0) or 0.0))
+            print('eval_top3              =', float(eval_summary.get('policy_accuracy_top3', 0.0) or 0.0))
+            print('eval_value_mae         =', float(eval_summary.get('value_mae', 0.0) or 0.0))
+            print('eval_loss_total        =', float(eval_summary.get('loss_total', 0.0) or 0.0))
+            print('registry_rank          =', registry_row.get('rank', '<none>'))
+            print('registry_eval_top1     =', registry_row.get('evaluation_top1', '<none>'))
+            print('registry_benchmark     =', registry_row.get('benchmark_score', '<none>'))
+            print('promoted_best          =', promoted_status, '| promoted_model_id =', promoted_model_id or '<none>')
+            print('benchmark_latest_score =', benchmark_row.get('benchmark_score', '<none>'))
+            print('benchmark_weighted     =', benchmark_row.get('benchmark_score_weighted', '<none>'))
+            print('model_signal           =', _model_signal(eval_summary, benchmark_row))
+            print('final_model_path       =', train_summary.get('final_model_path', '<none>'))
+            print('best_checkpoint_path   =', train_summary.get('best_checkpoint_path', '<none>'))
+            print('evaluation_summary     =', eval_summary.get('evaluation_summary_path', '<none>'))
         """
     ),
     code(
@@ -2599,6 +2745,12 @@ cells = [
         )
         subprocess.run(['/bin/bash', '-lc', eval_cmd], check=True)
         print('Train + Eval termines | mode=continue | model_id=', selected_model_id, '| eval_job_id=', eval_job_id)
+        _print_post_train_eval_report(
+            mode='continue',
+            train_job_id=TRAIN_CONTINUE_JOB_ID,
+            eval_job_id=eval_job_id,
+            model_id=selected_model_id,
+        )
         """
     ),
     code(
@@ -2627,6 +2779,12 @@ cells = [
         )
         subprocess.run(['/bin/bash', '-lc', eval_cmd], check=True)
         print('Train + Eval termines | mode=scratch | model_id=', selected_model_id, '| eval_job_id=', eval_job_id)
+        _print_post_train_eval_report(
+            mode='scratch',
+            train_job_id=TRAIN_SCRATCH_JOB_ID,
+            eval_job_id=eval_job_id,
+            model_id=selected_model_id,
+        )
         """
     ),
     md("## 8. Benchmark"),
