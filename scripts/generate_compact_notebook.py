@@ -2429,6 +2429,179 @@ cells = [
             print('dataset_registry Firestore introuvable:', f'{type(exc).__name__}: {exc}')
         """
     ),
+    md("## 6bis. Sanity Check Dataset (10 echantillons aleatoires)"),
+    code(
+        """
+        import json
+        from pathlib import Path
+        import numpy as np
+
+        DATASET_PREVIEW_ROWS = 10
+        DATASET_PREVIEW_SPLIT = 'train'  # 'train', 'validation', 'test'
+        DATASET_PREVIEW_SEED = 42
+        DATASET_PREVIEW_FEATURES_HEAD = 16
+
+        def _resolve_preview_dataset_entry() -> dict:
+            registry = _load_dataset_registry_payload()
+            built_entries = [item for item in registry.get('built_datasets', []) if isinstance(item, dict)]
+            requested = str(DATASET_BUILD_ID).strip()
+            split_name = str(DATASET_PREVIEW_SPLIT).strip().lower() or 'train'
+
+            def _has_split(entry: dict) -> bool:
+                output_dir = Path(str(entry.get('output_dir', '')).strip())
+                return output_dir.exists() and (output_dir / f'{split_name}.npz').exists()
+
+            direct = next(
+                (
+                    item
+                    for item in built_entries
+                    if str(item.get('dataset_id', '')).strip() == requested and _has_split(item)
+                ),
+                None,
+            )
+            if direct is not None:
+                return direct
+
+            prefix = f'{BASE_DATASET_BUILD_ID}_'
+            shard_candidates = [
+                item
+                for item in built_entries
+                if _has_split(item)
+                and (
+                    str(item.get('dataset_id', '')).strip() == BASE_DATASET_BUILD_ID
+                    or str(item.get('dataset_id', '')).strip().startswith(prefix)
+                )
+            ]
+            if shard_candidates:
+                shard_candidates = sorted(
+                    shard_candidates,
+                    key=lambda item: (
+                        int(item.get('labeled_samples', 0) or 0),
+                        str(item.get('updated_at', '')),
+                    ),
+                    reverse=True,
+                )
+                return shard_candidates[0]
+
+            datasets_root = Path(DRIVE_ROOT) / 'data' / 'datasets'
+            if datasets_root.exists():
+                dir_candidates = []
+                for path in datasets_root.iterdir():
+                    if not path.is_dir():
+                        continue
+                    name = path.name
+                    if name == requested or name == BASE_DATASET_BUILD_ID or name.startswith(prefix):
+                        if (path / f'{split_name}.npz').exists():
+                            dir_candidates.append(path)
+                if dir_candidates:
+                    selected = sorted(dir_candidates, key=lambda p: p.stat().st_mtime, reverse=True)[0]
+                    return {
+                        'dataset_id': selected.name,
+                        'output_dir': str(selected),
+                        'labeled_samples': 0,
+                        'build_mode': '<unknown>',
+                        'feature_schema_version': '<unknown>',
+                    }
+            raise ValueError(
+                f'Aucun dataset build avec {split_name}.npz trouve '
+                f'(requested={requested}, base={BASE_DATASET_BUILD_ID}).'
+            )
+
+        dataset_entry = _resolve_preview_dataset_entry()
+        dataset_id = str(dataset_entry.get('dataset_id', '<unknown>'))
+        output_dir = Path(str(dataset_entry.get('output_dir', '')).strip())
+        split_name = str(DATASET_PREVIEW_SPLIT).strip().lower() or 'train'
+        npz_path = output_dir / f'{split_name}.npz'
+        if not npz_path.exists():
+            raise FileNotFoundError(f'Split introuvable: {npz_path}')
+
+        with np.load(npz_path, allow_pickle=True) as data:
+            arrays = {key: data[key] for key in data.files}
+
+        x = arrays.get('x', np.zeros((0, 0), dtype=np.float32))
+        legal_mask = arrays.get('legal_mask', np.zeros((0, 7), dtype=np.float32))
+        policy_index = arrays.get('policy_index', np.zeros((0,), dtype=np.int64))
+        policy_target_full = arrays.get('policy_target_full')
+        value_target = arrays.get('value_target', np.zeros((0,), dtype=np.float32))
+        sample_ids = arrays.get('sample_ids', np.asarray([], dtype=object))
+        game_ids = arrays.get('game_ids', np.asarray([], dtype=object))
+
+        total = int(x.shape[0]) if x.ndim >= 1 else 0
+        if policy_target_full is None:
+            policy_target_full = np.zeros((total, 7), dtype=np.float32)
+            if total > 0:
+                rows = np.arange(total, dtype=np.int64)
+                valid = np.logical_and(policy_index >= 0, policy_index < 7)
+                policy_target_full[rows[valid], policy_index[valid]] = 1.0
+
+        policy_sum = policy_target_full.sum(axis=1) if total > 0 else np.asarray([], dtype=np.float32)
+        legal_count = legal_mask.sum(axis=1) if total > 0 else np.asarray([], dtype=np.float32)
+        invalid_policy_sum = int(np.sum(np.abs(policy_sum - 1.0) > 1e-3)) if total > 0 else 0
+        invalid_policy_index = int(np.sum(np.logical_or(policy_index < 0, policy_index >= 7))) if total > 0 else 0
+        invalid_policy_not_legal = int(
+            np.sum(
+                np.logical_and(
+                    np.logical_and(policy_index >= 0, policy_index < 7),
+                    legal_mask[np.arange(total), np.clip(policy_index, 0, 6)] <= 0.0,
+                )
+            )
+        ) if total > 0 else 0
+        invalid_legal_moves = int(np.sum(legal_count <= 0.0)) if total > 0 else 0
+        invalid_value_range = int(np.sum(np.logical_or(value_target < -1.0, value_target > 1.0))) if total > 0 else 0
+        nan_count = int(np.isnan(x).sum()) if total > 0 else 0
+        inf_count = int(np.isinf(x).sum()) if total > 0 else 0
+
+        print('=== Dataset Sanity Check ===')
+        print('dataset_id             =', dataset_id)
+        print('split                  =', split_name)
+        print('npz_path               =', npz_path)
+        print('build_mode             =', dataset_entry.get('build_mode', '<unknown>'))
+        print('schema_version         =', dataset_entry.get('feature_schema_version', '<unknown>'))
+        print('samples                =', total)
+        print('input_dim              =', int(x.shape[1]) if x.ndim == 2 else 0)
+        print('keys                   =', sorted(arrays.keys()))
+        print('value_min_max          =', (
+            float(value_target.min()) if total > 0 else 0.0,
+            float(value_target.max()) if total > 0 else 0.0,
+        ))
+        print('anomalies.policy_sum   =', invalid_policy_sum)
+        print('anomalies.policy_index =', invalid_policy_index)
+        print('anomalies.policy_legal =', invalid_policy_not_legal)
+        print('anomalies.legal_moves  =', invalid_legal_moves)
+        print('anomalies.value_range  =', invalid_value_range)
+        print('anomalies.nan_features =', nan_count)
+        print('anomalies.inf_features =', inf_count)
+
+        if total <= 0:
+            raise ValueError(f'Dataset vide pour split={split_name}: {npz_path}')
+
+        rng = np.random.default_rng(int(DATASET_PREVIEW_SEED))
+        sample_count = min(int(DATASET_PREVIEW_ROWS), total)
+        indices = sorted(rng.choice(total, size=sample_count, replace=False).tolist())
+
+        print('')
+        print(f'=== Echantillons Aleatoires ({sample_count}) ===')
+        for rank, idx in enumerate(indices, start=1):
+            sid = str(sample_ids[idx]) if idx < len(sample_ids) else '<na>'
+            gid = str(game_ids[idx]) if idx < len(game_ids) else '<na>'
+            pidx = int(policy_index[idx]) if idx < len(policy_index) else -1
+            legal_vec = legal_mask[idx].astype(np.int64).tolist() if idx < len(legal_mask) else []
+            policy_vec = policy_target_full[idx].astype(np.float64)
+            top_moves = np.argsort(-policy_vec)[:3].tolist()
+            top_moves_1b = [int(move + 1) for move in top_moves]
+            top_probs = [float(policy_vec[move]) for move in top_moves]
+            value = float(value_target[idx]) if idx < len(value_target) else 0.0
+            x_head = x[idx, : int(DATASET_PREVIEW_FEATURES_HEAD)].astype(np.float64).tolist() if x.ndim == 2 else []
+            print('-' * 120)
+            print(f'#{rank} idx={idx} | sample_id={sid} | game_id={gid}')
+            print(' policy_index(1-based)=', (pidx + 1) if pidx >= 0 else '<invalid>')
+            print(' top3_moves(1-based)  =', top_moves_1b, '| top3_probs=', [round(v, 6) for v in top_probs])
+            print(' legal_mask(7)        =', legal_vec)
+            print(' value_target         =', round(value, 6))
+            print(f' x_head(first {int(DATASET_PREVIEW_FEATURES_HEAD)}) =', [round(v, 6) for v in x_head])
+        print('-' * 120)
+        """
+    ),
     md("## 7. Entrainement + Evaluation Automatique"),
     code(
         """
