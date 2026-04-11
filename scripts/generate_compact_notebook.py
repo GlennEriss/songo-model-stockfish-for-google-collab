@@ -1260,10 +1260,72 @@ cells = [
         build_cfg['dataset_build'] = build_block
         DATASET_BUILD_CONFIG_ACTIVE = _write_yaml(build_cfg, DATASET_BUILD_CONFIG_ACTIVE_PATH)
 
+        def _resolve_train_eval_dataset_id() -> str:
+            # Priorite: dataset global fusionne (BASE_DATASET_BUILD_ID), sinon plus gros shard de la famille.
+            try:
+                registry_payload = _load_dataset_registry_payload()
+            except Exception:
+                return str(DATASET_BUILD_ID)
+
+            built_entries = registry_payload.get('built_datasets', []) if isinstance(registry_payload, dict) else []
+            if not isinstance(built_entries, list):
+                return str(DATASET_BUILD_ID)
+
+            def _entry_output_dir(entry: dict) -> Path:
+                output_text = str(entry.get('output_dir', '')).strip()
+                if not output_text:
+                    return Path('')
+                output_path = Path(output_text)
+                if output_path.is_absolute():
+                    return output_path
+                return Path(DRIVE_ROOT) / output_text
+
+            def _entry_has_required_npz(entry: dict) -> bool:
+                out = _entry_output_dir(entry)
+                return out.exists() and (out / 'train.npz').exists() and (out / 'validation.npz').exists()
+
+            def _entry_sort_key(entry: dict):
+                return (
+                    int(entry.get('labeled_samples', 0) or 0),
+                    str(entry.get('updated_at', '')),
+                )
+
+            exact_global = next(
+                (
+                    item
+                    for item in built_entries
+                    if isinstance(item, dict)
+                    and str(item.get('dataset_id', '')).strip() == str(BASE_DATASET_BUILD_ID)
+                    and _entry_has_required_npz(item)
+                ),
+                None,
+            )
+            if exact_global is not None:
+                return str(exact_global.get('dataset_id', BASE_DATASET_BUILD_ID))
+
+            family_prefix = f'{BASE_DATASET_BUILD_ID}_'
+            family = [
+                item
+                for item in built_entries
+                if isinstance(item, dict)
+                and _entry_has_required_npz(item)
+                and (
+                    str(item.get('dataset_id', '')).strip() == str(BASE_DATASET_BUILD_ID)
+                    or str(item.get('dataset_id', '')).strip().startswith(family_prefix)
+                )
+            ]
+            if family:
+                family.sort(key=_entry_sort_key, reverse=True)
+                return str(family[0].get('dataset_id', DATASET_BUILD_ID))
+
+            return str(DATASET_BUILD_ID)
+
+        TRAIN_EVAL_DATASET_ID = _resolve_train_eval_dataset_id()
+
         train_continue_cfg = yaml.safe_load(Path(TRAIN_CONTINUE_CONFIG_ACTIVE).read_text(encoding='utf-8')) or {}
         train_continue_block = dict(train_continue_cfg.get('train', {}) or {})
         train_continue_block['dataset_selection_mode'] = 'configured'
-        train_continue_block['dataset_id'] = DATASET_BUILD_ID
+        train_continue_block['dataset_id'] = TRAIN_EVAL_DATASET_ID
         train_continue_block['dataset_registry_backend'] = str(GLOBAL_PROGRESS_BACKEND)
         train_continue_block['dataset_registry_firestore_project_id'] = str(FIRESTORE_PROJECT_ID)
         train_continue_block['dataset_registry_firestore_collection'] = str(FIRESTORE_DATASET_REGISTRY_COLLECTION)
@@ -1276,7 +1338,7 @@ cells = [
         train_scratch_cfg = yaml.safe_load(Path(TRAIN_SCRATCH_CONFIG_ACTIVE).read_text(encoding='utf-8')) or {}
         train_scratch_block = dict(train_scratch_cfg.get('train', {}) or {})
         train_scratch_block['dataset_selection_mode'] = 'configured'
-        train_scratch_block['dataset_id'] = DATASET_BUILD_ID
+        train_scratch_block['dataset_id'] = TRAIN_EVAL_DATASET_ID
         train_scratch_block['dataset_registry_backend'] = str(GLOBAL_PROGRESS_BACKEND)
         train_scratch_block['dataset_registry_firestore_project_id'] = str(FIRESTORE_PROJECT_ID)
         train_scratch_block['dataset_registry_firestore_collection'] = str(FIRESTORE_DATASET_REGISTRY_COLLECTION)
@@ -1289,7 +1351,7 @@ cells = [
         eval_cfg = yaml.safe_load(Path(EVALUATION_CONFIG_ACTIVE).read_text(encoding='utf-8')) or {}
         eval_block = dict(eval_cfg.get('evaluation', {}) or {})
         eval_block['dataset_selection_mode'] = 'configured'
-        eval_block['dataset_id'] = DATASET_BUILD_ID
+        eval_block['dataset_id'] = TRAIN_EVAL_DATASET_ID
         eval_block['dataset_registry_backend'] = str(GLOBAL_PROGRESS_BACKEND)
         eval_block['dataset_registry_firestore_project_id'] = str(FIRESTORE_PROJECT_ID)
         eval_block['dataset_registry_firestore_collection'] = str(FIRESTORE_DATASET_REGISTRY_COLLECTION)
@@ -1306,6 +1368,7 @@ cells = [
         print('RUNTIME_SUMMARY                =', runtime_summary)
         print('DATASET_GENERATE_CONFIG_ACTIVE =', DATASET_GENERATE_CONFIG_ACTIVE)
         print('DATASET_BUILD_CONFIG_ACTIVE    =', DATASET_BUILD_CONFIG_ACTIVE)
+        print('TRAIN_EVAL_DATASET_ID          =', TRAIN_EVAL_DATASET_ID)
         print('GLOBAL_PROGRESS_BACKEND        =', GLOBAL_PROGRESS_BACKEND)
         print('FIRESTORE_PROJECT_ID           =', FIRESTORE_PROJECT_ID)
         print('FIRESTORE_COLLECTION           =', FIRESTORE_COLLECTION)
@@ -2543,6 +2606,10 @@ cells = [
         TOURNAMENT_DEVICE = 'cpu'
         TOURNAMENT_MIN_MODELS = 2
         TOURNAMENT_WRITE_REPORT = True
+        TOURNAMENT_MODEL_SEARCH_ENABLED = True
+        TOURNAMENT_MODEL_SEARCH_TOP_K = 4
+        TOURNAMENT_MODEL_SEARCH_POLICY_WEIGHT = 0.35
+        TOURNAMENT_MODEL_SEARCH_VALUE_WEIGHT = 1.0
 
         models_root = Path(DRIVE_ROOT) / 'models'
         registry_path = models_root / 'registry.json'
@@ -2584,7 +2651,15 @@ cells = [
             print(' -', m['model_id'])
 
         agents = {
-            m['model_id']: ModelAgent(m['checkpoint_path'], display_name=m['model_id'], device=TOURNAMENT_DEVICE)
+            m['model_id']: ModelAgent(
+                m['checkpoint_path'],
+                display_name=m['model_id'],
+                device=TOURNAMENT_DEVICE,
+                search_enabled=TOURNAMENT_MODEL_SEARCH_ENABLED,
+                search_top_k=TOURNAMENT_MODEL_SEARCH_TOP_K,
+                search_policy_weight=TOURNAMENT_MODEL_SEARCH_POLICY_WEIGHT,
+                search_value_weight=TOURNAMENT_MODEL_SEARCH_VALUE_WEIGHT,
+            )
             for m in models
         }
         table = {
@@ -2685,6 +2760,10 @@ cells = [
                 'games_per_pair': TOURNAMENT_GAMES_PER_PAIR,
                 'max_moves': TOURNAMENT_MAX_MOVES,
                 'device': TOURNAMENT_DEVICE,
+                'model_search_enabled': TOURNAMENT_MODEL_SEARCH_ENABLED,
+                'model_search_top_k': TOURNAMENT_MODEL_SEARCH_TOP_K,
+                'model_search_policy_weight': TOURNAMENT_MODEL_SEARCH_POLICY_WEIGHT,
+                'model_search_value_weight': TOURNAMENT_MODEL_SEARCH_VALUE_WEIGHT,
                 'models': [m['model_id'] for m in models],
                 'pairs': pair_summaries,
                 'ranking': ranking,

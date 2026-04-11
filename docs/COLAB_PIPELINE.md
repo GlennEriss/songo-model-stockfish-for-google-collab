@@ -61,6 +61,10 @@ Il couvre:
 - monitoring Redis-first + consolidation periodique Firestore
 - mode quota economique (`LOW_QUOTA_PROFILE`)
 - reprise auto via `job_id` + checkpoints
+- priorite dataset global pour train/eval:
+  - priorite au dataset fusionne `BASE_DATASET_BUILD_ID` si complet
+  - fallback sur le plus gros shard de la meme famille
+- benchmark modele avec recherche legere (`model_search_*`) au lieu du pur `argmax` policy
 
 ## Point de cadrage important
 

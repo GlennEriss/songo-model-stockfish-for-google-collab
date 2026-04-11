@@ -224,6 +224,10 @@ job:
 
 benchmark:
   target: auto_latest
+  model_search_enabled: true
+  model_search_top_k: 4
+  model_search_policy_weight: 0.35
+  model_search_value_weight: 1.0
   matchups:
     - minimax:medium
     - minimax:hard
@@ -233,6 +237,13 @@ benchmark:
   alternate_first_player: true
   output_dir: reports/benchmarks
 ```
+
+Champs benchmark model search:
+
+- `model_search_enabled`: active une recherche legere cote `ModelAgent` (au lieu du pur `argmax` policy)
+- `model_search_top_k`: nombre de coups candidats explores (tries par prior policy)
+- `model_search_policy_weight`: poids du prior policy dans le score de choix
+- `model_search_value_weight`: poids de la value predite (apres un ply)
 
 ## 8. Config `evaluation`
 

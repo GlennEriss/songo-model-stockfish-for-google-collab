@@ -201,7 +201,15 @@ def _build_target_agent(job: JobContext) -> AgentLike:
     else:
         checkpoint_path = _resolve_storage_path(job.paths.drive_root, benchmark_cfg.get("checkpoint_path"), job.job_dir / "model.pt")
     device = str(job.config.get("runtime", {}).get("device", "cpu"))
-    return ModelAgent(str(checkpoint_path), display_name=target, device=device)
+    return ModelAgent(
+        str(checkpoint_path),
+        display_name=target,
+        device=device,
+        search_enabled=bool(benchmark_cfg.get("model_search_enabled", True)),
+        search_top_k=max(1, int(benchmark_cfg.get("model_search_top_k", 4))),
+        search_policy_weight=float(benchmark_cfg.get("model_search_policy_weight", 0.35)),
+        search_value_weight=float(benchmark_cfg.get("model_search_value_weight", 1.0)),
+    )
 
 
 def run_benchmark_job(job: JobContext) -> dict[str, object]:

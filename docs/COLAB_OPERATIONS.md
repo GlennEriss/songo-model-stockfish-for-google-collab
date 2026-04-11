@@ -130,6 +130,8 @@ Notebook principal actuel:
   - lancement parallele `dataset-generate` + `dataset-build`
   - monitoring global Redis-first + Firestore snapshot
   - health check workers actifs/inactifs
+  - train/eval configures sur dataset global prioritaire (sinon plus gros shard famille)
+  - benchmark modele avec recherche legere configurable (`model_search_enabled`, `model_search_top_k`)
 
 ## 10. Commandes Git a standardiser
 

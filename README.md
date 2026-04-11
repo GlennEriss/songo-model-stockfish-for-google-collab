@@ -219,6 +219,8 @@ Important pour Colab:
 - le runtime multi-Colab utilise Redis (temps reel) + Firestore (source durable de coordination)
 - en pratique, il faut renseigner `FIRESTORE_CREDENTIALS_PATH` avec un service account JSON
 - en multi-workers, activer `LOW_QUOTA_PROFILE=True` pour limiter les reads/writes Firestore
+- les configs actives train/eval privilegient le dataset global fusionne, puis fallback sur le plus gros shard de la famille
+- le benchmark modele utilise une recherche legere configurable (`model_search_enabled`, `model_search_top_k`, etc.)
 
 Scripts utiles:
 

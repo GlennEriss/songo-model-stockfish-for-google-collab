@@ -18,6 +18,10 @@ job:
 benchmark:
   target: auto_latest
   checkpoint_path: ""
+  model_search_enabled: true
+  model_search_top_k: 4
+  model_search_policy_weight: 0.35
+  model_search_value_weight: 1.0
   matchups:
     - minimax:medium
     - minimax:hard

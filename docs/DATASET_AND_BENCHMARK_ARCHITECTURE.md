@@ -138,6 +138,7 @@ Le `benchmark_summary.json` doit inclure:
 - temps moyen par coup
 - profondeur moyenne si disponible
 - infos sur les agents testes
+- configuration de recherche du `ModelAgent` si active (`model_search_enabled`, `model_search_top_k`, poids policy/value)
 
 ## 9. Reprise benchmark
 
