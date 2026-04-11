@@ -41,6 +41,7 @@ cells = [
         6. entrainer
         7. evaluer
         8. benchmarker le dernier modele
+        9. lancer un tournoi inter-modeles (3/1/0)
         """
     ),
     md("## 1. Monter Drive"),
@@ -101,7 +102,9 @@ cells = [
     md("## 3. Parametres"),
     code(
         """
+        import json
         import os
+        from pathlib import Path
 
         def _as_bool(value, default=False):
             if isinstance(value, bool):
@@ -2514,13 +2517,13 @@ cells = [
         print('Train + Eval termines | mode=scratch | model_id=', selected_model_id, '| eval_job_id=', eval_job_id)
         """
     ),
-    md("## 9. Benchmark"),
+    md("## 8. Benchmark"),
     code(
         """
         !bash -lc "cd $WORKTREE && PYTHONPATH=$WORKTREE/src $PYTHON_BIN -m songo_model_stockfish.cli.main benchmark --config $BENCHMARK_CONFIG_ACTIVE --job-id $BENCHMARK_JOB_ID"
         """
     ),
-    md("## 10. Tournoi Inter-Modeles (3/1/0)"),
+    md("## 9. Tournoi Inter-Modeles (3/1/0)"),
     code(
         """
         # Tournoi round-robin entre modeles uniquement (sans minimax/mcts)
