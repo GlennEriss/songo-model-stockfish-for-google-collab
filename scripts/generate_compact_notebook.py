@@ -2493,7 +2493,7 @@ cells = [
         registry = json.loads(registry_path.read_text(encoding='utf-8')) if registry_path.exists() else {'models': []}
         records = registry.get('models', []) if isinstance(registry, dict) else []
 
-        # Dedup par model_id, garde l'entree la plus recente
+        # Dedup par model_id, garde l'entree la plus recente (source registre)
         ordered = sorted(records, key=lambda item: float(item.get('sort_ts', 0.0)), reverse=True)
         seen_ids = set()
         models = []
@@ -2507,6 +2507,15 @@ cells = [
                 checkpoint = fallback if fallback.exists() else checkpoint
             if checkpoint.exists():
                 models.append({'model_id': model_id, 'checkpoint_path': str(checkpoint)})
+                seen_ids.add(model_id)
+
+        # Fallback robuste: scan direct models/final/*.pt meme si registre vide/incomplet
+        if final_dir.exists():
+            for pt in sorted(final_dir.glob('*.pt'), key=lambda p: p.stat().st_mtime, reverse=True):
+                model_id = pt.stem.strip()
+                if not model_id or model_id in seen_ids:
+                    continue
+                models.append({'model_id': model_id, 'checkpoint_path': str(pt)})
                 seen_ids.add(model_id)
 
         if len(models) < TOURNAMENT_MIN_MODELS:
