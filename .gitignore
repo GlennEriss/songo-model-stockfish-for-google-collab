@@ -13,3 +13,7 @@ outputs/
 logs/
 data/generated/
 checkpoints/
+
+# Secrets
+secrets/
+upstash_redis.json

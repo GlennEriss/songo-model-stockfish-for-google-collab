@@ -117,21 +117,6 @@ cells = [
                 return False
             return bool(default)
 
-        def _load_env_file(path: str) -> bool:
-            file_path = Path(str(path).strip())
-            if not file_path.exists():
-                return False
-            for raw_line in file_path.read_text(encoding='utf-8').splitlines():
-                line = raw_line.strip()
-                if not line or line.startswith('#') or '=' not in line:
-                    continue
-                key, value = line.split('=', 1)
-                key = key.strip()
-                value = value.strip().strip('"').strip("'")
-                if key:
-                    os.environ[key] = value
-            return True
-
         DATASET_GENERATE_CONFIG = 'config/dataset_generation.full_matrix.colab_pro.yaml'
         DATASET_BUILD_CONFIG = 'config/dataset_build.full_matrix.colab_pro.yaml'
         TRAIN_CONTINUE_CONFIG = 'config/train.full_matrix.colab_pro.yaml'
@@ -197,11 +182,9 @@ cells = [
         FIRESTORE_WORKER_LEASES_COLLECTION = 'worker_leases'
         FIRESTORE_PIPELINE_MANIFESTS_COLLECTION = 'pipeline_manifests'
         FIRESTORE_WORKER_CHECKPOINTS_COLLECTION = 'worker_checkpoints'
-        REDIS_SECRET_ENV_PATH = '/content/drive/MyDrive/songo-stockfish/secrets/upstash_redis.env'
         REDIS_SECRET_JSON_PATH = '/content/drive/MyDrive/songo-stockfish/secrets/upstash_redis.json'
         REDIS_URL_OVERRIDE = 'https://touching-sculpin-69695.upstash.io'
         REDIS_TOKEN_OVERRIDE = ''
-        REDIS_SECRET_ENV_LOADED = _load_env_file(REDIS_SECRET_ENV_PATH)
         REDIS_SECRET_JSON_LOADED = False
         redis_secret_json_path = Path(REDIS_SECRET_JSON_PATH)
         if redis_secret_json_path.exists():
@@ -830,8 +813,6 @@ cells = [
         print('FIRESTORE_CREDENTIALS_EXISTS =', Path(str(FIRESTORE_CREDENTIALS_PATH)).exists())
         print('FIRESTORE_API_KEY_SET    =', bool(str(FIRESTORE_API_KEY).strip()))
         print('GLOBAL_PROGRESS_REDIS_ENABLED =', GLOBAL_PROGRESS_REDIS_ENABLED)
-        print('REDIS_SECRET_ENV_PATH    =', REDIS_SECRET_ENV_PATH)
-        print('REDIS_SECRET_ENV_LOADED  =', REDIS_SECRET_ENV_LOADED)
         print('REDIS_SECRET_JSON_PATH   =', REDIS_SECRET_JSON_PATH)
         print('REDIS_SECRET_JSON_LOADED =', REDIS_SECRET_JSON_LOADED)
         print('GLOBAL_PROGRESS_REDIS_URL_SET =', bool(str(GLOBAL_PROGRESS_REDIS_URL).strip()))
