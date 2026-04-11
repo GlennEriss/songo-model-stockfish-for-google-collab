@@ -2771,6 +2771,157 @@ def _parse_matchup(matchup_spec: str) -> tuple[str, str]:
     return parts[0].strip(), parts[1].strip()
 
 
+def _resolve_benchmark_review_summary_path(job: JobContext, cfg: dict[str, Any]) -> Path | None:
+    configured = str(cfg.get("benchmark_review_summary_path", "")).strip()
+    if configured:
+        candidate = _resolve_storage_path(job.paths.drive_root, configured, Path(configured))
+        return candidate
+
+    review_model = str(cfg.get("benchmark_review_model", "auto_best")).strip() or "auto_best"
+    resolved_model_id = ""
+    if review_model in {"auto_best", "auto_promoted_best"}:
+        metadata = promoted_best_metadata(job.paths.models_root)
+        resolved_model_id = str(metadata.get("model_id", "")).strip() if metadata else ""
+    elif review_model in {"auto", "auto_latest"}:
+        latest = latest_model_record(job.paths.models_root)
+        resolved_model_id = str(latest.get("model_id", "")).strip() if latest else ""
+    else:
+        resolved_model_id = review_model
+    if not resolved_model_id:
+        return None
+
+    registry = load_registry(job.paths.models_root)
+    model_record = next(
+        (
+            item
+            for item in registry.get("models", [])
+            if str(item.get("model_id", "")).strip() == resolved_model_id
+        ),
+        None,
+    )
+    if not isinstance(model_record, dict):
+        return None
+    summary_path_raw = str(model_record.get("benchmark_summary_path", "")).strip()
+    if not summary_path_raw:
+        return None
+    return _resolve_storage_path(job.paths.drive_root, summary_path_raw, Path(summary_path_raw))
+
+
+def _augment_matchups_with_benchmark_review(
+    job: JobContext,
+    *,
+    cfg: dict[str, Any],
+    base_matchups: list[str],
+) -> tuple[list[str], dict[str, Any]]:
+    enabled = _as_bool(cfg.get("benchmark_review_enabled", False), default=False)
+    if not enabled:
+        return list(base_matchups), {"enabled": False, "added": 0}
+
+    summary_path = _resolve_benchmark_review_summary_path(job, cfg)
+    if summary_path is None or not summary_path.exists():
+        job.logger.warning(
+            "dataset generation benchmark review enabled but summary missing | path=%s",
+            summary_path,
+        )
+        return list(base_matchups), {
+            "enabled": True,
+            "added": 0,
+            "reason": "summary_missing",
+            "summary_path": str(summary_path) if summary_path is not None else "",
+        }
+
+    payload = _read_json(summary_path)
+    matchups_payload = payload.get("matchups", [])
+    if not isinstance(matchups_payload, list) or not matchups_payload:
+        return list(base_matchups), {
+            "enabled": True,
+            "added": 0,
+            "reason": "empty_matchups",
+            "summary_path": str(summary_path),
+        }
+
+    engine = str(payload.get("engine", "")).strip()
+    if not engine:
+        return list(base_matchups), {
+            "enabled": True,
+            "added": 0,
+            "reason": "missing_engine",
+            "summary_path": str(summary_path),
+        }
+
+    top_k = max(1, int(cfg.get("benchmark_review_top_k", 2)))
+    repeat_factor = max(1, int(cfg.get("benchmark_review_repeat_factor", 2)))
+    winrate_threshold = float(cfg.get("benchmark_review_max_winrate", 0.35))
+    max_added_matchups = max(1, int(cfg.get("benchmark_review_max_added_matchups", 12)))
+    include_only_supported = _as_bool(cfg.get("benchmark_review_supported_only", True), default=True)
+
+    normalized: list[dict[str, Any]] = []
+    for item in matchups_payload:
+        if not isinstance(item, dict):
+            continue
+        opponent = str(item.get("opponent", "")).strip()
+        if not opponent or ":" not in opponent:
+            continue
+        if include_only_supported:
+            kind = opponent.split(":", 1)[0].strip().lower()
+            if kind not in {"minimax", "mcts"}:
+                continue
+        try:
+            winrate = float(item.get("winrate", 0.0))
+        except Exception:
+            winrate = 0.0
+        try:
+            score_rate = float(item.get("score_rate", winrate))
+        except Exception:
+            score_rate = winrate
+        normalized.append(
+            {
+                "opponent": opponent,
+                "winrate": winrate,
+                "score_rate": score_rate,
+            }
+        )
+
+    if not normalized:
+        return list(base_matchups), {
+            "enabled": True,
+            "added": 0,
+            "reason": "no_supported_opponents",
+            "summary_path": str(summary_path),
+        }
+
+    normalized.sort(key=lambda item: (float(item["winrate"]), float(item["score_rate"])))
+    selected = [item for item in normalized if float(item["winrate"]) <= winrate_threshold]
+    if not selected:
+        selected = normalized[:top_k]
+    else:
+        selected = selected[:top_k]
+
+    added: list[str] = []
+    for item in selected:
+        matchup = f"model:{engine} vs {item['opponent']}"
+        for _ in range(repeat_factor):
+            added.append(matchup)
+            if len(added) >= max_added_matchups:
+                break
+        if len(added) >= max_added_matchups:
+            break
+
+    final_matchups = list(base_matchups) + added
+    info = {
+        "enabled": True,
+        "added": len(added),
+        "summary_path": str(summary_path),
+        "engine": engine,
+        "selected_opponents": [str(item.get("opponent", "")) for item in selected],
+        "repeat_factor": repeat_factor,
+        "top_k": top_k,
+        "max_winrate": winrate_threshold,
+        "max_added_matchups": max_added_matchups,
+    }
+    return final_matchups, info
+
+
 def _validate_generation_agent_spec(
     spec: str,
     *,
@@ -3417,6 +3568,28 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
         raise ValueError(f"Unsupported dataset generation source_mode: {source_mode}")
 
     if source_mode == "benchmatch":
+        matchups, benchmark_review_info = _augment_matchups_with_benchmark_review(
+            job,
+            cfg=cfg,
+            base_matchups=[str(matchup) for matchup in matchups],
+        )
+        if bool(benchmark_review_info.get("enabled", False)):
+            job.logger.info(
+                "dataset generation benchmark review enrichment | added_matchups=%s | engine=%s | selected_opponents=%s | summary_path=%s",
+                int(benchmark_review_info.get("added", 0)),
+                str(benchmark_review_info.get("engine", "")) or "<none>",
+                benchmark_review_info.get("selected_opponents", []),
+                str(benchmark_review_info.get("summary_path", "")) or "<none>",
+            )
+            job.write_event(
+                "dataset_generation_benchmark_review_enrichment",
+                added_matchups=int(benchmark_review_info.get("added", 0)),
+                engine=str(benchmark_review_info.get("engine", "")),
+                selected_opponents=benchmark_review_info.get("selected_opponents", []),
+                summary_path=str(benchmark_review_info.get("summary_path", "")),
+                reason=str(benchmark_review_info.get("reason", "")),
+            )
+
         validation_cache: dict[str, tuple[bool, str]] = {}
         valid_matchups: list[str] = []
         skipped_matchups: list[dict[str, str]] = []

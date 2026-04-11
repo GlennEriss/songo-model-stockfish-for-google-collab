@@ -59,3 +59,12 @@ dataset_generation:
   progress_update_every_n_games: 1
   output_raw_dir: data/raw_full_matrix_colab_pro
   output_sampled_dir: data/sampled_full_matrix_colab_pro
+  # Benchmark review mini-dataset enrichment (hard examples)
+  benchmark_review_enabled: false
+  benchmark_review_model: auto_best
+  benchmark_review_summary_path: ""
+  benchmark_review_top_k: 2
+  benchmark_review_repeat_factor: 2
+  benchmark_review_max_winrate: 0.35
+  benchmark_review_max_added_matchups: 12
+  benchmark_review_supported_only: true
