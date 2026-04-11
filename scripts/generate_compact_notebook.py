@@ -54,8 +54,6 @@ cells = [
     code(
         """
         import os
-        import json
-        from pathlib import Path
         import sys
         import shutil
         import subprocess
@@ -1423,6 +1421,16 @@ cells = [
         """
     ),
     md("## 5bis. Suivre le pipeline dataset"),
+    md(
+        """
+        Vue par source:
+        - `5bis.A` = Firestore (source de verite globale)
+        - `5bis.B` = Drive local worker (etat local des jobs)
+        - `5bis.C` = Redis cache (et ecart vs Firestore)
+        - `5bis.D` = Logs worker (fichiers Drive)
+        """
+    ),
+    md("### 5bis.A Suivi Firestore (source de verite)"),
     code(
         """
         import json
@@ -1461,19 +1469,44 @@ cells = [
     ),
     code(
         """
-        import json
-        import time
-        from pathlib import Path
-
+        # Snapshot Firestore: global progress + dataset_registry (worker courant)
         try:
+            global_payload = _read_firestore_doc(
+                FIRESTORE_COLLECTION,
+                FIRESTORE_DOCUMENT,
+                default={
+                    'global_target_id': GLOBAL_TARGET_ID,
+                    'target_samples': int(GLOBAL_TARGET_SAMPLES),
+                    'total_samples': 0,
+                    'total_games': 0,
+                    'workers': {},
+                    'updated_at': '<none>',
+                },
+            )
             registry = _load_dataset_registry_payload()
         except Exception as exc:
-            print('dataset_registry Firestore introuvable:', f'{type(exc).__name__}: {exc}')
+            print('Lecture Firestore impossible:', f'{type(exc).__name__}: {exc}')
+            global_payload = {}
             registry = {'dataset_sources': [], 'built_datasets': []}
+
+        if not isinstance(global_payload, dict):
+            global_payload = {}
+        workers_payload = global_payload.get('workers', {})
+        if not isinstance(workers_payload, dict):
+            workers_payload = {}
+
+        print('Global Firestore:')
+        print('  collection/document =', f'{FIRESTORE_COLLECTION}/{FIRESTORE_DOCUMENT}')
+        print('  total_samples       =', int(global_payload.get('total_samples', 0)))
+        print('  target_samples      =', int(global_payload.get('target_samples', GLOBAL_TARGET_SAMPLES)))
+        print('  total_games         =', int(global_payload.get('total_games', 0)))
+        print('  workers             =', len(workers_payload))
+        print('  updated_at          =', global_payload.get('updated_at', '<none>'))
+
         source = next((item for item in registry.get('dataset_sources', []) if item.get('dataset_source_id') == DATASET_SOURCE_ID), None)
         built = next((item for item in registry.get('built_datasets', []) if item.get('dataset_id') == DATASET_BUILD_ID), None)
 
-        print('Source courante:')
+        print('\\nSource courante (Firestore dataset_registry):')
         if source is None:
             print('- aucune entree source pour', DATASET_SOURCE_ID)
         else:
@@ -1484,7 +1517,7 @@ cells = [
             print('  sampled_files     =', source.get('sampled_files'))
             print('  updated_at        =', source.get('updated_at'))
 
-        print('\\nDataset final courant:')
+        print('\\nDataset final courant (Firestore dataset_registry):')
         if built is None:
             print('- aucune entree built pour', DATASET_BUILD_ID)
         else:
@@ -1498,7 +1531,7 @@ cells = [
     ),
     code(
         """
-        # KPI live: progression source + build vers la cible
+        # KPI live (Firestore dataset_registry + Drive job summary)
         import json
         import time
         from pathlib import Path
@@ -1560,8 +1593,8 @@ cells = [
                     played_games = int(summary.get('added_games', 0))
 
             ts = time.strftime('%Y-%m-%d %H:%M:%S')
-            print(f'[{ts}] source_samples={source_samples}/{TARGET_SAMPLES} ({_safe_pct(source_samples, int(TARGET_SAMPLES)):.2f}%) | source_files={source_files} | source_status={source_status}')
-            print(f'[{ts}] played_games={played_games} | build_samples={build_samples}/{build_target} ({_safe_pct(build_samples, build_target):.2f}%) | build_status={build_status}')
+            print(f'[{ts}] [FIRESTORE dataset_registry] source_samples={source_samples}/{TARGET_SAMPLES} ({_safe_pct(source_samples, int(TARGET_SAMPLES)):.2f}%) | source_files={source_files} | source_status={source_status}')
+            print(f'[{ts}] [DRIVE summary + FIRESTORE build] played_games={played_games} | build_samples={build_samples}/{build_target} ({_safe_pct(build_samples, build_target):.2f}%) | build_status={build_status}')
             print('-' * 120)
 
             if loop_idx >= (MAX_LOOPS - 1):
@@ -1571,7 +1604,7 @@ cells = [
     ),
     code(
         """
-        # KPI global: progression agregee de tous les workers
+        # KPI global (Firestore direct): progression agregee de tous les workers
         import json
         import time
         from pathlib import Path
@@ -1602,11 +1635,20 @@ cells = [
             return (100.0 * float(value)) / float(target)
 
         for loop_idx in range(MAX_LOOPS):
-            global_payload = _load_global_progress_payload(
-                drive_root=DRIVE_ROOT,
-                global_target_id=GLOBAL_TARGET_ID,
-                target_samples=int(GLOBAL_TARGET_SAMPLES),
+            global_payload = _read_firestore_doc(
+                FIRESTORE_COLLECTION,
+                FIRESTORE_DOCUMENT,
+                default={
+                    'global_target_id': GLOBAL_TARGET_ID,
+                    'target_samples': int(GLOBAL_TARGET_SAMPLES),
+                    'total_samples': 0,
+                    'total_games': 0,
+                    'workers': {},
+                    'updated_at': '<none>',
+                },
             )
+            if not isinstance(global_payload, dict):
+                global_payload = {}
 
             global_total_samples = int(global_payload.get('total_samples', 0))
             global_total_games = int(global_payload.get('total_games', 0))
@@ -1627,12 +1669,12 @@ cells = [
 
             ts = time.strftime('%Y-%m-%d %H:%M:%S')
             print(
-                f'[{ts}] GLOBAL generate_samples={global_total_samples}/{global_target_samples} '
+                f'[{ts}] [FIRESTORE global] generate_samples={global_total_samples}/{global_target_samples} '
                 f'({_safe_pct(global_total_samples, global_target_samples):.2f}%) | '
                 f'global_games={global_total_games} | workers={global_workers} | '
                 f'updated_at={global_payload.get("updated_at", "<none>")}'
             )
-            print(f'[{ts}] GLOBAL build_labeled_samples_sum={built_total_samples} | build_worker_datasets={built_worker_datasets}')
+            print(f'[{ts}] [FIRESTORE registry] build_labeled_samples_sum={built_total_samples} | build_worker_datasets={built_worker_datasets}')
             print('-' * 120)
 
             if loop_idx >= (MAX_LOOPS - 1):
@@ -1642,7 +1684,7 @@ cells = [
     ),
     code(
         """
-        # Workers status: actif/inactif (vision globale multi-Colab)
+        # Workers status (Firestore direct): actif/inactif (vision globale multi-Colab)
         import json
         import time
         from datetime import datetime
@@ -1676,11 +1718,20 @@ cells = [
             except Exception:
                 return 0.0
 
-        payload = _load_global_progress_payload(
-            drive_root=DRIVE_ROOT,
-            global_target_id=GLOBAL_TARGET_ID,
-            target_samples=int(GLOBAL_TARGET_SAMPLES),
+        payload = _read_firestore_doc(
+            FIRESTORE_COLLECTION,
+            FIRESTORE_DOCUMENT,
+            default={
+                'global_target_id': GLOBAL_TARGET_ID,
+                'target_samples': int(GLOBAL_TARGET_SAMPLES),
+                'total_samples': 0,
+                'total_games': 0,
+                'workers': {},
+                'updated_at': '<none>',
+            },
         )
+        if not isinstance(payload, dict):
+            payload = {}
         workers = payload.get('workers', {})
         if not isinstance(workers, dict) or not workers:
             print('Aucun worker global enregistre')
@@ -1711,7 +1762,7 @@ cells = [
             active_count = sum(1 for row in rows if row['status'] == 'active')
             inactive_count = len(rows) - active_count
             print(
-                f'Workers global: total={len(rows)} | active={active_count} | inactive={inactive_count} '
+                f'[FIRESTORE global] Workers: total={len(rows)} | active={active_count} | inactive={inactive_count} '
                 f'| active_threshold_seconds={ACTIVE_THRESHOLD_SECONDS}'
             )
             for row in rows:
@@ -1726,7 +1777,7 @@ cells = [
     ),
     code(
         """
-        # Health check compact: un seul bloc pour voir si le pipeline avance vraiment
+        # Health check compact (Firestore direct): un seul bloc pour voir si le pipeline avance vraiment
         import json
         import time
         from datetime import datetime
@@ -1766,11 +1817,20 @@ cells = [
                 return 0.0
             return (100.0 * float(value)) / float(target)
 
-        payload = _load_global_progress_payload(
-            drive_root=DRIVE_ROOT,
-            global_target_id=GLOBAL_TARGET_ID,
-            target_samples=int(GLOBAL_TARGET_SAMPLES),
+        payload = _read_firestore_doc(
+            FIRESTORE_COLLECTION,
+            FIRESTORE_DOCUMENT,
+            default={
+                'global_target_id': GLOBAL_TARGET_ID,
+                'target_samples': int(GLOBAL_TARGET_SAMPLES),
+                'total_samples': 0,
+                'total_games': 0,
+                'workers': {},
+                'updated_at': '<none>',
+            },
         )
+        if not isinstance(payload, dict):
+            payload = {}
         workers = payload.get('workers', {})
         if not isinstance(workers, dict):
             workers = {}
@@ -1883,6 +1943,136 @@ cells = [
             print(f'INACTIVE | +{len(inactive_rows) - 3} autres workers inactifs')
         """
     ),
+    md("### 5bis.B Suivi Drive (fichiers worker locaux)"),
+    code(
+        """
+        # Vue Drive: progression locale du worker (fichiers jobs/*)
+        import json
+        import time
+        from pathlib import Path
+
+        REFRESH_SECONDS = float(MONITOR_REFRESH_SECONDS)
+        MAX_LOOPS = int(MONITOR_MAX_LOOPS)
+        jobs_root = Path(DRIVE_ROOT) / 'jobs'
+
+        def _load_json_retry(path: Path, retries: int = 4, wait_seconds: float = 0.2, default=None):
+            fallback = {} if default is None else default
+            for attempt in range(retries):
+                try:
+                    return json.loads(path.read_text(encoding='utf-8'))
+                except (FileNotFoundError, OSError, json.JSONDecodeError):
+                    if attempt + 1 >= retries:
+                        return fallback
+                    time.sleep(wait_seconds)
+            return fallback
+
+        def _latest_job_dir(job_id: str) -> Path | None:
+            exact = jobs_root / str(job_id)
+            if exact.exists() and exact.is_dir():
+                return exact
+            if not jobs_root.exists():
+                return None
+            prefix = str(job_id).rsplit('_', 1)[0]
+            candidates = [p for p in jobs_root.iterdir() if p.is_dir() and p.name.startswith(prefix)]
+            if not candidates:
+                return None
+            return sorted(candidates, key=lambda p: p.stat().st_mtime)[-1]
+
+        for loop_idx in range(MAX_LOOPS):
+            generate_dir = _latest_job_dir(DATASET_GENERATE_JOB_ID)
+            build_dir = _latest_job_dir(DATASET_BUILD_JOB_ID)
+
+            generate_status = _load_json_retry(generate_dir / 'run_status.json', default={}) if generate_dir else {}
+            generate_state = _load_json_retry(generate_dir / 'state.json', default={}) if generate_dir else {}
+            generate_summary = _load_json_retry(generate_dir / 'dataset_generation' / 'dataset_generation_summary.json', default={}) if generate_dir else {}
+
+            build_status = _load_json_retry(build_dir / 'run_status.json', default={}) if build_dir else {}
+            build_state = _load_json_retry(build_dir / 'state.json', default={}) if build_dir else {}
+            build_summary = _load_json_retry(build_dir / 'dataset_build' / 'dataset_build_summary.json', default={}) if build_dir else {}
+
+            ts = time.strftime('%Y-%m-%d %H:%M:%S')
+            print(
+                f'[{ts}] [DRIVE generate] dir={generate_dir} | status={generate_status.get("status", "<none>")} '
+                f'| phase={generate_status.get("phase", "<none>")} | sample_count={generate_state.get("sample_count", "<none>")} '
+                f'| total_samples_summary={generate_summary.get("total_samples", "<none>")} | added_games_summary={generate_summary.get("added_games", "<none>")}'
+            )
+            print(
+                f'[{ts}] [DRIVE build] dir={build_dir} | status={build_status.get("status", "<none>")} '
+                f'| phase={build_status.get("phase", "<none>")} | labeled_samples_state={build_state.get("labeled_samples", "<none>")} '
+                f'| processed_files_state={build_state.get("processed_files", "<none>")} | labeled_samples_summary={build_summary.get("labeled_samples", "<none>")}'
+            )
+            print('-' * 120)
+
+            if loop_idx >= (MAX_LOOPS - 1):
+                break
+            time.sleep(REFRESH_SECONDS)
+        """
+    ),
+    md("### 5bis.C Suivi Redis (cache de progression globale)"),
+    code(
+        """
+        # Vue Redis cache: snapshot + ecart vs Firestore
+        import json
+
+        redis_key = f'{GLOBAL_PROGRESS_REDIS_KEY_PREFIX}:global_progress'
+        print('Redis enabled =', bool(GLOBAL_PROGRESS_REDIS_ENABLED))
+        print('Redis url set =', bool(str(GLOBAL_PROGRESS_REDIS_URL).strip()))
+        print('Redis token set =', bool(str(GLOBAL_PROGRESS_REDIS_TOKEN).strip()))
+        print('Redis key =', redis_key)
+
+        if not bool(GLOBAL_PROGRESS_REDIS_ENABLED):
+            print('Redis desactive, rien a lire.')
+        elif not str(GLOBAL_PROGRESS_REDIS_URL).strip() or not str(GLOBAL_PROGRESS_REDIS_TOKEN).strip():
+            print('Redis active mais URL/token manquants.')
+        else:
+            try:
+                from upstash_redis import Redis
+
+                redis_client = Redis(
+                    url=str(GLOBAL_PROGRESS_REDIS_URL).strip(),
+                    token=str(GLOBAL_PROGRESS_REDIS_TOKEN).strip(),
+                )
+                raw_payload = redis_client.get(redis_key)
+                if raw_payload is None:
+                    print('Aucune entree Redis pour cette key.')
+                else:
+                    if isinstance(raw_payload, str):
+                        cache_payload = json.loads(raw_payload)
+                    elif isinstance(raw_payload, dict):
+                        cache_payload = raw_payload
+                    else:
+                        cache_payload = {}
+                    if not isinstance(cache_payload, dict):
+                        cache_payload = {}
+                    print('Redis payload:')
+                    print('  total_samples =', int(cache_payload.get('total_samples', 0)))
+                    print('  target_samples =', int(cache_payload.get('target_samples', GLOBAL_TARGET_SAMPLES)))
+                    print('  total_games =', int(cache_payload.get('total_games', 0)))
+                    print('  updated_at =', cache_payload.get('updated_at', '<none>'))
+                    print('  redis_cached_at =', cache_payload.get('_redis_cached_at', '<none>'))
+
+                    firestore_payload = _read_firestore_doc(
+                        FIRESTORE_COLLECTION,
+                        FIRESTORE_DOCUMENT,
+                        default={
+                            'total_samples': 0,
+                            'target_samples': int(GLOBAL_TARGET_SAMPLES),
+                            'total_games': 0,
+                            'updated_at': '<none>',
+                        },
+                    )
+                    if not isinstance(firestore_payload, dict):
+                        firestore_payload = {}
+                    delta_samples = int(cache_payload.get('total_samples', 0)) - int(firestore_payload.get('total_samples', 0))
+                    delta_games = int(cache_payload.get('total_games', 0)) - int(firestore_payload.get('total_games', 0))
+                    print('Ecart Redis - Firestore:')
+                    print('  delta_samples =', delta_samples)
+                    print('  delta_games   =', delta_games)
+            except Exception as exc:
+                print('Lecture Redis impossible:', f'{type(exc).__name__}: {exc}')
+        """
+    ),
+    md("### 5bis.D Logs worker (Drive)"),
     code(
         """
         import json
