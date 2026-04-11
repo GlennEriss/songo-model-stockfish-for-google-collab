@@ -148,7 +148,7 @@ cells = [
         FIRESTORE_PROJECT_ID = 'songo-model-ai'
         FIRESTORE_COLLECTION = 'global_generation_progress'
         FIRESTORE_DOCUMENT = GLOBAL_TARGET_ID
-        FIRESTORE_CREDENTIALS_PATH = ''  # Chemin JSON service account (requis pour Python Firestore)
+        FIRESTORE_CREDENTIALS_PATH = '/content/drive/MyDrive/songo-stockfish/secrets/songo-model-ai-firebase-adminsdk-fbsvc-b3ef3bdacb.json'  # Chemin JSON service account (requis pour Python Firestore)
         FIRESTORE_API_KEY = ''  # Non supporte par google-cloud-firestore (serveur)
         FIRESTORE_DATASET_REGISTRY_COLLECTION = 'dataset_registry'
         FIRESTORE_DATASET_REGISTRY_DOCUMENT = 'primary'
@@ -201,6 +201,12 @@ cells = [
         import time
         from datetime import datetime
         from pathlib import Path
+
+        if str(GLOBAL_PROGRESS_BACKEND).strip().lower() == 'firestore':
+            if not str(FIRESTORE_CREDENTIALS_PATH).strip():
+                raise RuntimeError('FIRESTORE_CREDENTIALS_PATH est vide en mode Firestore.')
+            if not Path(str(FIRESTORE_CREDENTIALS_PATH)).exists():
+                raise FileNotFoundError(f'FIRESTORE_CREDENTIALS_PATH introuvable: {FIRESTORE_CREDENTIALS_PATH}')
 
         def _acquire_lock_dir(lock_dir: Path, timeout_seconds: float = 20.0, poll_seconds: float = 0.1) -> bool:
             deadline = time.time() + max(1.0, float(timeout_seconds))
