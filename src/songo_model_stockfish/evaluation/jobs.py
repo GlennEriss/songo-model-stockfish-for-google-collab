@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
-import time
 
 import torch
 import torch.nn.functional as F
@@ -42,6 +41,15 @@ def _write_json(path: Path, payload: dict) -> None:
     write_json_atomic(path, payload, ensure_ascii=True, indent=2)
 
 
+def _ensure_checkpoint_exists(*, model_id: str, checkpoint_path: Path, mode: str) -> Path:
+    if checkpoint_path.exists():
+        return checkpoint_path
+    raise FileNotFoundError(
+        "Checkpoint d'evaluation introuvable "
+        f"(mode={mode}, model_id={model_id}, checkpoint_path={checkpoint_path})."
+    )
+
+
 def _resolve_evaluation_target(job: JobContext, cfg: dict[str, Any]) -> tuple[str, Path]:
     requested_model_id = str(cfg.get("model_id", "auto_latest")).strip() or "auto_latest"
     requested_checkpoint = str(cfg.get("checkpoint_path", "")).strip()
@@ -51,19 +59,31 @@ def _resolve_evaluation_target(job: JobContext, cfg: dict[str, Any]) -> tuple[st
         if not metadata:
             raise FileNotFoundError("Aucun modele promu disponible pour l'evaluation auto_best.")
         checkpoint_path = job.paths.models_root / "promoted" / "best" / "model.pt"
-        return str(metadata.get("model_id", "promoted_best")), checkpoint_path
+        resolved_model_id = str(metadata.get("model_id", "promoted_best"))
+        return resolved_model_id, _ensure_checkpoint_exists(
+            model_id=resolved_model_id,
+            checkpoint_path=checkpoint_path,
+            mode="auto_best",
+        )
 
     if requested_model_id in {"auto", "auto_latest"} or requested_checkpoint in {"", "auto", "auto_latest"}:
         latest = latest_model_record(job.paths.models_root)
         if not latest:
             raise FileNotFoundError("Aucun modele disponible dans le registre pour l'evaluation auto_latest.")
         checkpoint_path = Path(str(latest.get("checkpoint_path", "")).strip())
-        if not checkpoint_path.exists():
-            raise FileNotFoundError(f"Checkpoint latest introuvable: {checkpoint_path}")
-        return str(latest.get("model_id", "")), checkpoint_path
+        resolved_model_id = str(latest.get("model_id", ""))
+        return resolved_model_id, _ensure_checkpoint_exists(
+            model_id=resolved_model_id,
+            checkpoint_path=checkpoint_path,
+            mode="auto_latest",
+        )
 
     checkpoint_path = _resolve_storage_path(job.paths.drive_root, cfg.get("checkpoint_path"), job.job_dir / f"{requested_model_id}.pt")
-    return requested_model_id, checkpoint_path
+    return requested_model_id, _ensure_checkpoint_exists(
+        model_id=requested_model_id,
+        checkpoint_path=checkpoint_path,
+        mode="explicit",
+    )
 
 
 def _update_model_card_after_evaluation(models_root: Path, model_id: str, summary: dict[str, object]) -> None:
@@ -299,6 +319,29 @@ def run_evaluation(job: JobContext) -> dict[str, object]:
                     risky_move_mask,
                 )
                 loss_total = loss_policy + loss_value + (tactical_aux_loss_weight * tactical_aux_loss)
+            if not bool(torch.isfinite(loss_total).item()):
+                error_message = (
+                    "non-finite loss detected during evaluation "
+                    f"(batch={batch_index}/{len(test_loader)}, model_id={model_id}, dataset_id={dataset_id})."
+                )
+                job.write_event(
+                    "evaluation_non_finite_detected",
+                    model_id=model_id,
+                    dataset_id=dataset_id,
+                    batch_index=batch_index,
+                    total_batches=len(test_loader),
+                    error=error_message,
+                )
+                job.write_metric(
+                    {
+                        "metric_type": "evaluation_non_finite_detected",
+                        "model_id": model_id,
+                        "dataset_id": dataset_id,
+                        "batch_index": batch_index,
+                        "total_batches": len(test_loader),
+                    }
+                )
+                raise FloatingPointError(error_message)
 
             preds = masked_logits.argmax(dim=1)
             topk = min(3, masked_logits.shape[1])
@@ -399,13 +442,13 @@ def run_evaluation(job: JobContext) -> dict[str, object]:
         job.paths.models_root,
         {
             "model_id": model_id,
-            "sort_ts": time.time(),
             "dataset_id": dataset_id,
             "checkpoint_path": str(checkpoint_path),
             "training_job_id": existing.get("training_job_id", ""),
             "best_validation_metric": existing.get("best_validation_metric", -1.0),
             "evaluation_top1": float(summary["policy_accuracy_top1"]),
             "evaluation_top3": float(summary["policy_accuracy_top3"]),
+            "evaluated_at": str(summary.get("evaluated_at", utc_now_iso())),
             "evaluation_summary_path": str(report_path),
             "benchmark_score": float(existing.get("benchmark_score", -1.0)),
             "model_card_path": str(job.paths.models_root / "final" / f"{model_id}.model_card.json"),

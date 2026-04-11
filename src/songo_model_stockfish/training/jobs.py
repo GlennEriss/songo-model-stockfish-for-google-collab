@@ -93,18 +93,30 @@ def _read_dataset_registry(data_root: Path, firestore_cfg: dict[str, Any] | None
     return payload
 
 
+def _normalize_registry_output_dir(value: Any) -> Path | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    candidate = Path(text).expanduser()
+    if not candidate.is_absolute():
+        return None
+    return candidate.resolve(strict=False)
+
+
 def _select_largest_built_dataset(data_root: Path, firestore_cfg: dict[str, Any] | None = None) -> dict[str, Any]:
     registry = _read_dataset_registry(data_root, firestore_cfg=firestore_cfg)
     candidates: list[dict[str, Any]] = []
     for entry in registry.get("built_datasets", []):
-        output_dir = Path(str(entry.get("output_dir", "")))
-        if not output_dir:
+        output_dir = _normalize_registry_output_dir(entry.get("output_dir"))
+        if output_dir is None:
             continue
         if not (output_dir / "train.npz").exists():
             continue
         if not (output_dir / "validation.npz").exists():
             continue
-        candidates.append(entry)
+        normalized_entry = dict(entry)
+        normalized_entry["output_dir"] = str(output_dir)
+        candidates.append(normalized_entry)
     if not candidates:
         raise FileNotFoundError("Aucun built dataset complet avec train.npz et validation.npz trouve dans le registre")
     candidates.sort(
@@ -124,7 +136,14 @@ def _resolve_built_dataset_by_id(data_root: Path, dataset_id: str, firestore_cfg
     registry = _read_dataset_registry(data_root, firestore_cfg=firestore_cfg)
     for entry in registry.get("built_datasets", []):
         if str(entry.get("dataset_id", "")).strip() == requested_id:
-            return entry
+            output_dir = _normalize_registry_output_dir(entry.get("output_dir"))
+            if output_dir is None:
+                raise ValueError(
+                    f"Built dataset invalide dans le registre (output_dir vide/non-absolu): {requested_id}"
+                )
+            normalized_entry = dict(entry)
+            normalized_entry["output_dir"] = str(output_dir)
+            return normalized_entry
     raise FileNotFoundError(f"Built dataset introuvable dans le registre: {requested_id}")
 
 
@@ -233,6 +252,11 @@ def _run_epoch(
                 risky_move_mask,
             )
             loss_total = loss_policy + (value_loss_weight * loss_value) + (tactical_aux_loss_weight * tactical_aux_loss)
+        if not bool(torch.isfinite(loss_total).item()):
+            raise FloatingPointError(
+                f"non-finite loss detected | stage={stage} | batch={batch_index}/{total_batches} | "
+                f"loss_total={float(loss_total.detach().cpu().item())}"
+            )
 
         if training:
             optimizer.zero_grad(set_to_none=True)
@@ -468,6 +492,7 @@ def run_train(job: JobContext) -> dict[str, object]:
         best_metric = 0.0
     checkpoint_path_value = state.get("checkpoint_path")
     parent_checkpoint_snapshot_path = None
+    resumed_from_checkpoint = False
     if checkpoint_path_value:
         checkpoint_path = Path(str(checkpoint_path_value))
         if checkpoint_path.exists():
@@ -484,14 +509,17 @@ def run_train(job: JobContext) -> dict[str, object]:
             optimizer.load_state_dict(checkpoint["optimizer_state"])
             if scheduler is not None and checkpoint.get("scheduler_state") is not None:
                 scheduler.load_state_dict(checkpoint["scheduler_state"])
+            if scaler is not None and checkpoint.get("scaler_state") is not None:
+                scaler.load_state_dict(checkpoint["scaler_state"])
             start_epoch = int(checkpoint.get("epoch", start_epoch))
             global_step = int(checkpoint.get("global_step", global_step))
             best_metric = float(checkpoint.get("best_metric", best_metric))
             best_epoch = int(checkpoint.get("best_epoch", best_epoch))
             epochs_without_improvement = int(checkpoint.get("epochs_without_improvement", epochs_without_improvement))
-    elif init_checkpoint_path is None and init_from_promoted_best and promoted_best_checkpoint_path.exists():
+            resumed_from_checkpoint = True
+    if (not resumed_from_checkpoint) and init_checkpoint_path is None and init_from_promoted_best and promoted_best_checkpoint_path.exists():
         init_checkpoint_path = promoted_best_checkpoint_path
-    elif init_checkpoint_path:
+    if (not resumed_from_checkpoint) and init_checkpoint_path:
         if not init_checkpoint_path.exists():
             raise FileNotFoundError(f"init_checkpoint_path introuvable: {init_checkpoint_path}")
         parent_checkpoint = torch.load(init_checkpoint_path, map_location=device)
@@ -706,19 +734,35 @@ def run_train(job: JobContext) -> dict[str, object]:
                     }
                 )
 
-        train_metrics = _run_epoch(
-            model,
-            train_loader,
-            device,
-            optimizer=optimizer,
-            scaler=scaler,
-            amp_enabled=amp_enabled,
-            value_loss_weight=value_loss_weight,
-            soft_policy_loss_weight=soft_policy_loss_weight,
-            tactical_aux_loss_weight=tactical_aux_loss_weight,
-            gradient_clip_norm=gradient_clip_norm,
-            on_batch_end=on_train_batch_end,
-        )
+        try:
+            train_metrics = _run_epoch(
+                model,
+                train_loader,
+                device,
+                optimizer=optimizer,
+                scaler=scaler,
+                amp_enabled=amp_enabled,
+                value_loss_weight=value_loss_weight,
+                soft_policy_loss_weight=soft_policy_loss_weight,
+                tactical_aux_loss_weight=tactical_aux_loss_weight,
+                gradient_clip_norm=gradient_clip_norm,
+                on_batch_end=on_train_batch_end,
+            )
+        except FloatingPointError as exc:
+            job.write_event(
+                "train_non_finite_detected",
+                epoch=epoch_number,
+                stage="train",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            job.write_metric(
+                {
+                    "metric_type": "train_non_finite_detected",
+                    "epoch": epoch_number,
+                    "stage": "train",
+                }
+            )
+            raise
         job.logger.info(
             "training stage completed | epoch=%s/%s | stage=train | loss=%.4f | acc=%.4f",
             epoch_number,
@@ -800,18 +844,34 @@ def run_train(job: JobContext) -> dict[str, object]:
                     }
                 )
 
-        validation_metrics = _run_epoch(
-            model,
-            validation_loader,
-            device,
-            optimizer=None,
-            scaler=None,
-            amp_enabled=amp_enabled,
-            value_loss_weight=value_loss_weight,
-            soft_policy_loss_weight=soft_policy_loss_weight,
-            tactical_aux_loss_weight=tactical_aux_loss_weight,
-            on_batch_end=on_validation_batch_end,
-        )
+        try:
+            validation_metrics = _run_epoch(
+                model,
+                validation_loader,
+                device,
+                optimizer=None,
+                scaler=None,
+                amp_enabled=amp_enabled,
+                value_loss_weight=value_loss_weight,
+                soft_policy_loss_weight=soft_policy_loss_weight,
+                tactical_aux_loss_weight=tactical_aux_loss_weight,
+                on_batch_end=on_validation_batch_end,
+            )
+        except FloatingPointError as exc:
+            job.write_event(
+                "train_non_finite_detected",
+                epoch=epoch_number,
+                stage="validation",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            job.write_metric(
+                {
+                    "metric_type": "train_non_finite_detected",
+                    "epoch": epoch_number,
+                    "stage": "validation",
+                }
+            )
+            raise
         global_step += int(train_metrics["examples"])
 
         epoch_payload = {
@@ -863,6 +923,7 @@ def run_train(job: JobContext) -> dict[str, object]:
             "model_state": model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
             "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
+            "scaler_state": scaler.state_dict() if scaler is not None else None,
             "amp_enabled": amp_enabled,
             "model_config": model_config,
         }
