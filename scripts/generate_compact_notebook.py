@@ -2465,6 +2465,157 @@ cells = [
         !bash -lc "cd $WORKTREE && PYTHONPATH=$WORKTREE/src $PYTHON_BIN -m songo_model_stockfish.cli.main benchmark --config $BENCHMARK_CONFIG_ACTIVE --job-id $BENCHMARK_JOB_ID"
         """
     ),
+    md("## 10. Tournoi Inter-Modeles (3/1/0)"),
+    code(
+        """
+        # Tournoi round-robin entre modeles uniquement (sans minimax/mcts)
+        import json
+        import itertools
+        import sys
+        import time
+        from pathlib import Path
+        from datetime import UTC, datetime
+
+        sys.path.insert(0, f"{WORKTREE}/src")
+        from songo_model_stockfish.benchmark.model_agent import ModelAgent
+        from songo_model_stockfish.benchmark.play_match import play_match
+
+        TOURNAMENT_GAMES_PER_PAIR = 8   # total games par paire
+        TOURNAMENT_MAX_MOVES = 300
+        TOURNAMENT_DEVICE = 'cpu'
+        TOURNAMENT_MIN_MODELS = 2
+        TOURNAMENT_WRITE_REPORT = True
+
+        models_root = Path(DRIVE_ROOT) / 'models'
+        registry_path = models_root / 'registry.json'
+        final_dir = models_root / 'final'
+
+        registry = json.loads(registry_path.read_text(encoding='utf-8')) if registry_path.exists() else {'models': []}
+        records = registry.get('models', []) if isinstance(registry, dict) else []
+
+        # Dedup par model_id, garde l'entree la plus recente
+        ordered = sorted(records, key=lambda item: float(item.get('sort_ts', 0.0)), reverse=True)
+        seen_ids = set()
+        models = []
+        for item in ordered:
+            model_id = str(item.get('model_id', '')).strip()
+            if not model_id or model_id in seen_ids:
+                continue
+            checkpoint = Path(str(item.get('checkpoint_path', '')).strip())
+            if not checkpoint.exists():
+                fallback = final_dir / f'{model_id}.pt'
+                checkpoint = fallback if fallback.exists() else checkpoint
+            if checkpoint.exists():
+                models.append({'model_id': model_id, 'checkpoint_path': str(checkpoint)})
+                seen_ids.add(model_id)
+
+        if len(models) < TOURNAMENT_MIN_MODELS:
+            raise ValueError(f'Pas assez de modeles pour tournoi: {len(models)} (min={TOURNAMENT_MIN_MODELS})')
+
+        print('Modeles retenus pour tournoi =', len(models))
+        for m in models:
+            print(' -', m['model_id'])
+
+        agents = {
+            m['model_id']: ModelAgent(m['checkpoint_path'], display_name=m['model_id'], device=TOURNAMENT_DEVICE)
+            for m in models
+        }
+        table = {
+            m['model_id']: {
+                'model_id': m['model_id'],
+                'points': 0,
+                'wins': 0,
+                'draws': 0,
+                'losses': 0,
+                'played': 0,
+            }
+            for m in models
+        }
+
+        pair_summaries = []
+        for left, right in itertools.combinations([m['model_id'] for m in models], 2):
+            wins_left = 0
+            wins_right = 0
+            draws = 0
+            for game_idx in range(TOURNAMENT_GAMES_PER_PAIR):
+                starter = game_idx % 2
+                result = play_match(
+                    agents[left],
+                    agents[right],
+                    max_moves=TOURNAMENT_MAX_MOVES,
+                    starter=starter,
+                )
+                if result.winner == 0:
+                    wins_left += 1
+                elif result.winner == 1:
+                    wins_right += 1
+                else:
+                    draws += 1
+
+            table[left]['played'] += TOURNAMENT_GAMES_PER_PAIR
+            table[right]['played'] += TOURNAMENT_GAMES_PER_PAIR
+            table[left]['wins'] += wins_left
+            table[left]['draws'] += draws
+            table[left]['losses'] += wins_right
+            table[right]['wins'] += wins_right
+            table[right]['draws'] += draws
+            table[right]['losses'] += wins_left
+
+            table[left]['points'] += (wins_left * 3) + draws
+            table[right]['points'] += (wins_right * 3) + draws
+
+            pair_summaries.append(
+                {
+                    'model_a': left,
+                    'model_b': right,
+                    'games': TOURNAMENT_GAMES_PER_PAIR,
+                    'wins_a': wins_left,
+                    'wins_b': wins_right,
+                    'draws': draws,
+                    'points_a': (wins_left * 3) + draws,
+                    'points_b': (wins_right * 3) + draws,
+                }
+            )
+            print(f'pair done: {left} vs {right} | W={wins_left}-{wins_right} D={draws}')
+
+        ranking = sorted(
+            table.values(),
+            key=lambda row: (
+                int(row['points']),
+                int(row['wins']),
+                int(row['draws']),
+                -int(row['losses']),
+                row['model_id'],
+            ),
+            reverse=True,
+        )
+
+        print('\\n=== Classement Tournoi (models uniquement) ===')
+        print(f"{'Rk':>2} | {'Model':<40} | {'Pts':>4} | {'W':>4} | {'D':>4} | {'L':>4} | {'G':>4}")
+        print('-' * 78)
+        for idx, row in enumerate(ranking, start=1):
+            print(
+                f\"{idx:>2} | {row['model_id']:<40} | {row['points']:>4} | {row['wins']:>4} | {row['draws']:>4} | {row['losses']:>4} | {row['played']:>4}\"
+            )
+
+        if TOURNAMENT_WRITE_REPORT:
+            out_dir = Path(DRIVE_ROOT) / 'reports' / 'benchmarks' / 'model_tournaments'
+            out_dir.mkdir(parents=True, exist_ok=True)
+            payload = {
+                'created_at': datetime.now(UTC).isoformat().replace('+00:00', 'Z'),
+                'games_per_pair': TOURNAMENT_GAMES_PER_PAIR,
+                'max_moves': TOURNAMENT_MAX_MOVES,
+                'device': TOURNAMENT_DEVICE,
+                'models': [m['model_id'] for m in models],
+                'pairs': pair_summaries,
+                'ranking': ranking,
+            }
+            stamp = datetime.now(UTC).strftime('%Y%m%d_%H%M%S')
+            out_path = out_dir / f'model_tournament_{stamp}.json'
+            out_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding='utf-8')
+            print('\\nReport saved:', out_path)
+        """
+    ),
 ]
 
 
