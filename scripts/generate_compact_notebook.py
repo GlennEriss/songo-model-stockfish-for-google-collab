@@ -1432,7 +1432,7 @@ cells = [
         - `5bis.E` = Metriques checkpoint sync Firestore (events/metrics de run)
         """
     ),
-    md("### 5bis.A Suivi Firestore (source de verite)"),
+    md("### 5bis.A Suivi Manifest Pipeline (Drive prioritaire, Firestore fallback)"),
     code(
         """
         import json
@@ -1442,15 +1442,36 @@ cells = [
 
         logs_dir = Path(DRIVE_ROOT) / 'logs' / 'pipeline'
 
-        try:
-            manifest = _load_pipeline_manifest_payload(WORKER_TAG)
-        except Exception:
-            manifest = {}
+        manifest = {}
+        manifest_source = 'none'
+        local_manifest_path = Path(DRIVE_ROOT) / PIPELINE_MANIFEST_PATH
+
+        # Priorite: manifest local Drive (toujours ecrit par la cellule de lancement)
+        if local_manifest_path.exists():
+            try:
+                manifest = json.loads(local_manifest_path.read_text(encoding='utf-8'))
+                if isinstance(manifest, dict) and manifest:
+                    manifest_source = f'drive:{local_manifest_path}'
+            except Exception:
+                manifest = {}
+
+        # Fallback: Firestore (utile si local indisponible)
         if not manifest:
-            print('Manifest Firestore introuvable:', f'{FIRESTORE_PIPELINE_MANIFESTS_COLLECTION}/{WORKER_TAG}')
+            try:
+                manifest = _load_pipeline_manifest_payload(WORKER_TAG)
+                if isinstance(manifest, dict) and manifest:
+                    manifest_source = f'firestore:{FIRESTORE_PIPELINE_MANIFESTS_COLLECTION}/{WORKER_TAG}'
+            except Exception:
+                manifest = {}
+
+        if not manifest:
+            print('Manifest introuvable (Drive + Firestore)')
+            print('  drive_path =', local_manifest_path)
+            print('  firestore  =', f'{FIRESTORE_PIPELINE_MANIFESTS_COLLECTION}/{WORKER_TAG}')
         else:
             generate_pid = int(manifest.get('generate_pid', 0) or 0)
             build_pid = int(manifest.get('build_pid', 0) or 0)
+            print('Manifest source =', manifest_source)
             print('Manifest:')
             print(json.dumps(manifest, indent=2, ensure_ascii=True))
 
