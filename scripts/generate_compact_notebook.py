@@ -2259,192 +2259,204 @@ cells = [
             print('dataset_registry Firestore introuvable:', f'{type(exc).__name__}: {exc}')
         """
     ),
-    md("## 7. Entrainement"),
+    md("## 7. Entrainement + Evaluation Automatique"),
     code(
         """
-        print('Cellule A: continue depuis best sur le plus grand dataset disponible')
-        print('config =', TRAIN_CONTINUE_CONFIG_ACTIVE)
-        !bash -lc "cd $WORKTREE && PYTHONPATH=$WORKTREE/src $PYTHON_BIN -m songo_model_stockfish.cli.main train --config $TRAIN_CONTINUE_CONFIG_ACTIVE --job-id $TRAIN_CONTINUE_JOB_ID"
-        """
-    ),
-    code(
-        """
-        print('Cellule B: from scratch sur le plus grand dataset disponible')
-        print('config =', TRAIN_SCRATCH_CONFIG_ACTIVE)
-        !bash -lc "cd $WORKTREE && PYTHONPATH=$WORKTREE/src $PYTHON_BIN -m songo_model_stockfish.cli.main train --config $TRAIN_SCRATCH_CONFIG_ACTIVE --job-id $TRAIN_SCRATCH_JOB_ID"
-        """
-    ),
-    md("## 8. Evaluation"),
-    code(
-        """
-        # Selection automatique d'un modele compatible avec le dataset cible (input_dim identique)
+        # Utilitaire commun: selection auto dataset/checkpoint compatibles puis lancement evaluate.
         import json
+        import shlex
+        import subprocess
         from pathlib import Path
         import numpy as np
         import torch
         import yaml
 
-        base_eval_cfg_path = Path(EVALUATION_20M_CONFIG_ACTIVE)
-        runtime_eval_cfg_path = Path(EVALUATION_20M_RUNTIME_CONFIG_PATH)
-        eval_cfg = yaml.safe_load(base_eval_cfg_path.read_text(encoding='utf-8')) or {}
-        eval_block = dict(eval_cfg.get('evaluation', {}) or {})
-        requested_dataset_id = str(eval_block.get('dataset_id', DATASET_BUILD_ID))
-        dataset_id = requested_dataset_id
+        def _prepare_eval_runtime_config() -> tuple[Path, str]:
+            base_eval_cfg_path = Path(EVALUATION_20M_CONFIG_ACTIVE)
+            runtime_eval_cfg_path = Path(EVALUATION_20M_RUNTIME_CONFIG_PATH)
+            eval_cfg = yaml.safe_load(base_eval_cfg_path.read_text(encoding='utf-8')) or {}
+            eval_block = dict(eval_cfg.get('evaluation', {}) or {})
+            requested_dataset_id = str(eval_block.get('dataset_id', DATASET_BUILD_ID))
+            dataset_id = requested_dataset_id
 
-        registry = _load_dataset_registry_payload()
-        built_entries = [item for item in registry.get('built_datasets', []) if isinstance(item, dict)]
+            registry = _load_dataset_registry_payload()
+            built_entries = [item for item in registry.get('built_datasets', []) if isinstance(item, dict)]
 
-        def _entry_output_dir(entry: dict) -> Path:
-            return Path(str(entry.get('output_dir', '')).strip())
+            def _entry_output_dir(entry: dict) -> Path:
+                return Path(str(entry.get('output_dir', '')).strip())
 
-        def _has_test_npz(entry: dict) -> bool:
-            output_dir = _entry_output_dir(entry)
-            return output_dir.exists() and (output_dir / 'test.npz').exists()
+            def _has_test_npz(entry: dict) -> bool:
+                output_dir = _entry_output_dir(entry)
+                return output_dir.exists() and (output_dir / 'test.npz').exists()
 
-        built = next(
-            (
-                item
-                for item in built_entries
-                if str(item.get('dataset_id', '')).strip() == dataset_id and _has_test_npz(item)
-            ),
-            None,
-        )
-
-        if built is None:
-            prefix = f'{BASE_DATASET_BUILD_ID}_'
-            shard_candidates = [
-                item
-                for item in built_entries
-                if _has_test_npz(item)
-                and (
-                    str(item.get('dataset_id', '')).strip() == BASE_DATASET_BUILD_ID
-                    or str(item.get('dataset_id', '')).strip().startswith(prefix)
-                )
-            ]
-            if shard_candidates:
-                shard_candidates = sorted(
-                    shard_candidates,
-                    key=lambda item: (
-                        int(item.get('labeled_samples', 0) or 0),
-                        str(item.get('updated_at', '')),
-                    ),
-                    reverse=True,
-                )
-                built = shard_candidates[0]
-                dataset_id = str(built.get('dataset_id', dataset_id)).strip() or dataset_id
-
-        if built is None:
-            datasets_root = Path(DRIVE_ROOT) / 'data' / 'datasets'
-            dir_candidates = []
-            if datasets_root.exists():
-                for path in datasets_root.iterdir():
-                    if not path.is_dir():
-                        continue
-                    name = path.name
-                    if name == requested_dataset_id or name == BASE_DATASET_BUILD_ID or name.startswith(f'{BASE_DATASET_BUILD_ID}_'):
-                        if (path / 'test.npz').exists():
-                            dir_candidates.append(path)
-            if dir_candidates:
-                selected_dir = sorted(dir_candidates, key=lambda p: p.stat().st_mtime, reverse=True)[0]
-                built = {
-                    'dataset_id': selected_dir.name,
-                    'output_dir': str(selected_dir),
-                    'input_dim': 0,
-                    'labeled_samples': 0,
-                    'updated_at': '',
-                }
-                dataset_id = selected_dir.name
-
-        if built is None:
-            raise ValueError(
-                f'Dataset introuvable pour evaluation (requested={requested_dataset_id}, base={BASE_DATASET_BUILD_ID}). '
-                'Attends un snapshot build avec test.npz ou relance la cellule de configuration.'
+            built = next(
+                (
+                    item
+                    for item in built_entries
+                    if str(item.get('dataset_id', '')).strip() == dataset_id and _has_test_npz(item)
+                ),
+                None,
             )
 
-        dataset_input_dim = int(built.get('input_dim') or 0)
-        test_npz_path = Path(str(built.get('output_dir', ''))) / 'test.npz'
-        if dataset_input_dim <= 0:
-            with np.load(test_npz_path, allow_pickle=True) as test_npz:
-                dataset_input_dim = int(test_npz['x'].shape[1])
+            if built is None:
+                prefix = f'{BASE_DATASET_BUILD_ID}_'
+                shard_candidates = [
+                    item
+                    for item in built_entries
+                    if _has_test_npz(item)
+                    and (
+                        str(item.get('dataset_id', '')).strip() == BASE_DATASET_BUILD_ID
+                        or str(item.get('dataset_id', '')).strip().startswith(prefix)
+                    )
+                ]
+                if shard_candidates:
+                    shard_candidates = sorted(
+                        shard_candidates,
+                        key=lambda item: (
+                            int(item.get('labeled_samples', 0) or 0),
+                            str(item.get('updated_at', '')),
+                        ),
+                        reverse=True,
+                    )
+                    built = shard_candidates[0]
+                    dataset_id = str(built.get('dataset_id', dataset_id)).strip() or dataset_id
 
-        models_root = Path(DRIVE_ROOT) / 'models'
-        model_registry_path = models_root / 'model_registry.json'
-        model_registry = json.loads(model_registry_path.read_text(encoding='utf-8')) if model_registry_path.exists() else {'models': []}
-        candidates = sorted(model_registry.get('models', []), key=lambda item: float(item.get('sort_ts', 0.0)), reverse=True)
+            if built is None:
+                datasets_root = Path(DRIVE_ROOT) / 'data' / 'datasets'
+                dir_candidates = []
+                if datasets_root.exists():
+                    for path in datasets_root.iterdir():
+                        if not path.is_dir():
+                            continue
+                        name = path.name
+                        if name == requested_dataset_id or name == BASE_DATASET_BUILD_ID or name.startswith(f'{BASE_DATASET_BUILD_ID}_'):
+                            if (path / 'test.npz').exists():
+                                dir_candidates.append(path)
+                if dir_candidates:
+                    selected_dir = sorted(dir_candidates, key=lambda p: p.stat().st_mtime, reverse=True)[0]
+                    built = {
+                        'dataset_id': selected_dir.name,
+                        'output_dir': str(selected_dir),
+                        'input_dim': 0,
+                        'labeled_samples': 0,
+                        'updated_at': '',
+                    }
+                    dataset_id = selected_dir.name
 
-        selected = None
-        for item in candidates:
-            checkpoint_path = Path(str(item.get('checkpoint_path', '')).strip())
-            if not checkpoint_path.exists():
-                continue
-            try:
-                checkpoint = torch.load(checkpoint_path, map_location='cpu')
-            except Exception:
-                continue
-            model_config = checkpoint.get('model_config', {})
-            model_input_dim = int(model_config.get('input_dim', 0) or 0)
-            if model_input_dim == dataset_input_dim:
-                selected = {
-                    'model_id': str(item.get('model_id', '')),
-                    'checkpoint_path': str(checkpoint_path),
-                    'input_dim': model_input_dim,
-                }
-                break
+            if built is None:
+                raise ValueError(
+                    f'Dataset introuvable pour evaluation (requested={requested_dataset_id}, base={BASE_DATASET_BUILD_ID}). '
+                    'Attends un snapshot build avec test.npz ou relance la cellule de configuration.'
+                )
 
-        if selected is None:
-            raise ValueError(
-                f'Aucun checkpoint compatible trouve pour dataset_id={dataset_id} (dataset_input_dim={dataset_input_dim}). '
-                'Entraine d abord un modele sur ce dataset/schema.'
-            )
+            dataset_input_dim = int(built.get('input_dim') or 0)
+            test_npz_path = Path(str(built.get('output_dir', ''))) / 'test.npz'
+            if dataset_input_dim <= 0:
+                with np.load(test_npz_path, allow_pickle=True) as test_npz:
+                    dataset_input_dim = int(test_npz['x'].shape[1])
 
-        eval_block['dataset_selection_mode'] = 'configured'
-        eval_block['dataset_id'] = dataset_id
-        eval_block['test_dataset_path'] = str(test_npz_path)
-        eval_block['model_id'] = selected['model_id']
-        eval_block['checkpoint_path'] = selected['checkpoint_path']
-        eval_cfg['evaluation'] = eval_block
-        runtime_eval_cfg_path.parent.mkdir(parents=True, exist_ok=True)
-        runtime_eval_cfg_path.write_text(yaml.safe_dump(eval_cfg, sort_keys=False), encoding='utf-8')
+            models_root = Path(DRIVE_ROOT) / 'models'
+            model_registry_path = models_root / 'model_registry.json'
+            model_registry = json.loads(model_registry_path.read_text(encoding='utf-8')) if model_registry_path.exists() else {'models': []}
+            candidates = sorted(model_registry.get('models', []), key=lambda item: float(item.get('sort_ts', 0.0)), reverse=True)
 
-        print('Evaluation sur dataset 20M partiel configure')
-        print('dataset_id =', dataset_id)
-        print('dataset_input_dim =', dataset_input_dim)
-        print('selected_model_id =', selected['model_id'])
-        print('selected_checkpoint =', selected['checkpoint_path'])
-        print('runtime config =', runtime_eval_cfg_path)
-        !bash -lc "cd $WORKTREE && PYTHONPATH=$WORKTREE/src $PYTHON_BIN -m songo_model_stockfish.cli.main evaluate --config $EVALUATION_20M_RUNTIME_CONFIG_PATH --job-id $EVALUATION_JOB_ID"
+            selected = None
+            for item in candidates:
+                checkpoint_path = Path(str(item.get('checkpoint_path', '')).strip())
+                if not checkpoint_path.exists():
+                    continue
+                try:
+                    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+                except Exception:
+                    continue
+                model_config = checkpoint.get('model_config', {})
+                model_input_dim = int(model_config.get('input_dim', 0) or 0)
+                if model_input_dim == dataset_input_dim:
+                    selected = {
+                        'model_id': str(item.get('model_id', '')),
+                        'checkpoint_path': str(checkpoint_path),
+                        'input_dim': model_input_dim,
+                    }
+                    break
+
+            if selected is None:
+                raise ValueError(
+                    f'Aucun checkpoint compatible trouve pour dataset_id={dataset_id} (dataset_input_dim={dataset_input_dim}). '
+                    'Entraine d abord un modele sur ce dataset/schema.'
+                )
+
+            eval_block['dataset_selection_mode'] = 'configured'
+            eval_block['dataset_id'] = dataset_id
+            eval_block['test_dataset_path'] = str(test_npz_path)
+            eval_block['model_id'] = selected['model_id']
+            eval_block['checkpoint_path'] = selected['checkpoint_path']
+            eval_cfg['evaluation'] = eval_block
+            runtime_eval_cfg_path.parent.mkdir(parents=True, exist_ok=True)
+            runtime_eval_cfg_path.write_text(yaml.safe_dump(eval_cfg, sort_keys=False), encoding='utf-8')
+
+            print('Evaluation runtime config prete')
+            print('  dataset_id          =', dataset_id)
+            print('  dataset_input_dim   =', dataset_input_dim)
+            print('  selected_model_id   =', selected['model_id'])
+            print('  selected_checkpoint =', selected['checkpoint_path'])
+            print('  runtime config      =', runtime_eval_cfg_path)
+            return runtime_eval_cfg_path, selected['model_id']
         """
     ),
     code(
         """
-        import json
-        import re
-        from pathlib import Path
+        # Cellule A: train continue (depuis best promoted) puis evaluation automatique
+        print('Cellule A: train continue + evaluate')
+        print('train config =', TRAIN_CONTINUE_CONFIG_ACTIVE)
 
-        jobs_root = Path(DRIVE_ROOT) / 'jobs'
-        requested_job_id = globals().get('EVALUATION_JOB_ID', '')
+        train_cmd = (
+            f'cd {shlex.quote(WORKTREE)} && '
+            f'PYTHONPATH={shlex.quote(f"{WORKTREE}/src")} '
+            f'{shlex.quote(PYTHON_BIN)} -m songo_model_stockfish.cli.main '
+            f'train --config {shlex.quote(str(TRAIN_CONTINUE_CONFIG_ACTIVE))} '
+            f'--job-id {shlex.quote(TRAIN_CONTINUE_JOB_ID)}'
+        )
+        subprocess.run(['/bin/bash', '-lc', train_cmd], check=True)
 
-        if requested_job_id:
-            match = re.match(r'^(.*?)(\\d+)$', requested_job_id)
-            if match:
-                prefix = match.group(1)
-                candidates = [path for path in jobs_root.iterdir() if path.is_dir() and re.match(rf'^{re.escape(prefix)}\\d+$', path.name)]
-            else:
-                candidates = [path for path in jobs_root.iterdir() if path.is_dir() and path.name.startswith(requested_job_id)]
-        else:
-            candidates = [path for path in jobs_root.iterdir() if path.is_dir() and path.name.startswith('eval_')]
+        runtime_eval_cfg_path, selected_model_id = _prepare_eval_runtime_config()
+        eval_job_id = f'{EVALUATION_JOB_ID}_continue'
+        eval_cmd = (
+            f'cd {shlex.quote(WORKTREE)} && '
+            f'PYTHONPATH={shlex.quote(f"{WORKTREE}/src")} '
+            f'{shlex.quote(PYTHON_BIN)} -m songo_model_stockfish.cli.main '
+            f'evaluate --config {shlex.quote(str(runtime_eval_cfg_path))} '
+            f'--job-id {shlex.quote(eval_job_id)}'
+        )
+        subprocess.run(['/bin/bash', '-lc', eval_cmd], check=True)
+        print('Train + Eval termines | mode=continue | model_id=', selected_model_id, '| eval_job_id=', eval_job_id)
+        """
+    ),
+    code(
+        """
+        # Cellule B: train from scratch (modele de 0) puis evaluation automatique
+        print('Cellule B: train scratch + evaluate')
+        print('train config =', TRAIN_SCRATCH_CONFIG_ACTIVE)
 
-        if not candidates:
-            print('Aucun job evaluation trouve')
-        else:
-            latest_job_dir = sorted(candidates, key=lambda path: path.stat().st_mtime)[-1]
-            summary_path = latest_job_dir / 'evaluation_summary.json'
-            print('Evaluation job lu =', latest_job_dir.name)
-            if not summary_path.exists():
-                print('Resume introuvable:', summary_path)
-            else:
-                summary = json.loads(summary_path.read_text(encoding='utf-8'))
-                print(json.dumps(summary, indent=2, ensure_ascii=True))
+        train_cmd = (
+            f'cd {shlex.quote(WORKTREE)} && '
+            f'PYTHONPATH={shlex.quote(f"{WORKTREE}/src")} '
+            f'{shlex.quote(PYTHON_BIN)} -m songo_model_stockfish.cli.main '
+            f'train --config {shlex.quote(str(TRAIN_SCRATCH_CONFIG_ACTIVE))} '
+            f'--job-id {shlex.quote(TRAIN_SCRATCH_JOB_ID)}'
+        )
+        subprocess.run(['/bin/bash', '-lc', train_cmd], check=True)
+
+        runtime_eval_cfg_path, selected_model_id = _prepare_eval_runtime_config()
+        eval_job_id = f'{EVALUATION_JOB_ID}_scratch'
+        eval_cmd = (
+            f'cd {shlex.quote(WORKTREE)} && '
+            f'PYTHONPATH={shlex.quote(f"{WORKTREE}/src")} '
+            f'{shlex.quote(PYTHON_BIN)} -m songo_model_stockfish.cli.main '
+            f'evaluate --config {shlex.quote(str(runtime_eval_cfg_path))} '
+            f'--job-id {shlex.quote(eval_job_id)}'
+        )
+        subprocess.run(['/bin/bash', '-lc', eval_cmd], check=True)
+        print('Train + Eval termines | mode=scratch | model_id=', selected_model_id, '| eval_job_id=', eval_job_id)
         """
     ),
     md("## 9. Benchmark"),
