@@ -1334,7 +1334,8 @@ cells = [
         print('autotuned_train_batch_size     =', tuned_batch_size)
         """
     ),
-    md("## 5. Lancer le pipeline dataset en parallele"),
+    md("## 5. Creation Dataset (Generate + Build)"),
+    md("### 5.A Lancer Le Pipeline Dataset En Parallele"),
     code(
         """
         import json
@@ -1420,7 +1421,7 @@ cells = [
             print('  firestore_error      =', firestore_manifest_error)
         """
     ),
-    md("## 5bis. Suivre le pipeline dataset"),
+    md("## 5bis. Suivi Pipeline Et Logs"),
     md(
         """
         Vue par source:
@@ -1428,6 +1429,7 @@ cells = [
         - `5bis.B` = Drive local worker (etat local des jobs)
         - `5bis.C` = Redis cache (et ecart vs Firestore)
         - `5bis.D` = Logs worker (fichiers Drive)
+        - `5bis.E` = Metriques checkpoint sync Firestore (events/metrics de run)
         """
     ),
     md("### 5bis.A Suivi Firestore (source de verite)"),
@@ -2115,6 +2117,81 @@ cells = [
             print('log introuvable:', log_path)
         else:
             !tail -f {log_path}
+        """
+    ),
+    md("### 5bis.E Metriques Checkpoint Sync Firestore"),
+    code(
+        """
+        # Metriques firestore_checkpoint_sync_summary dans les metrics des jobs worker.
+        import json
+        from pathlib import Path
+
+        jobs_root = Path(DRIVE_ROOT) / 'jobs'
+
+        def _latest_job_dir(job_id: str) -> Path | None:
+            exact = jobs_root / str(job_id)
+            if exact.exists() and exact.is_dir():
+                return exact
+            if not jobs_root.exists():
+                return None
+            prefix = str(job_id).rsplit('_', 1)[0]
+            candidates = [p for p in jobs_root.iterdir() if p.is_dir() and p.name.startswith(prefix)]
+            if not candidates:
+                return None
+            return sorted(candidates, key=lambda p: p.stat().st_mtime)[-1]
+
+        def _read_jsonl(path: Path) -> list[dict]:
+            if not path.exists():
+                return []
+            rows: list[dict] = []
+            for line in path.read_text(encoding='utf-8', errors='replace').splitlines():
+                text = line.strip()
+                if not text:
+                    continue
+                try:
+                    row = json.loads(text)
+                    if isinstance(row, dict):
+                        rows.append(row)
+                except Exception:
+                    continue
+            return rows
+
+        for label, job_id in [('dataset-generate', DATASET_GENERATE_JOB_ID), ('dataset-build', DATASET_BUILD_JOB_ID)]:
+            job_dir = _latest_job_dir(job_id)
+            print(f'\\n===== {label} | job_id={job_id} | dir={job_dir} =====')
+            if job_dir is None:
+                print('job dir introuvable')
+                continue
+            metrics_path = job_dir / 'metrics.jsonl'
+            events_path = job_dir / 'events.jsonl'
+
+            metrics_rows = _read_jsonl(metrics_path)
+            sync_rows = [row for row in metrics_rows if str(row.get('metric_type', '')) == 'firestore_checkpoint_sync_summary']
+            if sync_rows:
+                latest = sync_rows[-1]
+                print('Derniere metric firestore_checkpoint_sync_summary:')
+                print('  timestamp            =', latest.get('timestamp', '<none>'))
+                print('  status               =', latest.get('status', '<none>'))
+                print('  phase                =', latest.get('phase', '<none>'))
+                print('  attempted            =', latest.get('attempted', 0))
+                print('  written              =', latest.get('written', 0))
+                print('  skipped_unchanged    =', latest.get('skipped_unchanged', 0))
+                print('  skipped_min_interval =', latest.get('skipped_min_interval', 0))
+                print('  failed               =', latest.get('failed', 0))
+                print('  auth_mode            =', latest.get('auth_mode', '<none>'))
+                print('  collection           =', latest.get('collection', '<none>'))
+            else:
+                print('Aucune metric firestore_checkpoint_sync_summary pour ce job.')
+
+            event_rows = _read_jsonl(events_path)
+            failed_events = [row for row in event_rows if str(row.get('message', '')) == 'firestore_worker_checkpoint_sync_failed']
+            print('failed sync events =', len(failed_events))
+            if failed_events:
+                last_failed = failed_events[-1]
+                print('Dernier echec:')
+                print('  timestamp =', last_failed.get('timestamp', '<none>'))
+                print('  error     =', last_failed.get('error', '<none>'))
+                print('  hint      =', last_failed.get('hint', '<none>'))
         """
     ),
     md("## 6. Lister les datasets"),

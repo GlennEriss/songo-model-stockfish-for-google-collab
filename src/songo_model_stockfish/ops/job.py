@@ -100,6 +100,54 @@ def _resolve_firestore_sync_config(config: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _firestore_auth_mode(credentials_path: str, api_key: str) -> str:
+    if str(credentials_path or "").strip():
+        return "service_account_file"
+    if str(api_key or "").strip():
+        return "api_key"
+    return "missing_credentials"
+
+
+def _firestore_sync_diag(sync: dict[str, Any]) -> dict[str, Any]:
+    credentials_path = str(sync.get("credentials_path", "")).strip()
+    api_key = str(sync.get("api_key", "")).strip()
+    auth_mode = _firestore_auth_mode(credentials_path, api_key)
+    return {
+        "enabled": bool(sync.get("enabled", False)),
+        "strict": bool(sync.get("strict", True)),
+        "project_id": str(sync.get("project_id", "")).strip(),
+        "collection": str(sync.get("collection", "")).strip() or "worker_checkpoints",
+        "auth_mode": auth_mode,
+        "credentials_path": credentials_path,
+        "credentials_path_exists": bool(Path(credentials_path).exists()) if credentials_path else False,
+        "api_key_set": bool(api_key),
+        "checkpoint_min_interval_seconds": float(_as_float(sync.get("checkpoint_min_interval_seconds", 30.0), 30.0)),
+        "checkpoint_state_only_on_change": bool(_as_bool(sync.get("checkpoint_state_only_on_change", True), default=True)),
+    }
+
+
+def _firestore_error_hint(exc: Exception, *, auth_mode: str) -> str:
+    text = f"{type(exc).__name__}: {exc}".lower()
+    auth_mode = str(auth_mode).strip().lower()
+    if auth_mode == "api_key":
+        return "google-cloud-firestore n'accepte pas API key seule; configure job_firestore_credentials_path."
+    if auth_mode == "missing_credentials":
+        return "credentials Firestore absents; configure job_firestore_credentials_path."
+    if "metadata.google.internal" in text or "compute metadata" in text:
+        return "ADC metadata indisponible ici; utilise un service account JSON explicite."
+    if "permissiondenied" in text or "permission denied" in text:
+        return "acces refuse par IAM/regles Firestore."
+    if "unauthenticated" in text or "invalid authentication credentials" in text:
+        return "authentification Firestore invalide."
+    if "resource_exhausted" in text or "quota exceeded" in text or "429" in text:
+        return "quota Firestore depasse; augmente le batching/throttling et reduis le polling."
+    if "deadlineexceeded" in text or "timeout" in text:
+        return "timeout reseau vers Firestore."
+    if "serviceunavailable" in text:
+        return "service Firestore temporairement indisponible."
+    return ""
+
+
 def _build_firestore_job_client(*, project_id: str, credentials_path: str, api_key: str):
     from google.cloud import firestore
 
@@ -171,6 +219,7 @@ class JobContext:
     _last_firestore_checkpoint_write_ts: float = 0.0
     _last_firestore_status_signature: str = ""
     _last_firestore_state_signature: str = ""
+    _firestore_sync_stats: dict[str, int] | None = None
 
     def read_status(self) -> dict[str, Any]:
         return read_json_dict(self.status_path, default={})
@@ -212,6 +261,9 @@ class JobContext:
             payload.update(extra)
         write_json_atomic(self.status_path, payload, ensure_ascii=True, indent=2)
         self._write_worker_checkpoint_firestore(status_payload=payload, state_payload=None, force=True)
+        status_normalized = str(status).strip().lower()
+        if status_normalized in {"completed", "failed", "cancelled"}:
+            self._emit_firestore_sync_summary(status=status_normalized, phase=str(phase))
 
     def write_state(self, state: dict[str, Any]) -> None:
         payload = {
@@ -239,6 +291,14 @@ class JobContext:
         if not bool(sync.get("enabled", False)):
             return
         strict = bool(sync.get("strict", True))
+        if self._firestore_sync_stats is None:
+            self._firestore_sync_stats = {
+                "attempted": 0,
+                "written": 0,
+                "skipped_unchanged": 0,
+                "skipped_min_interval": 0,
+                "failed": 0,
+            }
         min_interval_seconds = max(0.0, _as_float(sync.get("checkpoint_min_interval_seconds", 30.0), 30.0))
         state_only_on_change = _as_bool(sync.get("checkpoint_state_only_on_change", True), default=True)
         status_signature = json.dumps(status_payload, sort_keys=True, ensure_ascii=True, default=str) if status_payload is not None else ""
@@ -246,9 +306,12 @@ class JobContext:
         now_ts = time.time()
         if not force:
             if state_payload is not None and state_only_on_change and state_signature == self._last_firestore_state_signature:
+                self._firestore_sync_stats["skipped_unchanged"] = int(self._firestore_sync_stats.get("skipped_unchanged", 0)) + 1
                 return
             if min_interval_seconds > 0 and (now_ts - float(self._last_firestore_checkpoint_write_ts)) < min_interval_seconds:
+                self._firestore_sync_stats["skipped_min_interval"] = int(self._firestore_sync_stats.get("skipped_min_interval", 0)) + 1
                 return
+        self._firestore_sync_stats["attempted"] = int(self._firestore_sync_stats.get("attempted", 0)) + 1
         try:
             client = _build_firestore_job_client(
                 project_id=str(sync.get("project_id", "")).strip(),
@@ -272,10 +335,80 @@ class JobContext:
                 self._last_firestore_status_signature = status_signature
             if state_payload is not None:
                 self._last_firestore_state_signature = state_signature
+            self._firestore_sync_stats["written"] = int(self._firestore_sync_stats.get("written", 0)) + 1
         except Exception as exc:
-            self.logger.warning("firestore worker checkpoint sync failed | job_id=%s | error=%s", self.job_id, f"{type(exc).__name__}: {exc}")
+            self._firestore_sync_stats["failed"] = int(self._firestore_sync_stats.get("failed", 0)) + 1
+            diag = _firestore_sync_diag(sync)
+            hint = _firestore_error_hint(exc, auth_mode=str(diag.get("auth_mode", "")))
+            self.logger.warning(
+                "firestore worker checkpoint sync failed | job_id=%s | strict=%s | project_id=%s | collection=%s | auth_mode=%s | credentials_path_exists=%s | api_key_set=%s | error=%s | hint=%s",
+                self.job_id,
+                strict,
+                str(diag.get("project_id", "")) or "<empty>",
+                str(diag.get("collection", "")) or "<empty>",
+                str(diag.get("auth_mode", "")) or "<unknown>",
+                bool(diag.get("credentials_path_exists", False)),
+                bool(diag.get("api_key_set", False)),
+                f"{type(exc).__name__}: {exc}",
+                hint or "<none>",
+            )
+            try:
+                self.write_event(
+                    "firestore_worker_checkpoint_sync_failed",
+                    strict=strict,
+                    project_id=str(diag.get("project_id", "")),
+                    collection=str(diag.get("collection", "")),
+                    auth_mode=str(diag.get("auth_mode", "")),
+                    credentials_path_exists=bool(diag.get("credentials_path_exists", False)),
+                    api_key_set=bool(diag.get("api_key_set", False)),
+                    error=f"{type(exc).__name__}: {exc}",
+                    hint=hint or "",
+                )
+            except Exception:
+                pass
             if strict:
                 raise
+
+    def _emit_firestore_sync_summary(self, *, status: str, phase: str) -> None:
+        sync = self.firestore_sync if isinstance(self.firestore_sync, dict) else {}
+        stats = self._firestore_sync_stats or {}
+        diag = _firestore_sync_diag(sync)
+        self.logger.info(
+            "firestore checkpoint sync summary | job_id=%s | status=%s | phase=%s | enabled=%s | strict=%s | attempted=%s | written=%s | skipped_unchanged=%s | skipped_min_interval=%s | failed=%s | project_id=%s | collection=%s | auth_mode=%s",
+            self.job_id,
+            status,
+            phase,
+            bool(diag.get("enabled", False)),
+            bool(diag.get("strict", True)),
+            int(stats.get("attempted", 0)),
+            int(stats.get("written", 0)),
+            int(stats.get("skipped_unchanged", 0)),
+            int(stats.get("skipped_min_interval", 0)),
+            int(stats.get("failed", 0)),
+            str(diag.get("project_id", "")) or "<empty>",
+            str(diag.get("collection", "")) or "<empty>",
+            str(diag.get("auth_mode", "")) or "<unknown>",
+        )
+        try:
+            self.write_metric(
+                {
+                    "metric_type": "firestore_checkpoint_sync_summary",
+                    "status": status,
+                    "phase": phase,
+                    "sync_enabled": bool(diag.get("enabled", False)),
+                    "sync_strict": bool(diag.get("strict", True)),
+                    "attempted": int(stats.get("attempted", 0)),
+                    "written": int(stats.get("written", 0)),
+                    "skipped_unchanged": int(stats.get("skipped_unchanged", 0)),
+                    "skipped_min_interval": int(stats.get("skipped_min_interval", 0)),
+                    "failed": int(stats.get("failed", 0)),
+                    "project_id": str(diag.get("project_id", "")),
+                    "collection": str(diag.get("collection", "")),
+                    "auth_mode": str(diag.get("auth_mode", "")),
+                }
+            )
+        except Exception:
+            pass
 
 
 def create_job_context(config: dict[str, Any], *, override_job_id: str | None = None) -> JobContext:
@@ -321,6 +454,31 @@ def create_job_context(config: dict[str, Any], *, override_job_id: str | None = 
         status_path=status_path,
         state_path=state_path,
         firestore_sync=_resolve_firestore_sync_config(config),
+    )
+    sync_diag = _firestore_sync_diag(context.firestore_sync)
+    context.logger.info(
+        "firestore checkpoint sync config | enabled=%s | strict=%s | project_id=%s | collection=%s | auth_mode=%s | credentials_path_exists=%s | api_key_set=%s | checkpoint_min_interval_seconds=%.2f | checkpoint_state_only_on_change=%s",
+        bool(sync_diag.get("enabled", False)),
+        bool(sync_diag.get("strict", True)),
+        str(sync_diag.get("project_id", "")) or "<empty>",
+        str(sync_diag.get("collection", "")) or "<empty>",
+        str(sync_diag.get("auth_mode", "")) or "<unknown>",
+        bool(sync_diag.get("credentials_path_exists", False)),
+        bool(sync_diag.get("api_key_set", False)),
+        float(sync_diag.get("checkpoint_min_interval_seconds", 0.0)),
+        bool(sync_diag.get("checkpoint_state_only_on_change", True)),
+    )
+    context.write_event(
+        "firestore_checkpoint_sync_config_resolved",
+        enabled=bool(sync_diag.get("enabled", False)),
+        strict=bool(sync_diag.get("strict", True)),
+        project_id=str(sync_diag.get("project_id", "")),
+        collection=str(sync_diag.get("collection", "")),
+        auth_mode=str(sync_diag.get("auth_mode", "")),
+        credentials_path_exists=bool(sync_diag.get("credentials_path_exists", False)),
+        api_key_set=bool(sync_diag.get("api_key_set", False)),
+        checkpoint_min_interval_seconds=float(sync_diag.get("checkpoint_min_interval_seconds", 0.0)),
+        checkpoint_state_only_on_change=bool(sync_diag.get("checkpoint_state_only_on_change", True)),
     )
 
     write_text_atomic(job_dir / "config.yaml", _dump_yaml_like(config), encoding="utf-8")

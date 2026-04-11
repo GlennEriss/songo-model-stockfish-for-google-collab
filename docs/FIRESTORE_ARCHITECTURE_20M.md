@@ -206,3 +206,37 @@ Pour la cible 20M et 5 -> 20 Colabs:
 - architecture officielle = Drive + Firestore + Redis
 - Firestore reste le registre durable
 - Redis devient la couche temps reel par defaut
+
+## 11. Logging et erreurs (runtime)
+
+### 11.1 Contrat de logs Firestore checkpoint
+
+Chaque job logge au demarrage:
+
+- `firestore checkpoint sync config`
+- champs: `enabled`, `strict`, `project_id`, `collection`, `auth_mode`, `credentials_path_exists`, `api_key_set`, `checkpoint_min_interval_seconds`, `checkpoint_state_only_on_change`
+
+En cas d'echec d'ecriture checkpoint:
+
+- log `warning` avec contexte complet
+- event `firestore_worker_checkpoint_sync_failed`
+- `hint` explicite (credentials manquants, quota depasse, timeout, permission, auth invalide)
+- si `strict=true`: l'exception est re-raise
+- si `strict=false`: le job continue avec trace claire de degradation
+
+En fin de job (`completed|failed|cancelled`):
+
+- log `firestore checkpoint sync summary`
+- metric `firestore_checkpoint_sync_summary` avec compteurs:
+  - `attempted`
+  - `written`
+  - `skipped_unchanged`
+  - `skipped_min_interval`
+  - `failed`
+
+### 11.2 Recommandations operatoires
+
+- garder `strict=true` pour les jobs critiques de coordination
+- utiliser `strict=false` seulement pour les runs exploratoires
+- surveiller la derive via `failed > 0` dans `metrics.jsonl`
+- si `quota exceeded`, augmenter batching/throttling avant d'augmenter le nombre de workers

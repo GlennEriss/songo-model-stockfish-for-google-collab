@@ -33,6 +33,16 @@ Niveaux recommandes:
 - `WARNING`
 - `ERROR`
 
+Regle runtime multi-Colab:
+
+- les erreurs Firestore doivent inclure un `hint` actionnable
+- les logs doivent contenir le contexte minimal de diagnostic:
+  - `project_id`
+  - `collection`
+  - `auth_mode`
+  - `credentials_path_exists`
+  - `strict`
+
 ## 4. Sorties de logs
 
 Chaque job doit produire:
@@ -40,6 +50,12 @@ Chaque job doit produire:
 - log console temps reel
 - `events.jsonl`
 - `metrics.jsonl`
+
+En plus, les jobs doivent produire des evenements runtime explicites pour la sync Firestore:
+
+- `firestore_checkpoint_sync_config_resolved`
+- `firestore_worker_checkpoint_sync_failed`
+- metric `firestore_checkpoint_sync_summary` en fin de job (`completed|failed|cancelled`)
 
 ## 5. Exigences de lisibilite
 
@@ -76,6 +92,7 @@ Les logs persistants doivent etre:
 - global progress update success/failure
 - dataset registry update success/failure
 - worker lease assignment
+- hint d'erreur standardise (quota/auth/timeout/permission)
 
 ### Pour `benchmark`
 
@@ -131,6 +148,12 @@ Chaque job doit produire un resume final:
 - statut final
 - artefacts crees
 - metriques principales
+- stats de sync Firestore checkpoint:
+  - attempted
+  - written
+  - skipped_unchanged
+  - skipped_min_interval
+  - failed
 
 ## 9. Conservation
 
