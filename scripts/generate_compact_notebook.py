@@ -101,6 +101,20 @@ cells = [
     md("## 3. Parametres"),
     code(
         """
+        import os
+
+        def _as_bool(value, default=False):
+            if isinstance(value, bool):
+                return value
+            if value is None:
+                return bool(default)
+            text = str(value).strip().lower()
+            if text in {'1', 'true', 'yes', 'on', 'y', 't'}:
+                return True
+            if text in {'0', 'false', 'no', 'off', 'n', 'f'}:
+                return False
+            return bool(default)
+
         DATASET_GENERATE_CONFIG = 'config/dataset_generation.full_matrix.colab_pro.yaml'
         DATASET_BUILD_CONFIG = 'config/dataset_build.full_matrix.colab_pro.yaml'
         TRAIN_CONTINUE_CONFIG = 'config/train.full_matrix.colab_pro.yaml'
@@ -166,11 +180,15 @@ cells = [
         FIRESTORE_WORKER_LEASES_COLLECTION = 'worker_leases'
         FIRESTORE_PIPELINE_MANIFESTS_COLLECTION = 'pipeline_manifests'
         FIRESTORE_WORKER_CHECKPOINTS_COLLECTION = 'worker_checkpoints'
-        GLOBAL_PROGRESS_REDIS_ENABLED = True
+        GLOBAL_PROGRESS_REDIS_ENABLED = _as_bool(os.environ.get('GLOBAL_PROGRESS_REDIS_ENABLED', '1'), default=True)
         GLOBAL_PROGRESS_REDIS_URL = os.environ.get('UPSTASH_REDIS_REST_URL', '').strip()
         GLOBAL_PROGRESS_REDIS_TOKEN = os.environ.get('UPSTASH_REDIS_REST_TOKEN', '').strip()
         GLOBAL_PROGRESS_REDIS_KEY_PREFIX = f'songo:{GLOBAL_TARGET_ID}'
         GLOBAL_PROGRESS_REDIS_CACHE_TTL_SECONDS = 120
+        GLOBAL_PROGRESS_WORKERS_RETENTION_SECONDS = 86400
+        GLOBAL_PROGRESS_WORKERS_MAX_ENTRIES = 5000
+        WORKER_CHECKPOINTS_MIN_INTERVAL_SECONDS = 60.0
+        WORKER_CHECKPOINTS_STATE_ONLY_ON_CHANGE = True
         SOURCE_POLL_INTERVAL_SECONDS = 20
         DATASET_BUILD_EXPORT_PARTIAL_EVERY_N_FILES = 20
         MONITOR_REFRESH_SECONDS = 15
@@ -186,6 +204,7 @@ cells = [
             MONITOR_MAX_LOOPS = int(LOW_QUOTA_MONITOR_MAX_LOOPS)
             PIPELINE_MANIFEST_FIRESTORE_WRITE_ENABLED = bool(LOW_QUOTA_WRITE_PIPELINE_MANIFEST_FIRESTORE)
             GLOBAL_PROGRESS_REDIS_CACHE_TTL_SECONDS = max(120, int(GLOBAL_PROGRESS_REDIS_CACHE_TTL_SECONDS))
+            WORKER_CHECKPOINTS_MIN_INTERVAL_SECONDS = max(60.0, float(WORKER_CHECKPOINTS_MIN_INTERVAL_SECONDS))
         if str(GLOBAL_PROGRESS_BACKEND).strip().lower() != 'firestore':
             raise ValueError("GLOBAL_PROGRESS_BACKEND doit rester 'firestore' (fallback fichier desactive).")
         DATASET_GENERATE_WORKERS = 16
@@ -226,7 +245,6 @@ cells = [
 
         import hashlib
         import json
-        import os
         import re
         import socket
         import time
@@ -771,6 +789,10 @@ cells = [
         print('GLOBAL_PROGRESS_REDIS_TOKEN_SET =', bool(str(GLOBAL_PROGRESS_REDIS_TOKEN).strip()))
         print('GLOBAL_PROGRESS_REDIS_KEY_PREFIX =', GLOBAL_PROGRESS_REDIS_KEY_PREFIX)
         print('GLOBAL_PROGRESS_REDIS_CACHE_TTL_SECONDS =', GLOBAL_PROGRESS_REDIS_CACHE_TTL_SECONDS)
+        print('GLOBAL_PROGRESS_WORKERS_RETENTION_SECONDS =', GLOBAL_PROGRESS_WORKERS_RETENTION_SECONDS)
+        print('GLOBAL_PROGRESS_WORKERS_MAX_ENTRIES =', GLOBAL_PROGRESS_WORKERS_MAX_ENTRIES)
+        print('WORKER_CHECKPOINTS_MIN_INTERVAL_SECONDS =', WORKER_CHECKPOINTS_MIN_INTERVAL_SECONDS)
+        print('WORKER_CHECKPOINTS_STATE_ONLY_ON_CHANGE =', WORKER_CHECKPOINTS_STATE_ONLY_ON_CHANGE)
         print('DATASET_GENERATE_JOB_ID =', DATASET_GENERATE_JOB_ID)
         print('DATASET_BUILD_JOB_ID    =', DATASET_BUILD_JOB_ID)
         print('TRAIN_CONTINUE_JOB_ID   =', TRAIN_CONTINUE_JOB_ID)
@@ -1144,9 +1166,12 @@ cells = [
         generate_block['global_progress_firestore_api_key'] = str(FIRESTORE_API_KEY)
         generate_block['global_progress_redis_enabled'] = bool(GLOBAL_PROGRESS_REDIS_ENABLED)
         generate_block['global_progress_redis_url'] = str(GLOBAL_PROGRESS_REDIS_URL)
-        generate_block['global_progress_redis_token'] = str(GLOBAL_PROGRESS_REDIS_TOKEN)
         generate_block['global_progress_redis_key_prefix'] = str(GLOBAL_PROGRESS_REDIS_KEY_PREFIX)
         generate_block['global_progress_redis_cache_ttl_seconds'] = int(GLOBAL_PROGRESS_REDIS_CACHE_TTL_SECONDS)
+        generate_block['global_progress_workers_retention_seconds'] = int(GLOBAL_PROGRESS_WORKERS_RETENTION_SECONDS)
+        generate_block['global_progress_workers_max_entries'] = int(GLOBAL_PROGRESS_WORKERS_MAX_ENTRIES)
+        generate_block['worker_checkpoints_min_interval_seconds'] = float(WORKER_CHECKPOINTS_MIN_INTERVAL_SECONDS)
+        generate_block['job_firestore_checkpoint_state_only_on_change'] = bool(WORKER_CHECKPOINTS_STATE_ONLY_ON_CHANGE)
         generate_block['dataset_registry_backend'] = str(GLOBAL_PROGRESS_BACKEND)
         generate_block['dataset_registry_firestore_project_id'] = str(FIRESTORE_PROJECT_ID)
         generate_block['dataset_registry_firestore_collection'] = str(FIRESTORE_DATASET_REGISTRY_COLLECTION)
@@ -1184,9 +1209,12 @@ cells = [
         build_block['global_target_progress_firestore_api_key'] = str(FIRESTORE_API_KEY)
         build_block['global_target_progress_redis_enabled'] = bool(GLOBAL_PROGRESS_REDIS_ENABLED)
         build_block['global_target_progress_redis_url'] = str(GLOBAL_PROGRESS_REDIS_URL)
-        build_block['global_target_progress_redis_token'] = str(GLOBAL_PROGRESS_REDIS_TOKEN)
         build_block['global_target_progress_redis_key_prefix'] = str(GLOBAL_PROGRESS_REDIS_KEY_PREFIX)
         build_block['global_target_progress_redis_cache_ttl_seconds'] = int(GLOBAL_PROGRESS_REDIS_CACHE_TTL_SECONDS)
+        build_block['global_target_progress_workers_retention_seconds'] = int(GLOBAL_PROGRESS_WORKERS_RETENTION_SECONDS)
+        build_block['global_target_progress_workers_max_entries'] = int(GLOBAL_PROGRESS_WORKERS_MAX_ENTRIES)
+        build_block['worker_checkpoints_min_interval_seconds'] = float(WORKER_CHECKPOINTS_MIN_INTERVAL_SECONDS)
+        build_block['job_firestore_checkpoint_state_only_on_change'] = bool(WORKER_CHECKPOINTS_STATE_ONLY_ON_CHANGE)
         build_block['dataset_registry_backend'] = str(GLOBAL_PROGRESS_BACKEND)
         build_block['dataset_registry_firestore_project_id'] = str(FIRESTORE_PROJECT_ID)
         build_block['dataset_registry_firestore_collection'] = str(FIRESTORE_DATASET_REGISTRY_COLLECTION)

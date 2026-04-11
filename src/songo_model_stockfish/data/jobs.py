@@ -8,6 +8,7 @@ import multiprocessing
 import os
 import shutil
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -65,6 +66,91 @@ def _release_lock_dir(lock_dir: Path) -> None:
     release_lock_dir(lock_dir)
 
 
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return bool(default)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on", "y", "t"}:
+        return True
+    if text in {"0", "false", "no", "off", "n", "f"}:
+        return False
+    return bool(default)
+
+
+def _safe_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def _parse_iso_to_epoch_seconds(value: Any) -> float:
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    try:
+        return float(datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp())
+    except Exception:
+        return 0.0
+
+
+def _apply_worker_progress_retention(
+    *,
+    workers: dict[str, dict[str, Any]],
+    keep_job_id: str,
+    stale_seconds: int,
+    max_entries: int,
+) -> tuple[dict[str, dict[str, Any]], int, int]:
+    now_ts = time.time()
+    keep = str(keep_job_id).strip()
+    normalized: dict[str, dict[str, Any]] = {}
+    dropped_samples = 0
+    dropped_games = 0
+    ttl_seconds = max(0, int(stale_seconds))
+    limit = max(1, int(max_entries))
+
+    for worker_job_id, payload in (workers or {}).items():
+        entry = _normalize_worker_progress_entry(job_id=str(worker_job_id), payload=payload)
+        if entry is None:
+            continue
+        if ttl_seconds > 0 and entry["job_id"] != keep:
+            updated_ts = _parse_iso_to_epoch_seconds(entry.get("updated_at"))
+            if updated_ts > 0 and (now_ts - updated_ts) > float(ttl_seconds):
+                dropped_samples += max(0, int(entry.get("contributed_samples", 0)))
+                dropped_games += max(0, int(entry.get("contributed_games", 0)))
+                continue
+        normalized[entry["job_id"]] = {
+            "dataset_source_id": str(entry.get("dataset_source_id", "")),
+            "contributed_samples": max(0, int(entry.get("contributed_samples", 0))),
+            "contributed_games": max(0, int(entry.get("contributed_games", 0))),
+            "updated_at": str(entry.get("updated_at", "")),
+        }
+
+    if len(normalized) <= limit:
+        return normalized, dropped_samples, dropped_games
+
+    sorted_entries = sorted(
+        normalized.items(),
+        key=lambda item: (_parse_iso_to_epoch_seconds(item[1].get("updated_at")), item[0]),
+        reverse=True,
+    )
+    allowed_job_ids = {job_id for job_id, _payload in sorted_entries[:limit]}
+    if keep and keep in normalized:
+        allowed_job_ids.add(keep)
+
+    retained: dict[str, dict[str, Any]] = {}
+    for job_id, payload in normalized.items():
+        if job_id in allowed_job_ids:
+            retained[job_id] = payload
+            continue
+        dropped_samples += max(0, int(payload.get("contributed_samples", 0)))
+        dropped_games += max(0, int(payload.get("contributed_games", 0)))
+
+    return retained, dropped_samples, dropped_games
+
+
 def _resolve_global_progress_backend_config(
     *,
     cfg: dict[str, Any],
@@ -80,11 +166,12 @@ def _resolve_global_progress_backend_config(
             ),
         )
     ).strip().lower() or "file"
-    firestore_enabled_flag = bool(
+    firestore_enabled_flag = _as_bool(
         cfg.get(
             "global_progress_firestore_enabled",
             cfg.get("global_target_progress_firestore_enabled", False),
-        )
+        ),
+        default=False,
     )
     use_firestore = backend_raw == "firestore" or firestore_enabled_flag
     project_id = str(
@@ -120,11 +207,12 @@ def _resolve_global_progress_backend_config(
             cfg.get("global_target_progress_firestore_api_key", os.environ.get("FIREBASE_API_KEY", "")),
         )
     ).strip()
-    redis_enabled = bool(
+    redis_enabled = _as_bool(
         cfg.get(
             "global_progress_redis_enabled",
             cfg.get("global_target_progress_redis_enabled", False),
-        )
+        ),
+        default=False,
     )
     redis_url = str(
         cfg.get(
@@ -152,11 +240,32 @@ def _resolve_global_progress_backend_config(
     ).strip() or f"songo:{global_target_id}"
     redis_cache_ttl_seconds = max(
         1,
-        int(
+        _safe_int(
             cfg.get(
                 "global_progress_redis_cache_ttl_seconds",
                 cfg.get("global_target_progress_redis_cache_ttl_seconds", 120),
-            )
+            ),
+            120,
+        ),
+    )
+    workers_retention_seconds = max(
+        0,
+        _safe_int(
+            cfg.get(
+                "global_progress_workers_retention_seconds",
+                cfg.get("global_target_progress_workers_retention_seconds", 86400),
+            ),
+            86400,
+        ),
+    )
+    workers_max_entries = max(
+        1,
+        _safe_int(
+            cfg.get(
+                "global_progress_workers_max_entries",
+                cfg.get("global_target_progress_workers_max_entries", 5000),
+            ),
+            5000,
         ),
     )
     return {
@@ -173,6 +282,8 @@ def _resolve_global_progress_backend_config(
         "redis_token": redis_token,
         "redis_key_prefix": redis_key_prefix,
         "redis_cache_ttl_seconds": int(redis_cache_ttl_seconds),
+        "workers_retention_seconds": int(workers_retention_seconds),
+        "workers_max_entries": int(workers_max_entries),
     }
 
 
@@ -199,11 +310,21 @@ def _normalize_global_generation_state_payload(
                 "contributed_games": int(normalized.get("contributed_games", 0)),
                 "updated_at": str(normalized.get("updated_at", "")),
             }
+    archived_samples = max(0, int(raw.get("archived_samples", 0) or 0))
+    archived_games = max(0, int(raw.get("archived_games", 0) or 0))
     worker_total_samples = sum(int(item.get("contributed_samples", 0)) for item in workers.values())
     worker_total_games = sum(int(item.get("contributed_games", 0)) for item in workers.values())
     state["workers"] = workers
-    state["total_samples"] = max(int(raw.get("total_samples", 0) or 0), int(worker_total_samples))
-    state["total_games"] = max(int(raw.get("total_games", 0) or 0), int(worker_total_games))
+    state["archived_samples"] = archived_samples
+    state["archived_games"] = archived_games
+    state["total_samples"] = max(
+        int(raw.get("total_samples", 0) or 0),
+        int(archived_samples + worker_total_samples),
+    )
+    state["total_games"] = max(
+        int(raw.get("total_games", 0) or 0),
+        int(archived_games + worker_total_games),
+    )
     state["updated_at"] = str(raw.get("updated_at", "")).strip() or utc_now_iso()
     return state
 
@@ -230,6 +351,8 @@ def _firestore_backend_diagnostics(progress_backend: dict[str, Any] | None) -> d
         "redis_enabled": bool(backend.get("redis_enabled", False)),
         "redis_url_set": bool(str(backend.get("redis_url", "")).strip()),
         "redis_token_set": bool(str(backend.get("redis_token", "")).strip()),
+        "workers_retention_seconds": int(_safe_int(backend.get("workers_retention_seconds", 0), 0)),
+        "workers_max_entries": int(_safe_int(backend.get("workers_max_entries", 0), 0)),
     }
 
 
@@ -372,11 +495,21 @@ def _redis_global_progress_key(progress_backend: dict[str, Any] | None, global_t
     return f"{prefix}:global_progress"
 
 
+def _touch_progress_read_telemetry(
+    telemetry: dict[str, int] | None,
+    key: str,
+) -> None:
+    if telemetry is None:
+        return
+    telemetry[key] = int(telemetry.get(key, 0) or 0) + 1
+
+
 def _read_global_generation_progress_redis_cache(
     *,
     global_target_id: str,
     target_samples: int,
     progress_backend: dict[str, Any] | None = None,
+    telemetry: dict[str, int] | None = None,
 ) -> dict[str, Any] | None:
     backend = progress_backend if isinstance(progress_backend, dict) else {}
     client = _resolve_redis_progress_client(backend)
@@ -386,8 +519,10 @@ def _read_global_generation_progress_redis_cache(
     try:
         raw_payload = client.get(key)
     except Exception:
+        _touch_progress_read_telemetry(telemetry, "redis_error")
         return None
     if raw_payload is None:
+        _touch_progress_read_telemetry(telemetry, "redis_miss")
         return None
     payload: dict[str, Any] | None = None
     if isinstance(raw_payload, dict):
@@ -398,9 +533,12 @@ def _read_global_generation_progress_redis_cache(
             if isinstance(parsed, dict):
                 payload = parsed
         except Exception:
+            _touch_progress_read_telemetry(telemetry, "redis_error")
             payload = None
     if payload is None:
+        _touch_progress_read_telemetry(telemetry, "redis_error")
         return None
+    _touch_progress_read_telemetry(telemetry, "redis_hit")
     return _normalize_global_generation_state_payload(
         payload=payload,
         global_target_id=global_target_id,
@@ -473,6 +611,8 @@ def _update_global_generation_progress_firestore(
     progress_backend: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     backend = progress_backend if isinstance(progress_backend, dict) else {}
+    workers_retention_seconds = max(0, _safe_int(backend.get("workers_retention_seconds", 86400), 86400))
+    workers_max_entries = max(1, _safe_int(backend.get("workers_max_entries", 5000), 5000))
     endpoint = _resolve_firestore_progress_endpoint(backend)
     if endpoint is None:
         _raise_firestore_progress_error(
@@ -494,6 +634,8 @@ def _update_global_generation_progress_firestore(
         workers = state.get("workers")
         if not isinstance(workers, dict):
             workers = {}
+        archived_samples = max(0, int(state.get("archived_samples", 0) or 0))
+        archived_games = max(0, int(state.get("archived_games", 0) or 0))
         current = _normalize_worker_progress_entry(
             job_id=job_id,
             payload=workers.get(job_id, {}),
@@ -515,9 +657,21 @@ def _update_global_generation_progress_firestore(
             "contributed_games": int(current.get("contributed_games", 0)),
             "updated_at": str(current.get("updated_at", "")),
         }
+        workers, dropped_samples, dropped_games = _apply_worker_progress_retention(
+            workers=workers,
+            keep_job_id=job_id,
+            stale_seconds=workers_retention_seconds,
+            max_entries=workers_max_entries,
+        )
+        archived_samples += max(0, int(dropped_samples))
+        archived_games += max(0, int(dropped_games))
+        active_samples = sum(int(item.get("contributed_samples", 0)) for item in workers.values() if isinstance(item, dict))
+        active_games = sum(int(item.get("contributed_games", 0)) for item in workers.values() if isinstance(item, dict))
         state["workers"] = workers
-        state["total_samples"] = sum(int(item.get("contributed_samples", 0)) for item in workers.values() if isinstance(item, dict))
-        state["total_games"] = sum(int(item.get("contributed_games", 0)) for item in workers.values() if isinstance(item, dict))
+        state["archived_samples"] = int(archived_samples)
+        state["archived_games"] = int(archived_games)
+        state["total_samples"] = int(archived_samples + active_samples)
+        state["total_games"] = int(archived_games + active_games)
         state["updated_at"] = utc_now_iso()
         tx.set(doc_ref, state)
         return state
@@ -551,6 +705,8 @@ def _reserve_global_generation_budget_firestore(
     progress_backend: dict[str, Any] | None = None,
 ) -> tuple[int, int, dict[str, Any]]:
     backend = progress_backend if isinstance(progress_backend, dict) else {}
+    workers_retention_seconds = max(0, _safe_int(backend.get("workers_retention_seconds", 86400), 86400))
+    workers_max_entries = max(1, _safe_int(backend.get("workers_max_entries", 5000), 5000))
     endpoint = _resolve_firestore_progress_endpoint(backend)
     if endpoint is None:
         _raise_firestore_progress_error(
@@ -583,6 +739,8 @@ def _reserve_global_generation_budget_firestore(
         workers = state.get("workers")
         if not isinstance(workers, dict):
             workers = {}
+        archived_samples = max(0, int(state.get("archived_samples", 0) or 0))
+        archived_games = max(0, int(state.get("archived_games", 0) or 0))
         current = _normalize_worker_progress_entry(
             job_id=job_id,
             payload=workers.get(job_id, {}),
@@ -604,9 +762,21 @@ def _reserve_global_generation_budget_firestore(
             "contributed_games": int(current.get("contributed_games", 0)),
             "updated_at": str(current.get("updated_at", "")),
         }
+        workers, dropped_samples, dropped_games = _apply_worker_progress_retention(
+            workers=workers,
+            keep_job_id=job_id,
+            stale_seconds=workers_retention_seconds,
+            max_entries=workers_max_entries,
+        )
+        archived_samples += max(0, int(dropped_samples))
+        archived_games += max(0, int(dropped_games))
+        active_samples = sum(int(item.get("contributed_samples", 0)) for item in workers.values() if isinstance(item, dict))
+        active_games = sum(int(item.get("contributed_games", 0)) for item in workers.values() if isinstance(item, dict))
         state["workers"] = workers
-        state["total_samples"] = sum(int(item.get("contributed_samples", 0)) for item in workers.values() if isinstance(item, dict))
-        state["total_games"] = sum(int(item.get("contributed_games", 0)) for item in workers.values() if isinstance(item, dict))
+        state["archived_samples"] = int(archived_samples)
+        state["archived_games"] = int(archived_games)
+        state["total_samples"] = int(archived_samples + active_samples)
+        state["total_games"] = int(archived_games + active_games)
         state["updated_at"] = utc_now_iso()
         tx.set(doc_ref, state)
         return int(allowed_samples), int(allowed_games), state
@@ -637,16 +807,23 @@ def _read_global_generation_progress_firestore(
     global_target_id: str,
     target_samples: int,
     progress_backend: dict[str, Any] | None = None,
+    prefer_cache: bool = True,
+    telemetry: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     backend = progress_backend if isinstance(progress_backend, dict) else {}
-    cached = _read_global_generation_progress_redis_cache(
-        global_target_id=global_target_id,
-        target_samples=target_samples,
-        progress_backend=backend,
-    )
-    if cached is not None:
-        _mirror_global_generation_progress_state(progress_path, cached)
-        return cached
+    redis_enabled = bool(backend.get("redis_enabled", False))
+    if prefer_cache:
+        cached = _read_global_generation_progress_redis_cache(
+            global_target_id=global_target_id,
+            target_samples=target_samples,
+            progress_backend=backend,
+            telemetry=telemetry,
+        )
+        if cached is not None:
+            _mirror_global_generation_progress_state(progress_path, cached)
+            return cached
+        if redis_enabled:
+            _touch_progress_read_telemetry(telemetry, "fallback_firestore")
     endpoint = _resolve_firestore_progress_endpoint(backend)
     if endpoint is None:
         _raise_firestore_progress_error(
@@ -668,6 +845,7 @@ def _read_global_generation_progress_firestore(
         global_target_id=global_target_id,
         target_samples=target_samples,
     )
+    _touch_progress_read_telemetry(telemetry, "firestore_read")
     _write_global_generation_progress_redis_cache(
         global_target_id=global_target_id,
         state=state,
@@ -683,6 +861,8 @@ def _default_global_generation_progress_state(global_target_id: str, target_samp
         "target_samples": int(target_samples),
         "total_samples": 0,
         "total_games": 0,
+        "archived_samples": 0,
+        "archived_games": 0,
         "workers": {},
         "updated_at": utc_now_iso(),
     }
@@ -811,6 +991,8 @@ def _sync_global_generation_progress_state(
     workers_from_snapshots = _load_global_generation_worker_snapshots(progress_path)
     merged_workers = _merge_worker_progress_maps(workers_from_state, workers_from_snapshots)
 
+    archived_samples = max(0, int(state.get("archived_samples", 0) or 0))
+    archived_games = max(0, int(state.get("archived_games", 0) or 0))
     merged_total_samples = sum(int(item.get("contributed_samples", 0)) for item in merged_workers.values())
     merged_total_games = sum(int(item.get("contributed_games", 0)) for item in merged_workers.values())
 
@@ -823,8 +1005,10 @@ def _sync_global_generation_progress_state(
         }
         for worker_job_id, payload in merged_workers.items()
     }
-    state["total_samples"] = max(int(state.get("total_samples", 0)), int(merged_total_samples))
-    state["total_games"] = max(int(state.get("total_games", 0)), int(merged_total_games))
+    state["archived_samples"] = int(archived_samples)
+    state["archived_games"] = int(archived_games)
+    state["total_samples"] = max(int(state.get("total_samples", 0)), int(archived_samples + merged_total_samples))
+    state["total_games"] = max(int(state.get("total_games", 0)), int(archived_games + merged_total_games))
     state["updated_at"] = utc_now_iso()
     return state
 
@@ -867,6 +1051,8 @@ def _update_global_generation_progress(
         workers = state.get("workers")
         if not isinstance(workers, dict):
             workers = {}
+        archived_samples = max(0, int(state.get("archived_samples", 0) or 0))
+        archived_games = max(0, int(state.get("archived_games", 0) or 0))
         current = _normalize_worker_progress_entry(
             job_id=job_id,
             payload=workers.get(job_id, {}),
@@ -889,9 +1075,13 @@ def _update_global_generation_progress(
             "updated_at": str(current.get("updated_at", "")),
         }
         _write_global_generation_worker_snapshot(progress_path=progress_path, worker_payload=current)
+        active_samples = sum(int(item.get("contributed_samples", 0)) for item in workers.values() if isinstance(item, dict))
+        active_games = sum(int(item.get("contributed_games", 0)) for item in workers.values() if isinstance(item, dict))
         state["workers"] = workers
-        state["total_samples"] = sum(int(item.get("contributed_samples", 0)) for item in workers.values() if isinstance(item, dict))
-        state["total_games"] = sum(int(item.get("contributed_games", 0)) for item in workers.values() if isinstance(item, dict))
+        state["archived_samples"] = int(archived_samples)
+        state["archived_games"] = int(archived_games)
+        state["total_samples"] = int(archived_samples + active_samples)
+        state["total_games"] = int(archived_games + active_games)
         state["updated_at"] = utc_now_iso()
         write_json_atomic(progress_path, state, ensure_ascii=True, indent=2)
         return state
@@ -947,6 +1137,8 @@ def _reserve_global_generation_budget(
         workers = state.get("workers")
         if not isinstance(workers, dict):
             workers = {}
+        archived_samples = max(0, int(state.get("archived_samples", 0) or 0))
+        archived_games = max(0, int(state.get("archived_games", 0) or 0))
         current = _normalize_worker_progress_entry(
             job_id=job_id,
             payload=workers.get(job_id, {}),
@@ -969,9 +1161,13 @@ def _reserve_global_generation_budget(
             "updated_at": str(current.get("updated_at", "")),
         }
         _write_global_generation_worker_snapshot(progress_path=progress_path, worker_payload=current)
+        active_samples = sum(int(item.get("contributed_samples", 0)) for item in workers.values() if isinstance(item, dict))
+        active_games = sum(int(item.get("contributed_games", 0)) for item in workers.values() if isinstance(item, dict))
         state["workers"] = workers
-        state["total_samples"] = sum(int(item.get("contributed_samples", 0)) for item in workers.values() if isinstance(item, dict))
-        state["total_games"] = sum(int(item.get("contributed_games", 0)) for item in workers.values() if isinstance(item, dict))
+        state["archived_samples"] = int(archived_samples)
+        state["archived_games"] = int(archived_games)
+        state["total_samples"] = int(archived_samples + active_samples)
+        state["total_games"] = int(archived_games + active_games)
         state["updated_at"] = utc_now_iso()
 
         write_json_atomic(progress_path, state, ensure_ascii=True, indent=2)
@@ -986,6 +1182,8 @@ def _read_global_generation_progress(
     target_samples: int,
     *,
     progress_backend: dict[str, Any] | None = None,
+    prefer_cache: bool = True,
+    telemetry: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     backend = progress_backend if isinstance(progress_backend, dict) else {}
     if str(backend.get("backend", "file")).strip().lower() == "firestore":
@@ -994,6 +1192,8 @@ def _read_global_generation_progress(
             global_target_id=global_target_id,
             target_samples=target_samples,
             progress_backend=backend,
+            prefer_cache=prefer_cache,
+            telemetry=telemetry,
         )
 
     state = _sync_global_generation_progress_state(
@@ -2945,14 +3145,15 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
     source_dataset_ids = [str(value).strip() for value in cfg.get("source_dataset_ids", []) if str(value).strip()]
     derivation_strategy = str(cfg.get("derivation_strategy", "unique_positions")).strip().lower() or "unique_positions"
     derivation_params = dict(cfg.get("derivation_params", {}))
-    merge_dedupe_sample_ids = bool(cfg.get("merge_dedupe_sample_ids", True))
+    merge_dedupe_sample_ids = _as_bool(cfg.get("merge_dedupe_sample_ids", True), default=True)
     games = int(cfg.get("games", 20))
     matchups = list(cfg.get("matchups", []))
-    cycle_matchups_until_target = bool(
+    cycle_matchups_until_target = _as_bool(
         cfg.get(
             "cycle_matchups_until_target",
             cfg.get("benchmatch_cycle_matchups_until_target", source_mode == "benchmatch"),
-        )
+        ),
+        default=(source_mode == "benchmatch"),
     )
     max_matchup_cycles = max(
         0,
@@ -2975,7 +3176,7 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
     )
     target_samples = int(cfg.get("target_samples", 0))
     model_agent_device = str(cfg.get("model_agent_device", "cpu")).strip().lower() or "cpu"
-    global_target_enabled = bool(cfg.get("global_target_enabled", False))
+    global_target_enabled = _as_bool(cfg.get("global_target_enabled", False), default=False)
     global_target_id = str(cfg.get("global_target_id", "")).strip() or dataset_source_id
     global_target_samples = int(cfg.get("global_target_samples", target_samples or 0))
     global_progress_path = _resolve_storage_path(
@@ -3412,6 +3613,7 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
         float(cfg.get("global_target_poll_interval_seconds", 15.0)),
     )
     global_target_poll_cache: dict[str, Any] = {"checked_at": 0.0, "reached": False}
+    global_progress_read_telemetry: dict[str, int] = {}
     job.logger.info(
         "dataset generation global budget control | mode=%s | strict_reservation=%s | progress_flush_every_n_games=%s | target_poll_interval_seconds=%.1f",
         global_budget_mode_cfg,
@@ -3609,6 +3811,8 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
                     global_target_id=global_target_id,
                     target_samples=global_target_samples,
                     progress_backend=global_progress_backend,
+                    prefer_cache=False,
+                    telemetry=global_progress_read_telemetry,
                 )
                 reached = int(state.get("total_samples", 0)) >= int(global_target_samples)
                 global_target_poll_cache["checked_at"] = now_ts
@@ -4110,6 +4314,8 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
             global_target_id=global_target_id,
             target_samples=global_target_samples,
             progress_backend=global_progress_backend,
+            prefer_cache=False,
+            telemetry=global_progress_read_telemetry,
         )
         global_target_reached_final = int(global_state.get("total_samples", 0)) >= int(global_target_samples)
     local_target_reached_final = target_samples > 0 and int(final_total_samples) >= int(target_samples)
@@ -4177,6 +4383,17 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
             "target_samples": target_samples,
         }
     )
+    if global_target_enabled and source_mode == "benchmatch":
+        job.write_metric(
+            {
+                "metric_type": "dataset_global_progress_read_telemetry",
+                "redis_hit": int(global_progress_read_telemetry.get("redis_hit", 0)),
+                "redis_miss": int(global_progress_read_telemetry.get("redis_miss", 0)),
+                "redis_error": int(global_progress_read_telemetry.get("redis_error", 0)),
+                "fallback_firestore": int(global_progress_read_telemetry.get("fallback_firestore", 0)),
+                "firestore_read": int(global_progress_read_telemetry.get("firestore_read", 0)),
+            }
+        )
     return summary
 
 
@@ -4188,7 +4405,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
     teacher_level = str(teacher_cfg.get("level", "hard"))
     dataset_id = str(cfg.get("dataset_id", "dataset_v1"))
     source_dataset_id = str(cfg.get("source_dataset_id", "")).strip()
-    configured_follow_source_updates = bool(cfg.get("follow_source_updates", False))
+    configured_follow_source_updates = _as_bool(cfg.get("follow_source_updates", False), default=False)
     source_poll_interval_seconds = max(1.0, float(cfg.get("source_poll_interval_seconds", 30.0)))
     split_cfg = cfg.get("split", {})
     train_ratio = float(split_cfg.get("train", 0.8))
@@ -4197,14 +4414,14 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
     max_pending_futures = max(1, int(cfg.get("max_pending_futures", num_workers * 2)))
     multiprocessing_start_method = str(runtime_cfg.get("multiprocessing_start_method", "spawn")).strip().lower() or "spawn"
     max_tasks_per_child = int(runtime_cfg.get("max_tasks_per_child", 25))
-    include_tactical_analysis = bool(cfg.get("include_tactical_analysis", True))
-    dedupe_sample_ids = bool(cfg.get("dedupe_sample_ids", True))
+    include_tactical_analysis = _as_bool(cfg.get("include_tactical_analysis", True), default=True)
+    dedupe_sample_ids = _as_bool(cfg.get("dedupe_sample_ids", True), default=True)
     export_partial_every_n_files = max(1, int(cfg.get("export_partial_every_n_files", 250)))
-    adaptive_source_polling = bool(cfg.get("adaptive_source_polling", True))
+    adaptive_source_polling = _as_bool(cfg.get("adaptive_source_polling", True), default=True)
     source_poll_interval_min_seconds = max(1.0, float(cfg.get("source_poll_interval_min_seconds", max(1.0, source_poll_interval_seconds / 2.0))))
     source_poll_interval_max_seconds = max(source_poll_interval_min_seconds, float(cfg.get("source_poll_interval_max_seconds", max(source_poll_interval_seconds * 4.0, source_poll_interval_min_seconds))))
     current_poll_interval_seconds = source_poll_interval_seconds
-    stop_when_global_target_reached = bool(cfg.get("stop_when_global_target_reached", True))
+    stop_when_global_target_reached = _as_bool(cfg.get("stop_when_global_target_reached", True), default=True)
     global_target_progress_path = _resolve_storage_path(
         job.paths.drive_root,
         cfg.get("global_target_progress_path"),
@@ -4219,12 +4436,25 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
     )
     global_target_stabilization_polls = max(1, int(cfg.get("global_target_stabilization_polls", 3)))
     global_target_reached_polls = 0
+    global_progress_read_telemetry: dict[str, int] = {}
     effective_max_tasks_per_child = _resolve_pool_max_tasks_per_child(
         start_method=multiprocessing_start_method,
         configured_value=max_tasks_per_child,
         logger=job.logger,
         scope="dataset build pool configuration",
     )
+
+    def _write_global_progress_read_telemetry_metric() -> None:
+        job.write_metric(
+            {
+                "metric_type": "dataset_build_global_progress_read_telemetry",
+                "redis_hit": int(global_progress_read_telemetry.get("redis_hit", 0)),
+                "redis_miss": int(global_progress_read_telemetry.get("redis_miss", 0)),
+                "redis_error": int(global_progress_read_telemetry.get("redis_error", 0)),
+                "fallback_firestore": int(global_progress_read_telemetry.get("fallback_firestore", 0)),
+                "firestore_read": int(global_progress_read_telemetry.get("firestore_read", 0)),
+            }
+        )
 
     job.logger.info(
         "dataset build startup | dataset=%s | source_dataset_id=%s | configured_input_sampled_dir=%s | workers=%s | max_pending_futures=%s | include_tactical_analysis=%s | dedupe_sample_ids=%s | export_partial_every_n_files=%s | follow_source_updates=%s | source_poll_interval_seconds=%.1f | adaptive_source_polling=%s | global_target_backend=%s",
@@ -4344,6 +4574,8 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
             global_target_id=global_target_id,
             target_samples=int(global_target_samples_cfg),
             progress_backend=global_progress_backend,
+            prefer_cache=False,
+            telemetry=global_progress_read_telemetry,
         )
         total = int(payload.get("total_samples", 0))
         target = int(payload.get("target_samples") or global_target_samples_cfg or 0)
@@ -4406,6 +4638,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
                 dataset_id,
                 source_dataset_id,
             )
+            _write_global_progress_read_telemetry_metric()
             return summary
         raise FileNotFoundError(f"Aucun fichier sampled_positions trouve dans {sampled_root}")
 
@@ -5018,6 +5251,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         duplicate_samples_removed=duplicate_samples_removed,
         dedupe_sample_ids=dedupe_sample_ids,
     )
+    _write_global_progress_read_telemetry_metric()
     return summary
 
 

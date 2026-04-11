@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import random
 import string
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,26 @@ def _first_non_empty(candidates: list[Any]) -> str:
         if text:
             return text
     return ""
+
+
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return bool(default)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on", "y", "t"}:
+        return True
+    if text in {"0", "false", "no", "off", "n", "f"}:
+        return False
+    return bool(default)
+
+
+def _as_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
 
 
 def _resolve_firestore_sync_config(config: dict[str, Any]) -> dict[str, Any]:
@@ -40,6 +61,17 @@ def _resolve_firestore_sync_config(config: dict[str, Any]) -> dict[str, Any]:
 
     strict_flag = pick("job_firestore_strict").lower()
     strict = strict_flag in {"", "1", "true", "yes", "on"}
+    checkpoint_min_interval_seconds = max(
+        0.0,
+        _as_float(
+            pick("job_firestore_checkpoint_min_interval_seconds", "worker_checkpoints_min_interval_seconds") or "30",
+            30.0,
+        ),
+    )
+    checkpoint_state_only_on_change = _as_bool(
+        pick("job_firestore_checkpoint_state_only_on_change") or "1",
+        default=True,
+    )
     project_id = pick(
         "job_firestore_project_id",
         "global_progress_firestore_project_id",
@@ -63,6 +95,8 @@ def _resolve_firestore_sync_config(config: dict[str, Any]) -> dict[str, Any]:
         "collection": collection,
         "credentials_path": credentials_path,
         "api_key": api_key,
+        "checkpoint_min_interval_seconds": checkpoint_min_interval_seconds,
+        "checkpoint_state_only_on_change": checkpoint_state_only_on_change,
     }
 
 
@@ -134,6 +168,9 @@ class JobContext:
     status_path: Path
     state_path: Path
     firestore_sync: dict[str, Any]
+    _last_firestore_checkpoint_write_ts: float = 0.0
+    _last_firestore_status_signature: str = ""
+    _last_firestore_state_signature: str = ""
 
     def read_status(self) -> dict[str, Any]:
         return read_json_dict(self.status_path, default={})
@@ -174,7 +211,7 @@ class JobContext:
         if extra:
             payload.update(extra)
         write_json_atomic(self.status_path, payload, ensure_ascii=True, indent=2)
-        self._write_worker_checkpoint_firestore(status_payload=payload, state_payload=None)
+        self._write_worker_checkpoint_firestore(status_payload=payload, state_payload=None, force=True)
 
     def write_state(self, state: dict[str, Any]) -> None:
         payload = {
@@ -183,24 +220,35 @@ class JobContext:
             **state,
         }
         write_json_atomic(self.state_path, payload, ensure_ascii=True, indent=2)
-        self._write_worker_checkpoint_firestore(status_payload=None, state_payload=payload)
+        self._write_worker_checkpoint_firestore(status_payload=None, state_payload=payload, force=False)
 
     def set_phase(self, phase: str) -> None:
         current = read_json_dict(self.status_path, default={})
         current.update({"phase": phase, "updated_at": utc_now_iso()})
         write_json_atomic(self.status_path, current, ensure_ascii=True, indent=2)
-        self._write_worker_checkpoint_firestore(status_payload=current, state_payload=None)
+        self._write_worker_checkpoint_firestore(status_payload=current, state_payload=None, force=True)
 
     def _write_worker_checkpoint_firestore(
         self,
         *,
         status_payload: dict[str, Any] | None,
         state_payload: dict[str, Any] | None,
+        force: bool = False,
     ) -> None:
         sync = self.firestore_sync if isinstance(self.firestore_sync, dict) else {}
         if not bool(sync.get("enabled", False)):
             return
         strict = bool(sync.get("strict", True))
+        min_interval_seconds = max(0.0, _as_float(sync.get("checkpoint_min_interval_seconds", 30.0), 30.0))
+        state_only_on_change = _as_bool(sync.get("checkpoint_state_only_on_change", True), default=True)
+        status_signature = json.dumps(status_payload, sort_keys=True, ensure_ascii=True, default=str) if status_payload is not None else ""
+        state_signature = json.dumps(state_payload, sort_keys=True, ensure_ascii=True, default=str) if state_payload is not None else ""
+        now_ts = time.time()
+        if not force:
+            if state_payload is not None and state_only_on_change and state_signature == self._last_firestore_state_signature:
+                return
+            if min_interval_seconds > 0 and (now_ts - float(self._last_firestore_checkpoint_write_ts)) < min_interval_seconds:
+                return
         try:
             client = _build_firestore_job_client(
                 project_id=str(sync.get("project_id", "")).strip(),
@@ -209,11 +257,7 @@ class JobContext:
             )
             collection = str(sync.get("collection", "worker_checkpoints")).strip() or "worker_checkpoints"
             doc_ref = client.collection(collection).document(self.job_id)
-            current = {}
-            snap = doc_ref.get()
-            if snap.exists:
-                current = snap.to_dict() or {}
-            payload = dict(current)
+            payload: dict[str, Any] = {}
             payload["job_id"] = self.job_id
             payload["run_type"] = self.run_type
             payload["updated_at"] = utc_now_iso()
@@ -222,7 +266,12 @@ class JobContext:
                 payload["phase"] = str(status_payload.get("phase", ""))
             if state_payload is not None:
                 payload["state"] = dict(state_payload)
-            doc_ref.set(payload)
+            doc_ref.set(payload, merge=True)
+            self._last_firestore_checkpoint_write_ts = now_ts
+            if status_payload is not None:
+                self._last_firestore_status_signature = status_signature
+            if state_payload is not None:
+                self._last_firestore_state_signature = state_signature
         except Exception as exc:
             self.logger.warning("firestore worker checkpoint sync failed | job_id=%s | error=%s", self.job_id, f"{type(exc).__name__}: {exc}")
             if strict:
@@ -294,9 +343,33 @@ def create_job_context(config: dict[str, Any], *, override_job_id: str | None = 
     return context
 
 
+def _redact_sensitive_config(value: Any, key_path: str = "") -> Any:
+    if isinstance(value, dict):
+        redacted: dict[str, Any] = {}
+        for key, child in value.items():
+            key_text = str(key)
+            key_lower = key_text.strip().lower()
+            is_sensitive = (
+                "token" in key_lower
+                or "secret" in key_lower
+                or "password" in key_lower
+                or "private_key" in key_lower
+                or key_lower.endswith("api_key")
+            )
+            if is_sensitive:
+                redacted[key_text] = "***REDACTED***"
+            else:
+                redacted[key_text] = _redact_sensitive_config(child, key_text if not key_path else f"{key_path}.{key_text}")
+        return redacted
+    if isinstance(value, list):
+        return [_redact_sensitive_config(item, key_path) for item in value]
+    return value
+
+
 def _dump_yaml_like(config: dict[str, Any]) -> str:
+    safe_config = _redact_sensitive_config(config)
     try:
         import yaml
     except ImportError:
-        return json.dumps(config, indent=2)
-    return yaml.safe_dump(config, sort_keys=False)
+        return json.dumps(safe_config, indent=2)
+    return yaml.safe_dump(safe_config, sort_keys=False)
