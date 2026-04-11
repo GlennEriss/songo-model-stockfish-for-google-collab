@@ -1331,6 +1331,156 @@ def _mutate_dataset_registry(job: JobContext, updater: Callable[[dict[str, Any]]
         _release_lock_dir(lock_dir)
 
 
+def _dataset_merge_final_lock_dir(job: JobContext, dataset_id: str) -> Path:
+    safe_dataset_id = str(dataset_id).strip().replace("/", "_").replace(":", "_")
+    return job.paths.data_root / f"dataset_merge_final.{safe_dataset_id}.lock"
+
+
+def _acquire_dataset_merge_final_lock(
+    job: JobContext,
+    *,
+    dataset_id: str,
+    lock_ttl_seconds: float,
+    lock_wait_seconds: float,
+    poll_seconds: float = 1.0,
+) -> dict[str, Any]:
+    dataset_id = str(dataset_id).strip()
+    if not dataset_id:
+        raise ValueError("dataset_id vide pour acquisition du verrou dataset_merge_final.")
+
+    lock_ttl_seconds = max(30.0, float(lock_ttl_seconds))
+    lock_wait_seconds = max(1.0, float(lock_wait_seconds))
+    poll_seconds = max(0.2, float(poll_seconds))
+    deadline = time.time() + lock_wait_seconds
+
+    endpoint, _backend = _dataset_registry_doc_ref_from_job(job)
+    if endpoint is not None:
+        client, doc_ref, firestore_mod = endpoint
+        lock_path = ("_locks", "dataset_merge_final", dataset_id)
+
+        @firestore_mod.transactional
+        def _try_acquire(tx):
+            snap = doc_ref.get(transaction=tx)
+            payload = snap.to_dict() if snap.exists else _dataset_registry_default_payload()
+            if not isinstance(payload, dict):
+                payload = _dataset_registry_default_payload()
+            locks = payload.get("_locks", {})
+            if not isinstance(locks, dict):
+                locks = {}
+            merge_locks = locks.get("dataset_merge_final", {})
+            if not isinstance(merge_locks, dict):
+                merge_locks = {}
+
+            now_ts = time.time()
+            existing = merge_locks.get(dataset_id)
+            existing_owner = ""
+            if isinstance(existing, dict):
+                existing_owner = str(existing.get("owner_job_id", "")).strip()
+            existing_expires_at = float(existing.get("expires_at", 0.0) or 0.0) if isinstance(existing, dict) else 0.0
+            lock_active = bool(existing_owner) and existing_expires_at > now_ts
+            if lock_active and existing_owner != job.job_id:
+                return False, existing_owner, existing_expires_at, ""
+
+            token = f"{job.job_id}:{int(now_ts * 1000)}"
+            merge_locks[dataset_id] = {
+                "owner_job_id": job.job_id,
+                "token": token,
+                "acquired_at": now_ts,
+                "expires_at": now_ts + lock_ttl_seconds,
+            }
+            locks["dataset_merge_final"] = merge_locks
+            payload["_locks"] = locks
+            tx.set(doc_ref, payload, merge=True)
+            return True, job.job_id, now_ts + lock_ttl_seconds, token
+
+        while True:
+            tx = client.transaction()
+            acquired, owner, expires_at, token = _try_acquire(tx)
+            if acquired:
+                return {
+                    "backend": "firestore",
+                    "dataset_id": dataset_id,
+                    "owner_job_id": str(owner),
+                    "expires_at": float(expires_at),
+                    "token": str(token),
+                }
+            if time.time() >= deadline:
+                raise TimeoutError(
+                    f"Timeout acquisition lock merge final (firestore) | dataset_id={dataset_id} | owner={owner}"
+                )
+            time.sleep(poll_seconds)
+
+    # Fallback lock on shared Drive filesystem.
+    lock_dir = _dataset_merge_final_lock_dir(job, dataset_id)
+    lock_ok = _acquire_lock_dir(lock_dir, timeout_seconds=lock_wait_seconds, poll_seconds=poll_seconds)
+    if not lock_ok:
+        raise TimeoutError(
+            f"Timeout acquisition lock merge final (drive lock dir) | dataset_id={dataset_id} | lock_dir={lock_dir}"
+        )
+    return {
+        "backend": "drive_lock_dir",
+        "dataset_id": dataset_id,
+        "lock_dir": str(lock_dir),
+    }
+
+
+def _release_dataset_merge_final_lock(job: JobContext, lock_handle: dict[str, Any] | None) -> None:
+    if not isinstance(lock_handle, dict):
+        return
+    backend = str(lock_handle.get("backend", "")).strip().lower()
+    dataset_id = str(lock_handle.get("dataset_id", "")).strip()
+    if backend == "drive_lock_dir":
+        lock_dir = Path(str(lock_handle.get("lock_dir", "")).strip())
+        if lock_dir:
+            _release_lock_dir(lock_dir)
+        return
+    if backend != "firestore" or not dataset_id:
+        return
+
+    token = str(lock_handle.get("token", "")).strip()
+    endpoint, _resolved_backend = _dataset_registry_doc_ref_from_job(job)
+    if endpoint is None:
+        return
+    client, doc_ref, firestore_mod = endpoint
+
+    @firestore_mod.transactional
+    def _tx_release(tx):
+        snap = doc_ref.get(transaction=tx)
+        payload = snap.to_dict() if snap.exists else _dataset_registry_default_payload()
+        if not isinstance(payload, dict):
+            payload = _dataset_registry_default_payload()
+        locks = payload.get("_locks", {})
+        if not isinstance(locks, dict):
+            return
+        merge_locks = locks.get("dataset_merge_final", {})
+        if not isinstance(merge_locks, dict):
+            return
+        current = merge_locks.get(dataset_id)
+        if not isinstance(current, dict):
+            return
+        current_owner = str(current.get("owner_job_id", "")).strip()
+        current_token = str(current.get("token", "")).strip()
+        if current_owner != job.job_id or (token and current_token != token):
+            return
+        merge_locks.pop(dataset_id, None)
+        if merge_locks:
+            locks["dataset_merge_final"] = merge_locks
+        else:
+            locks.pop("dataset_merge_final", None)
+        if locks:
+            payload["_locks"] = locks
+        else:
+            payload.pop("_locks", None)
+        tx.set(doc_ref, payload, merge=True)
+
+    try:
+        tx = client.transaction()
+        _tx_release(tx)
+    except Exception:
+        # Never crash caller on lock release path.
+        pass
+
+
 def _upsert_registry_entry(entries: list[dict[str, Any]], *, key: str, value: str, payload: dict[str, Any]) -> None:
     for index, entry in enumerate(entries):
         if str(entry.get(key, "")) == value:
@@ -5264,152 +5414,182 @@ def run_dataset_merge_final(job: JobContext) -> dict[str, object]:
     source_dataset_ids = [str(value).strip() for value in cfg.get("source_dataset_ids", []) if str(value).strip()]
     include_all_built = bool(cfg.get("include_all_built", False))
     dedupe_sample_ids = bool(cfg.get("dedupe_sample_ids", True))
+    merge_lock_ttl_seconds = max(30.0, float(cfg.get("merge_lock_ttl_seconds", 1800.0)))
+    merge_lock_wait_seconds = max(1.0, float(cfg.get("merge_lock_wait_seconds", 180.0)))
 
-    registry = _read_dataset_registry(job)
-    built_entries = registry.get("built_datasets", [])
-    if include_all_built:
-        source_dataset_ids = [str(entry.get("dataset_id", "")).strip() for entry in built_entries if str(entry.get("dataset_id", "")).strip()]
-    if not source_dataset_ids:
-        raise ValueError("Aucun `source_dataset_ids` fourni pour `dataset_merge_final`")
-
-    source_entries = [_resolve_built_dataset(job, source_dataset_id) for source_dataset_id in source_dataset_ids]
-    teacher_pairs = {(str(entry.get("teacher_engine", "")), str(entry.get("teacher_level", ""))) for entry in source_entries}
-    if len(teacher_pairs) != 1:
-        raise ValueError("Tous les datasets finaux a fusionner doivent partager le meme teacher")
-    teacher_engine, teacher_level = next(iter(teacher_pairs))
-
-    output_root = _resolve_storage_path(
-        job.paths.drive_root,
-        cfg.get("output_dir"),
-        job.paths.data_root / "datasets" / dataset_id,
-    )
-    output_root.mkdir(parents=True, exist_ok=True)
-    merge_dir = job.job_dir / "dataset_merge_final"
-    merge_dir.mkdir(parents=True, exist_ok=True)
-
-    job.logger.info(
-        "dataset final merge started | dataset=%s | source_datasets=%s | teacher=%s:%s | dedupe_sample_ids=%s | output_dir=%s",
-        dataset_id,
-        len(source_entries),
-        teacher_engine,
-        teacher_level,
-        dedupe_sample_ids,
-        output_root,
-    )
-    job.write_event(
-        "dataset_merge_final_started",
-        dataset_id=dataset_id,
-        source_dataset_ids=source_dataset_ids,
-        teacher_engine=teacher_engine,
-        teacher_level=teacher_level,
-        dedupe_sample_ids=dedupe_sample_ids,
-        output_dir=str(output_root),
-    )
-
-    split_summary: dict[str, dict[str, int]] = {}
-    merge_breakdown: dict[str, dict[str, int]] = {}
-    source_breakdown: dict[str, dict[str, dict[str, int]]] = {}
-    total_labeled_samples = 0
-    source_sampled_roots = [str(entry.get("sampled_root", "")) for entry in source_entries if str(entry.get("sampled_root", "")).strip()]
-    label_cache_dirs = [str(entry.get("label_cache_dir", "")) for entry in source_entries if str(entry.get("label_cache_dir", "")).strip()]
-
-    for split_name in ("train", "validation", "test"):
-        split_items: list[tuple[str, Path]] = []
-        for entry in source_entries:
-            output_dir = Path(str(entry["output_dir"]))
-            split_path = output_dir / f"{split_name}.npz"
-            if not split_path.exists():
-                raise FileNotFoundError(f"Split introuvable pour {entry['dataset_id']}: {split_path}")
-            split_items.append((str(entry["dataset_id"]), split_path))
-
-        job.logger.info(
-            "dataset final merge split started | split=%s | source_files=%s",
-            split_name,
-            len(split_items),
-        )
-        merged_arrays, split_metrics, split_source_breakdown = _merge_npz_splits_with_source_breakdown(
-            split_items,
-            dedupe_sample_ids=dedupe_sample_ids,
-        )
-        np.savez_compressed(output_root / f"{split_name}.npz", **merged_arrays)
-        split_summary[split_name] = {
-            "games": int(split_metrics["unique_games"]),
-            "samples": int(split_metrics["kept_samples"]),
-        }
-        merge_breakdown[split_name] = split_metrics
-        source_breakdown[split_name] = split_source_breakdown
-        total_labeled_samples += int(split_metrics["kept_samples"])
-        job.logger.info(
-            "dataset final merge split completed | split=%s | kept_samples=%s | duplicate_samples=%s | unique_games=%s | path=%s",
-            split_name,
-            split_metrics["kept_samples"],
-            split_metrics["duplicate_samples"],
-            split_metrics["unique_games"],
-            output_root / f"{split_name}.npz",
-        )
-        for source_dataset_id, stats in split_source_breakdown.items():
-            job.logger.info(
-                "dataset final merge source breakdown | split=%s | source_dataset_id=%s | input_samples=%s | kept_samples=%s | duplicate_samples=%s | unique_games=%s",
-                split_name,
-                source_dataset_id,
-                stats["input_samples"],
-                stats["kept_samples"],
-                stats["duplicate_samples"],
-                stats["unique_games"],
-            )
-
-    metadata = _register_built_dataset(
+    lock_handle = _acquire_dataset_merge_final_lock(
         job,
         dataset_id=dataset_id,
-        source_dataset_id=source_dataset_ids[0],
-        source_dataset_ids=source_dataset_ids,
-        sampled_root=Path(source_sampled_roots[0]) if source_sampled_roots else output_root,
-        output_root=output_root,
-        label_cache_dir=Path(label_cache_dirs[0]) if label_cache_dirs else output_root,
-        teacher_engine=teacher_engine,
-        teacher_level=teacher_level,
-        split_summary=split_summary,
-        labeled_samples=total_labeled_samples,
-        target_labeled_samples=total_labeled_samples,
-        build_mode="merged_final",
-        parent_dataset_ids=source_dataset_ids,
+        lock_ttl_seconds=merge_lock_ttl_seconds,
+        lock_wait_seconds=merge_lock_wait_seconds,
+        poll_seconds=1.0,
     )
-    metadata["merge_breakdown"] = merge_breakdown
-    metadata["source_breakdown"] = source_breakdown
-    metadata["dedupe_sample_ids"] = dedupe_sample_ids
-    metadata["source_dataset_ids"] = source_dataset_ids
-    _write_json(output_root / "dataset_metadata.json", metadata)
-
-    summary = {
-        "job_id": job.job_id,
-        "dataset_id": dataset_id,
-        "build_mode": "merged_final",
-        "source_dataset_ids": source_dataset_ids,
-        "teacher_engine": teacher_engine,
-        "teacher_level": teacher_level,
-        "dedupe_sample_ids": dedupe_sample_ids,
-        "splits": split_summary,
-        "merge_breakdown": merge_breakdown,
-        "source_breakdown": source_breakdown,
-        "output_dir": str(output_root),
-        "labeled_samples": total_labeled_samples,
-    }
-    _write_json(merge_dir / "dataset_merge_final_summary.json", summary)
     job.logger.info(
-        "dataset final merge completed | dataset=%s | sources=%s | train=%s | validation=%s | test=%s | labeled_samples=%s",
+        "dataset final merge lock acquired | dataset=%s | backend=%s | owner_job_id=%s",
         dataset_id,
-        len(source_dataset_ids),
-        split_summary.get("train", {}).get("samples", 0),
-        split_summary.get("validation", {}).get("samples", 0),
-        split_summary.get("test", {}).get("samples", 0),
-        total_labeled_samples,
+        str(lock_handle.get("backend", "")),
+        str(lock_handle.get("owner_job_id", job.job_id)),
     )
     job.write_event(
-        "dataset_merge_final_completed",
+        "dataset_merge_final_lock_acquired",
         dataset_id=dataset_id,
-        source_dataset_ids=source_dataset_ids,
-        labeled_samples=total_labeled_samples,
-        source_breakdown=source_breakdown,
+        lock_backend=str(lock_handle.get("backend", "")),
+        lock_owner_job_id=str(lock_handle.get("owner_job_id", job.job_id)),
     )
-    job.write_metric({"metric_type": "dataset_merge_final_completed", "dataset_id": dataset_id, "labeled_samples": total_labeled_samples})
-    return summary
+
+    try:
+        registry = _read_dataset_registry(job)
+        built_entries = registry.get("built_datasets", [])
+        if include_all_built:
+            source_dataset_ids = [str(entry.get("dataset_id", "")).strip() for entry in built_entries if str(entry.get("dataset_id", "")).strip()]
+        if not source_dataset_ids:
+            raise ValueError("Aucun `source_dataset_ids` fourni pour `dataset_merge_final`")
+
+        source_entries = [_resolve_built_dataset(job, source_dataset_id) for source_dataset_id in source_dataset_ids]
+        teacher_pairs = {(str(entry.get("teacher_engine", "")), str(entry.get("teacher_level", ""))) for entry in source_entries}
+        if len(teacher_pairs) != 1:
+            raise ValueError("Tous les datasets finaux a fusionner doivent partager le meme teacher")
+        teacher_engine, teacher_level = next(iter(teacher_pairs))
+
+        output_root = _resolve_storage_path(
+            job.paths.drive_root,
+            cfg.get("output_dir"),
+            job.paths.data_root / "datasets" / dataset_id,
+        )
+        output_root.mkdir(parents=True, exist_ok=True)
+        merge_dir = job.job_dir / "dataset_merge_final"
+        merge_dir.mkdir(parents=True, exist_ok=True)
+
+        job.logger.info(
+            "dataset final merge started | dataset=%s | source_datasets=%s | teacher=%s:%s | dedupe_sample_ids=%s | output_dir=%s",
+            dataset_id,
+            len(source_entries),
+            teacher_engine,
+            teacher_level,
+            dedupe_sample_ids,
+            output_root,
+        )
+        job.write_event(
+            "dataset_merge_final_started",
+            dataset_id=dataset_id,
+            source_dataset_ids=source_dataset_ids,
+            teacher_engine=teacher_engine,
+            teacher_level=teacher_level,
+            dedupe_sample_ids=dedupe_sample_ids,
+            output_dir=str(output_root),
+        )
+
+        split_summary: dict[str, dict[str, int]] = {}
+        merge_breakdown: dict[str, dict[str, int]] = {}
+        source_breakdown: dict[str, dict[str, dict[str, int]]] = {}
+        total_labeled_samples = 0
+        source_sampled_roots = [str(entry.get("sampled_root", "")) for entry in source_entries if str(entry.get("sampled_root", "")).strip()]
+        label_cache_dirs = [str(entry.get("label_cache_dir", "")) for entry in source_entries if str(entry.get("label_cache_dir", "")).strip()]
+
+        for split_name in ("train", "validation", "test"):
+            split_items: list[tuple[str, Path]] = []
+            for entry in source_entries:
+                output_dir = Path(str(entry["output_dir"]))
+                split_path = output_dir / f"{split_name}.npz"
+                if not split_path.exists():
+                    raise FileNotFoundError(f"Split introuvable pour {entry['dataset_id']}: {split_path}")
+                split_items.append((str(entry["dataset_id"]), split_path))
+
+            job.logger.info(
+                "dataset final merge split started | split=%s | source_files=%s",
+                split_name,
+                len(split_items),
+            )
+            merged_arrays, split_metrics, split_source_breakdown = _merge_npz_splits_with_source_breakdown(
+                split_items,
+                dedupe_sample_ids=dedupe_sample_ids,
+            )
+            np.savez_compressed(output_root / f"{split_name}.npz", **merged_arrays)
+            split_summary[split_name] = {
+                "games": int(split_metrics["unique_games"]),
+                "samples": int(split_metrics["kept_samples"]),
+            }
+            merge_breakdown[split_name] = split_metrics
+            source_breakdown[split_name] = split_source_breakdown
+            total_labeled_samples += int(split_metrics["kept_samples"])
+            job.logger.info(
+                "dataset final merge split completed | split=%s | kept_samples=%s | duplicate_samples=%s | unique_games=%s | path=%s",
+                split_name,
+                split_metrics["kept_samples"],
+                split_metrics["duplicate_samples"],
+                split_metrics["unique_games"],
+                output_root / f"{split_name}.npz",
+            )
+            for source_dataset_id, stats in split_source_breakdown.items():
+                job.logger.info(
+                    "dataset final merge source breakdown | split=%s | source_dataset_id=%s | input_samples=%s | kept_samples=%s | duplicate_samples=%s | unique_games=%s",
+                    split_name,
+                    source_dataset_id,
+                    stats["input_samples"],
+                    stats["kept_samples"],
+                    stats["duplicate_samples"],
+                    stats["unique_games"],
+                )
+
+        metadata = _register_built_dataset(
+            job,
+            dataset_id=dataset_id,
+            source_dataset_id=source_dataset_ids[0],
+            source_dataset_ids=source_dataset_ids,
+            sampled_root=Path(source_sampled_roots[0]) if source_sampled_roots else output_root,
+            output_root=output_root,
+            label_cache_dir=Path(label_cache_dirs[0]) if label_cache_dirs else output_root,
+            teacher_engine=teacher_engine,
+            teacher_level=teacher_level,
+            split_summary=split_summary,
+            labeled_samples=total_labeled_samples,
+            target_labeled_samples=total_labeled_samples,
+            build_mode="merged_final",
+            parent_dataset_ids=source_dataset_ids,
+        )
+        metadata["merge_breakdown"] = merge_breakdown
+        metadata["source_breakdown"] = source_breakdown
+        metadata["dedupe_sample_ids"] = dedupe_sample_ids
+        metadata["source_dataset_ids"] = source_dataset_ids
+        _write_json(output_root / "dataset_metadata.json", metadata)
+
+        summary = {
+            "job_id": job.job_id,
+            "dataset_id": dataset_id,
+            "build_mode": "merged_final",
+            "source_dataset_ids": source_dataset_ids,
+            "teacher_engine": teacher_engine,
+            "teacher_level": teacher_level,
+            "dedupe_sample_ids": dedupe_sample_ids,
+            "splits": split_summary,
+            "merge_breakdown": merge_breakdown,
+            "source_breakdown": source_breakdown,
+            "output_dir": str(output_root),
+            "labeled_samples": total_labeled_samples,
+        }
+        _write_json(merge_dir / "dataset_merge_final_summary.json", summary)
+        job.logger.info(
+            "dataset final merge completed | dataset=%s | sources=%s | train=%s | validation=%s | test=%s | labeled_samples=%s",
+            dataset_id,
+            len(source_dataset_ids),
+            split_summary.get("train", {}).get("samples", 0),
+            split_summary.get("validation", {}).get("samples", 0),
+            split_summary.get("test", {}).get("samples", 0),
+            total_labeled_samples,
+        )
+        job.write_event(
+            "dataset_merge_final_completed",
+            dataset_id=dataset_id,
+            source_dataset_ids=source_dataset_ids,
+            labeled_samples=total_labeled_samples,
+            source_breakdown=source_breakdown,
+        )
+        job.write_metric({"metric_type": "dataset_merge_final_completed", "dataset_id": dataset_id, "labeled_samples": total_labeled_samples})
+        return summary
+    finally:
+        _release_dataset_merge_final_lock(job, lock_handle)
+        job.write_event(
+            "dataset_merge_final_lock_released",
+            dataset_id=dataset_id,
+            lock_backend=str(lock_handle.get("backend", "")),
+        )
