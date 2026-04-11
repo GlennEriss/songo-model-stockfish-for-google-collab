@@ -2614,13 +2614,19 @@ cells = [
         import torch
         import yaml
 
-        def _prepare_eval_runtime_config() -> tuple[Path, str]:
+        def _prepare_eval_runtime_config(
+            *,
+            locked_dataset_id: str = '',
+            locked_model_id: str = '',
+            locked_checkpoint_path: str = '',
+        ) -> tuple[Path, str]:
             base_eval_cfg_path = Path(EVALUATION_20M_CONFIG_ACTIVE)
             runtime_eval_cfg_path = Path(EVALUATION_20M_RUNTIME_CONFIG_PATH)
             eval_cfg = yaml.safe_load(base_eval_cfg_path.read_text(encoding='utf-8')) or {}
             eval_block = dict(eval_cfg.get('evaluation', {}) or {})
-            requested_dataset_id = str(eval_block.get('dataset_id', DATASET_BUILD_ID))
+            requested_dataset_id = str(locked_dataset_id).strip() or str(eval_block.get('dataset_id', DATASET_BUILD_ID))
             dataset_id = requested_dataset_id
+            dataset_locked = bool(str(locked_dataset_id).strip())
 
             registry = _load_dataset_registry_payload()
             built_entries = [item for item in registry.get('built_datasets', []) if isinstance(item, dict)]
@@ -2628,25 +2634,39 @@ cells = [
             def _entry_output_dir(entry: dict) -> Path:
                 return Path(str(entry.get('output_dir', '')).strip())
 
-            def _has_test_npz(entry: dict) -> bool:
+            def _resolve_eval_npz_from_output_dir(output_dir: Path) -> Path | None:
+                test_npz = output_dir / 'test.npz'
+                if test_npz.exists():
+                    return test_npz
+                validation_npz = output_dir / 'validation.npz'
+                if validation_npz.exists():
+                    return validation_npz
+                return None
+
+            def _resolve_eval_npz(entry: dict) -> Path | None:
                 output_dir = _entry_output_dir(entry)
-                return output_dir.exists() and (output_dir / 'test.npz').exists()
+                if not output_dir.exists():
+                    return None
+                return _resolve_eval_npz_from_output_dir(output_dir)
+
+            def _has_eval_npz(entry: dict) -> bool:
+                return _resolve_eval_npz(entry) is not None
 
             built = next(
                 (
                     item
                     for item in built_entries
-                    if str(item.get('dataset_id', '')).strip() == dataset_id and _has_test_npz(item)
+                    if str(item.get('dataset_id', '')).strip() == dataset_id and _has_eval_npz(item)
                 ),
                 None,
             )
 
-            if built is None:
+            if built is None and (not dataset_locked):
                 prefix = f'{BASE_DATASET_BUILD_ID}_'
                 shard_candidates = [
                     item
                     for item in built_entries
-                    if _has_test_npz(item)
+                    if _has_eval_npz(item)
                     and (
                         str(item.get('dataset_id', '')).strip() == BASE_DATASET_BUILD_ID
                         or str(item.get('dataset_id', '')).strip().startswith(prefix)
@@ -2672,9 +2692,15 @@ cells = [
                         if not path.is_dir():
                             continue
                         name = path.name
-                        if name == requested_dataset_id or name == BASE_DATASET_BUILD_ID or name.startswith(f'{BASE_DATASET_BUILD_ID}_'):
-                            if (path / 'test.npz').exists():
+                        if dataset_locked:
+                            if name != requested_dataset_id:
+                                continue
+                            if _resolve_eval_npz_from_output_dir(path) is not None:
                                 dir_candidates.append(path)
+                        else:
+                            if name == requested_dataset_id or name == BASE_DATASET_BUILD_ID or name.startswith(f'{BASE_DATASET_BUILD_ID}_'):
+                                if _resolve_eval_npz_from_output_dir(path) is not None:
+                                    dir_candidates.append(path)
                 if dir_candidates:
                     selected_dir = sorted(dir_candidates, key=lambda p: p.stat().st_mtime, reverse=True)[0]
                     built = {
@@ -2687,40 +2713,94 @@ cells = [
                     dataset_id = selected_dir.name
 
             if built is None:
+                if dataset_locked:
+                    raise ValueError(
+                        f'Dataset verrouille introuvable pour evaluation: {requested_dataset_id}. '
+                        'Le train a utilise ce dataset mais aucun split eval (test/validation) est disponible.'
+                    )
                 raise ValueError(
                     f'Dataset introuvable pour evaluation (requested={requested_dataset_id}, base={BASE_DATASET_BUILD_ID}). '
-                    'Attends un snapshot build avec test.npz ou relance la cellule de configuration.'
+                    'Attends un snapshot build avec test.npz/validation.npz ou relance la cellule de configuration.'
                 )
 
             dataset_input_dim = int(built.get('input_dim') or 0)
-            test_npz_path = Path(str(built.get('output_dir', ''))) / 'test.npz'
+            eval_npz_path = _resolve_eval_npz(built)
+            if eval_npz_path is None:
+                raise ValueError(
+                    f'Dataset selectionne sans split eval exploitable (dataset_id={dataset_id}, output_dir={built.get("output_dir", "")}).'
+                )
             if dataset_input_dim <= 0:
-                with np.load(test_npz_path, allow_pickle=True) as test_npz:
-                    dataset_input_dim = int(test_npz['x'].shape[1])
-
-            models_root = Path(DRIVE_ROOT) / 'models'
-            model_registry_path = models_root / 'model_registry.json'
-            model_registry = json.loads(model_registry_path.read_text(encoding='utf-8')) if model_registry_path.exists() else {'models': []}
-            candidates = sorted(model_registry.get('models', []), key=lambda item: float(item.get('sort_ts', 0.0)), reverse=True)
+                with np.load(eval_npz_path, allow_pickle=True) as eval_npz:
+                    dataset_input_dim = int(eval_npz['x'].shape[1])
 
             selected = None
-            for item in candidates:
-                checkpoint_path = Path(str(item.get('checkpoint_path', '')).strip())
-                if not checkpoint_path.exists():
-                    continue
+            locked_model_id_value = str(locked_model_id).strip()
+            locked_checkpoint_value = str(locked_checkpoint_path).strip()
+            if locked_model_id_value or locked_checkpoint_value:
+                candidate_checkpoint = None
+                if locked_checkpoint_value:
+                    checkpoint_path = Path(locked_checkpoint_value)
+                    if not checkpoint_path.exists():
+                        raise FileNotFoundError(
+                            f'Checkpoint verrouille introuvable pour evaluation: {checkpoint_path}'
+                        )
+                    candidate_checkpoint = checkpoint_path
+                if candidate_checkpoint is None and locked_model_id_value:
+                    registry_row = _load_model_registry_record(locked_model_id_value)
+                    registry_checkpoint = Path(str(registry_row.get('checkpoint_path', '')).strip())
+                    if registry_checkpoint.exists():
+                        candidate_checkpoint = registry_checkpoint
+                    else:
+                        fallback_checkpoint = Path(DRIVE_ROOT) / 'models' / 'final' / f'{locked_model_id_value}.pt'
+                        if fallback_checkpoint.exists():
+                            candidate_checkpoint = fallback_checkpoint
+                if candidate_checkpoint is None:
+                    raise ValueError(
+                        f'Impossible de resoudre le checkpoint verrouille pour model_id={locked_model_id_value or "<empty>"}'
+                    )
+
                 try:
-                    checkpoint = torch.load(checkpoint_path, map_location='cpu')
-                except Exception:
-                    continue
+                    checkpoint = torch.load(candidate_checkpoint, map_location='cpu')
+                except Exception as exc:
+                    raise RuntimeError(
+                        f'Lecture checkpoint verrouille impossible: {candidate_checkpoint} | cause={type(exc).__name__}: {exc}'
+                    ) from exc
                 model_config = checkpoint.get('model_config', {})
                 model_input_dim = int(model_config.get('input_dim', 0) or 0)
-                if model_input_dim == dataset_input_dim:
-                    selected = {
-                        'model_id': str(item.get('model_id', '')),
-                        'checkpoint_path': str(checkpoint_path),
-                        'input_dim': model_input_dim,
-                    }
-                    break
+                if model_input_dim != dataset_input_dim:
+                    raise ValueError(
+                        f'Checkpoint verrouille incompatible avec le dataset eval '
+                        f'(model_input_dim={model_input_dim}, dataset_input_dim={dataset_input_dim}, '
+                        f'checkpoint={candidate_checkpoint}, dataset_id={dataset_id}).'
+                    )
+                selected = {
+                    'model_id': locked_model_id_value or str(candidate_checkpoint.stem),
+                    'checkpoint_path': str(candidate_checkpoint),
+                    'input_dim': model_input_dim,
+                }
+            else:
+                models_root = Path(DRIVE_ROOT) / 'models'
+                model_registry_path = models_root / 'model_registry.json'
+                model_registry = json.loads(model_registry_path.read_text(encoding='utf-8')) if model_registry_path.exists() else {'models': []}
+                candidates = sorted(model_registry.get('models', []), key=lambda item: float(item.get('sort_ts', 0.0)), reverse=True)
+
+                for item in candidates:
+                    checkpoint_path = Path(str(item.get('checkpoint_path', '')).strip())
+                    if not checkpoint_path.exists():
+                        continue
+                    try:
+                        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+                    except Exception:
+                        continue
+                    model_config = checkpoint.get('model_config', {})
+                    model_input_dim = int(model_config.get('input_dim', 0) or 0)
+                    if model_input_dim == dataset_input_dim:
+                        selected = {
+                            'model_id': str(item.get('model_id', '')),
+                            'checkpoint_path': str(checkpoint_path),
+                            'input_dim': model_input_dim,
+                        }
+                        break
 
             if selected is None:
                 raise ValueError(
@@ -2730,7 +2810,7 @@ cells = [
 
             eval_block['dataset_selection_mode'] = 'configured'
             eval_block['dataset_id'] = dataset_id
-            eval_block['test_dataset_path'] = str(test_npz_path)
+            eval_block['test_dataset_path'] = str(eval_npz_path)
             eval_block['model_id'] = selected['model_id']
             eval_block['checkpoint_path'] = selected['checkpoint_path']
             eval_cfg['evaluation'] = eval_block
@@ -2740,6 +2820,7 @@ cells = [
             print('Evaluation runtime config prete')
             print('  dataset_id          =', dataset_id)
             print('  dataset_input_dim   =', dataset_input_dim)
+            print('  eval_dataset_path   =', eval_npz_path)
             print('  selected_model_id   =', selected['model_id'])
             print('  selected_checkpoint =', selected['checkpoint_path'])
             print('  runtime config      =', runtime_eval_cfg_path)
@@ -2795,6 +2876,31 @@ cells = [
                 return {}, None
             payload = _load_json_dict(job_dir / filename, default={})
             return payload, job_dir
+
+        def _resolve_train_artifacts(job_id: str) -> tuple[str, str, str]:
+            train_summary, train_job_dir = _read_job_summary(job_id, 'training_summary.json')
+            dataset_id = str(train_summary.get('dataset_id', '')).strip()
+            model_id = str(train_summary.get('model_id', '')).strip()
+            checkpoint_path = str(train_summary.get('final_model_path', '')).strip()
+            checkpoint = Path(checkpoint_path) if checkpoint_path else None
+            if (checkpoint is None or not checkpoint.exists()) and model_id:
+                fallback = Path(DRIVE_ROOT) / 'models' / 'final' / f'{model_id}.pt'
+                if fallback.exists():
+                    checkpoint = fallback
+            if not dataset_id:
+                raise ValueError(
+                    f'dataset_id absent dans training_summary pour job_id={job_id} (job_dir={train_job_dir})'
+                )
+            if not model_id:
+                raise ValueError(
+                    f'model_id absent dans training_summary pour job_id={job_id} (job_dir={train_job_dir})'
+                )
+            if checkpoint is None or not checkpoint.exists():
+                raise FileNotFoundError(
+                    f'checkpoint introuvable pour job_id={job_id} | model_id={model_id} | '
+                    f'checkpoint(train_summary)={checkpoint_path}'
+                )
+            return dataset_id, model_id, str(checkpoint)
 
         def _load_model_registry_record(model_id: str) -> dict:
             registry_path = Path(DRIVE_ROOT) / 'models' / 'model_registry.json'
@@ -2907,7 +3013,13 @@ cells = [
         )
         subprocess.run(['/bin/bash', '-lc', train_cmd], check=True)
 
-        runtime_eval_cfg_path, selected_model_id = _prepare_eval_runtime_config()
+        train_dataset_id, train_model_id, train_checkpoint_path = _resolve_train_artifacts(TRAIN_CONTINUE_JOB_ID)
+        print('Evaluation lock        = dataset_id', train_dataset_id, '| model_id', train_model_id)
+        runtime_eval_cfg_path, selected_model_id = _prepare_eval_runtime_config(
+            locked_dataset_id=train_dataset_id,
+            locked_model_id=train_model_id,
+            locked_checkpoint_path=train_checkpoint_path,
+        )
         eval_job_id = f'{EVALUATION_JOB_ID}_continue'
         eval_cmd = (
             f'cd {shlex.quote(WORKTREE)} && '
@@ -2941,7 +3053,13 @@ cells = [
         )
         subprocess.run(['/bin/bash', '-lc', train_cmd], check=True)
 
-        runtime_eval_cfg_path, selected_model_id = _prepare_eval_runtime_config()
+        train_dataset_id, train_model_id, train_checkpoint_path = _resolve_train_artifacts(TRAIN_SCRATCH_JOB_ID)
+        print('Evaluation lock        = dataset_id', train_dataset_id, '| model_id', train_model_id)
+        runtime_eval_cfg_path, selected_model_id = _prepare_eval_runtime_config(
+            locked_dataset_id=train_dataset_id,
+            locked_model_id=train_model_id,
+            locked_checkpoint_path=train_checkpoint_path,
+        )
         eval_job_id = f'{EVALUATION_JOB_ID}_scratch'
         eval_cmd = (
             f'cd {shlex.quote(WORKTREE)} && '
