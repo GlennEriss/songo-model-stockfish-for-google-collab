@@ -1425,7 +1425,7 @@ cells = [
     md(
         """
         Vue par source:
-        - `5bis.A` = Firestore (source de verite globale)
+        - `5bis.A` = Manifest pipeline (Drive prioritaire, Firestore fallback)
         - `5bis.B` = Drive local worker (etat local des jobs)
         - `5bis.C` = Redis cache (et ecart vs Firestore)
         - `5bis.D` = Logs worker (fichiers Drive)
@@ -2103,19 +2103,40 @@ cells = [
 
         LOG_TAIL_LINES = 40
         logs_dir = Path(DRIVE_ROOT) / 'logs' / 'pipeline'
-        manifest = _load_pipeline_manifest_payload(WORKER_TAG)
+        local_manifest_path = Path(DRIVE_ROOT) / PIPELINE_MANIFEST_PATH
+        manifest = {}
+        manifest_source = 'none'
+
+        if local_manifest_path.exists():
+            try:
+                manifest = json.loads(local_manifest_path.read_text(encoding='utf-8'))
+                if isinstance(manifest, dict) and manifest:
+                    manifest_source = f'drive:{local_manifest_path}'
+            except Exception:
+                manifest = {}
+
         if not manifest:
-            print('Manifest Firestore introuvable:', f'{FIRESTORE_PIPELINE_MANIFESTS_COLLECTION}/{WORKER_TAG}')
-        else:
-            for label, key in [('dataset-generate', 'generate_log_path'), ('dataset-build', 'build_log_path')]:
-                log_path = Path(str(manifest.get(key, '')))
-                print(f'\\n===== {label} | {log_path} =====')
-                if not log_path.exists():
-                    print('log introuvable')
-                    continue
-                lines = log_path.read_text(encoding='utf-8', errors='replace').splitlines()
-                for line in lines[-LOG_TAIL_LINES:]:
-                    print(line)
+            try:
+                manifest = _load_pipeline_manifest_payload(WORKER_TAG)
+                if isinstance(manifest, dict) and manifest:
+                    manifest_source = f'firestore:{FIRESTORE_PIPELINE_MANIFESTS_COLLECTION}/{WORKER_TAG}'
+            except Exception:
+                manifest = {}
+
+        print('manifest source =', manifest_source)
+        for label, key, fallback in [
+            ('dataset-generate', 'generate_log_path', logs_dir / f'{DATASET_GENERATE_JOB_ID}.log'),
+            ('dataset-build', 'build_log_path', logs_dir / f'{DATASET_BUILD_JOB_ID}.log'),
+        ]:
+            manifest_path = Path(str(manifest.get(key, '')).strip()) if manifest else Path('')
+            log_path = manifest_path if str(manifest_path).strip() else fallback
+            print(f'\\n===== {label} | {log_path} =====')
+            if not log_path.exists():
+                print('log introuvable')
+                continue
+            lines = log_path.read_text(encoding='utf-8', errors='replace').splitlines()
+            for line in lines[-LOG_TAIL_LINES:]:
+                print(line)
         """
     ),
     code(
@@ -2127,9 +2148,22 @@ cells = [
         logs_dir = Path(DRIVE_ROOT) / 'logs' / 'pipeline'
         fallback_path = logs_dir / f'{DATASET_BUILD_JOB_ID}.log'
 
-        manifest = _load_pipeline_manifest_payload(WORKER_TAG)
+        local_manifest_path = Path(DRIVE_ROOT) / PIPELINE_MANIFEST_PATH
+        manifest = {}
+        if local_manifest_path.exists():
+            try:
+                manifest = json.loads(local_manifest_path.read_text(encoding='utf-8'))
+            except Exception:
+                manifest = {}
+        if not manifest:
+            try:
+                manifest = _load_pipeline_manifest_payload(WORKER_TAG)
+            except Exception:
+                manifest = {}
+
         if manifest:
-            log_path = Path(str(manifest.get('build_log_path', fallback_path)))
+            manifest_path = Path(str(manifest.get('build_log_path', '')).strip())
+            log_path = manifest_path if str(manifest_path).strip() else fallback_path
         else:
             log_path = fallback_path
 
