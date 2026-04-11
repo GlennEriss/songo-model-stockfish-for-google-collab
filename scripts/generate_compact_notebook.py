@@ -2537,6 +2537,8 @@ cells = [
                 'draws': 0,
                 'losses': 0,
                 'played': 0,
+                'max_points': 0,
+                'score_rate': 0.0,
             }
             for m in models
         }
@@ -2572,6 +2574,8 @@ cells = [
 
             table[left]['points'] += (wins_left * 3) + draws
             table[right]['points'] += (wins_right * 3) + draws
+            table[left]['max_points'] += TOURNAMENT_GAMES_PER_PAIR * 3
+            table[right]['max_points'] += TOURNAMENT_GAMES_PER_PAIR * 3
 
             pair_summaries.append(
                 {
@@ -2585,7 +2589,15 @@ cells = [
                     'points_b': (wins_right * 3) + draws,
                 }
             )
-            print(f'pair done: {left} vs {right} | W={wins_left}-{wins_right} D={draws}')
+            print(
+                f"pair done: {left} vs {right} | "
+                f"W={wins_left}-{wins_right} D={draws} | "
+                f"score={((wins_left * 3) + draws)}-{((wins_right * 3) + draws)}"
+            )
+
+        for row in table.values():
+            max_pts = int(row['max_points'])
+            row['score_rate'] = (float(row['points']) / float(max_pts)) if max_pts > 0 else 0.0
 
         ranking = sorted(
             table.values(),
@@ -2600,11 +2612,11 @@ cells = [
         )
 
         print('\\n=== Classement Tournoi (models uniquement) ===')
-        print(f"{'Rk':>2} | {'Model':<40} | {'Pts':>4} | {'W':>4} | {'D':>4} | {'L':>4} | {'G':>4}")
-        print('-' * 78)
+        print(f"{'Rk':>2} | {'Model':<40} | {'Pts':>4} | {'Score':>9} | {'W':>4} | {'D':>4} | {'L':>4} | {'G':>4}")
+        print('-' * 92)
         for idx, row in enumerate(ranking, start=1):
             print(
-                f\"{idx:>2} | {row['model_id']:<40} | {row['points']:>4} | {row['wins']:>4} | {row['draws']:>4} | {row['losses']:>4} | {row['played']:>4}\"
+                f\"{idx:>2} | {row['model_id']:<40} | {row['points']:>4} | {row['points']:>4}/{row['max_points']:<4} | {row['wins']:>4} | {row['draws']:>4} | {row['losses']:>4} | {row['played']:>4}\"
             )
 
         if TOURNAMENT_WRITE_REPORT:
