@@ -56,6 +56,7 @@ La ligne technique retenue est:
 - `docs/ENGINE_V1_DESIGN.md` : design concret de la premiere version du moteur
 - `docs/SYSTEM_ARCHITECTURE.md` : architecture globale, logs, erreurs, reprise
 - `docs/MODEL_STRATEGY.md` : strategie modele et decision from scratch
+- `docs/EXPERT_ITERATION_ALPHAZERO_ARCHITECTURE.md` : architecture cible d'amelioration continue (policy+value+PUCT+self-play+retrain)
 - `docs/DATASET_AND_BENCHMARK_ARCHITECTURE.md` : pipeline dataset et benchmatch
 - `docs/COLAB_OPERATIONS.md` : operations Colab, Drive, GitHub, reprise
 - `docs/FIRESTORE_ARCHITECTURE_20M.md` : architecture multi-Colab quota-first et plan P0/P1/P2
@@ -155,6 +156,8 @@ La gestion dataset supporte maintenant plusieurs modes:
 
 - `dataset-generate --generation-mode benchmatch`
   - produit ou etend un corpus source fiable a partir de matchs
+- `dataset-generate --generation-mode self_play_puct`
+  - produit un corpus Expert Iteration via auto-jeu modele+PUCT avec `policy_target` (visites) et `value_target` (issue finale)
 - `dataset-generate --generation-mode clone_existing`
   - duplique une source existante pour creer une nouvelle base versionnee
 - `dataset-generate --generation-mode derive_existing`
@@ -165,6 +168,10 @@ La gestion dataset supporte maintenant plusieurs modes:
   - fusionne plusieurs sources existantes en une nouvelle grande source dedupliquee
 - `dataset-build --source-dataset-id ...`
   - permet de choisir explicitement la source a enrichir avec le teacher
+- `dataset-build --build-mode source_prelabeled`
+  - consomme directement des samples deja labels (`policy_target` + `value_target`) sans relabel teacher
+- `dataset-build --build-mode auto`
+  - bascule automatiquement sur `source_prelabeled` pour une source `self_play_puct`
 - `dataset-build --dataset-id-override ...`
   - permet de versionner une nouvelle sortie sans modifier le YAML
 - `dataset-generate --target-samples ...`

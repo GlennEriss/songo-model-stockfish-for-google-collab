@@ -30,6 +30,11 @@ Si tu veux comprendre rapidement le projet, lis dans cet ordre:
   - ameliorations deja faites
   - prochaines evolutions priorisees
 
+- `EXPERT_ITERATION_ALPHAZERO_ARCHITECTURE.md`
+  - architecture cible d'amelioration continue du modele
+  - boucle `policy + value + PUCT + self-play + retrain`
+  - plan d'integration multi-Colab
+
 - `STOCKFISH_PLAN.md`
   - trajectoire vers un moteur de type Stockfish
   - versions successives
@@ -143,6 +148,7 @@ Lis:
 Lis:
 
 - `MODEL_STRATEGY.md`
+- `EXPERT_ITERATION_ALPHAZERO_ARCHITECTURE.md`
 - `MODEL_V1_SPEC.md`
 - `DATASET_V1_SPEC.md`
 

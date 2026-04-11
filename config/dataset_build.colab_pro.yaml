@@ -12,6 +12,7 @@ job:
   save_every_minutes: 5
 
 dataset_build:
+  build_mode: auto  # auto | teacher_label | source_prelabeled
   input_sampled_dir: data/sampled_colab_pro
   dataset_id: dataset_v1_colab_pro
   output_dir: data/datasets/dataset_v1_colab_pro

@@ -118,3 +118,15 @@ La ligne officielle du projet est:
 - reseau neuronal custom V2
 - architecture `policy + value`
 - pas de fine-tuning externe comme base principale
+
+## 11. Evolution cible
+
+La trajectoire d'amelioration continue retenue est documentee dans:
+
+- `EXPERT_ITERATION_ALPHAZERO_ARCHITECTURE.md`
+
+Cette trajectoire formalise l'integration de:
+
+- `PUCT/MCTS` guide par reseau
+- `self-play`
+- reentrainement iteratif sur cibles de recherche

@@ -17,6 +17,7 @@ job:
   auto_rollover_completed_job: true
 
 dataset_build:
+  build_mode: auto  # auto | teacher_label | source_prelabeled
   source_dataset_id: sampled_full_matrix_colab_pro
   input_sampled_dir: data/sampled_full_matrix_colab_pro
   dataset_id: dataset_v2_full_matrix_colab_pro_insane_1m

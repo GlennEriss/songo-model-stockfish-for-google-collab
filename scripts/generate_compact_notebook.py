@@ -157,6 +157,21 @@ cells = [
         BENCHMATCH_CYCLE_MATCHUPS_UNTIL_TARGET = True
         BENCHMATCH_MAX_MATCHUP_CYCLES = 0  # 0 = illimite
         BENCHMATCH_MODEL_AGENT_DEVICE = 'cpu'
+        DATASET_GENERATE_SOURCE_MODE = 'benchmatch'  # 'benchmatch' ou 'self_play_puct'
+        SELF_PLAY_MODEL = 'auto_best'
+        SELF_PLAY_MODEL_DEVICE = 'cpu'
+        SELF_PLAY_GAMES_PER_CYCLE = 400
+        SELF_PLAY_CYCLE_UNTIL_TARGET = True
+        SELF_PLAY_MAX_MATCHUP_CYCLES = 0  # 0 = illimite
+        SELF_PLAY_NUM_SIMULATIONS = 96
+        SELF_PLAY_C_PUCT = 1.5
+        SELF_PLAY_TEMPERATURE = 1.0
+        SELF_PLAY_TEMPERATURE_END = 0.1
+        SELF_PLAY_TEMPERATURE_DROP_PLY = 12
+        SELF_PLAY_ROOT_DIRICHLET_ALPHA = 0.3
+        SELF_PLAY_ROOT_DIRICHLET_EPSILON = 0.25
+        SELF_PLAY_DETERMINISTIC = False
+        DATASET_BUILD_MODE_OVERRIDE = ''  # '', 'auto', 'teacher_label', 'source_prelabeled'
         LOW_QUOTA_PROFILE = True
         LOW_QUOTA_GLOBAL_PROGRESS_FLUSH_EVERY_N_GAMES = 200
         LOW_QUOTA_GLOBAL_TARGET_POLL_INTERVAL_SECONDS = 60.0
@@ -786,6 +801,11 @@ cells = [
         print('PIPELINE_MANIFEST_PATH  =', PIPELINE_MANIFEST_PATH)
         print('TARGET_SAMPLES          =', TARGET_SAMPLES)
         print('TARGET_LABELED_SAMPLES  =', TARGET_LABELED_SAMPLES)
+        print('DATASET_GENERATE_SOURCE_MODE =', DATASET_GENERATE_SOURCE_MODE)
+        print('SELF_PLAY_MODEL         =', SELF_PLAY_MODEL)
+        print('SELF_PLAY_GAMES_PER_CYCLE =', SELF_PLAY_GAMES_PER_CYCLE)
+        print('SELF_PLAY_NUM_SIMULATIONS =', SELF_PLAY_NUM_SIMULATIONS)
+        print('DATASET_BUILD_MODE_OVERRIDE =', DATASET_BUILD_MODE_OVERRIDE or '<auto>')
         print('LOW_QUOTA_PROFILE       =', LOW_QUOTA_PROFILE)
         print('SOURCE_POLL_INTERVAL_SECONDS =', SOURCE_POLL_INTERVAL_SECONDS)
         print('DATASET_BUILD_EXPORT_PARTIAL_EVERY_N_FILES =', DATASET_BUILD_EXPORT_PARTIAL_EVERY_N_FILES)
@@ -1172,18 +1192,37 @@ cells = [
         else:
             output_sampled_dir = f'data/{DATASET_SOURCE_ID}'
             output_raw_dir = f'data/raw_{DATASET_SOURCE_ID}'
-        generate_block['source_mode'] = 'benchmatch'
+        generate_source_mode = str(DATASET_GENERATE_SOURCE_MODE).strip().lower() or 'benchmatch'
+        if generate_source_mode not in {'benchmatch', 'self_play_puct'}:
+            raise ValueError(f"DATASET_GENERATE_SOURCE_MODE non supporte: {generate_source_mode}")
+        generate_block['source_mode'] = generate_source_mode
         generate_block['dataset_source_id'] = DATASET_SOURCE_ID
         generate_block['target_samples'] = int(TARGET_SAMPLES)
         generate_block['output_sampled_dir'] = output_sampled_dir
         generate_block['output_raw_dir'] = output_raw_dir
         generate_block['workers'] = int(DATASET_GENERATE_WORKERS)
         generate_block['max_pending_futures'] = int(DATASET_GENERATE_MAX_PENDING_FUTURES)
-        generate_block['games'] = int(BENCHMATCH_GAMES)
-        generate_block['matchups'] = matchups
-        generate_block['cycle_matchups_until_target'] = bool(BENCHMATCH_CYCLE_MATCHUPS_UNTIL_TARGET)
-        generate_block['max_matchup_cycles'] = int(BENCHMATCH_MAX_MATCHUP_CYCLES)
         generate_block['model_agent_device'] = str(BENCHMATCH_MODEL_AGENT_DEVICE)
+        if generate_source_mode == 'benchmatch':
+            generate_block['games'] = int(BENCHMATCH_GAMES)
+            generate_block['matchups'] = matchups
+            generate_block['cycle_matchups_until_target'] = bool(BENCHMATCH_CYCLE_MATCHUPS_UNTIL_TARGET)
+            generate_block['max_matchup_cycles'] = int(BENCHMATCH_MAX_MATCHUP_CYCLES)
+        else:
+            generate_block.pop('matchups', None)
+            generate_block['games'] = int(SELF_PLAY_GAMES_PER_CYCLE)
+            generate_block['cycle_matchups_until_target'] = bool(SELF_PLAY_CYCLE_UNTIL_TARGET)
+            generate_block['max_matchup_cycles'] = int(SELF_PLAY_MAX_MATCHUP_CYCLES)
+            generate_block['self_play_model'] = str(SELF_PLAY_MODEL)
+            generate_block['self_play_model_device'] = str(SELF_PLAY_MODEL_DEVICE)
+            generate_block['self_play_num_simulations'] = int(SELF_PLAY_NUM_SIMULATIONS)
+            generate_block['self_play_c_puct'] = float(SELF_PLAY_C_PUCT)
+            generate_block['self_play_temperature'] = float(SELF_PLAY_TEMPERATURE)
+            generate_block['self_play_temperature_end'] = float(SELF_PLAY_TEMPERATURE_END)
+            generate_block['self_play_temperature_drop_ply'] = int(SELF_PLAY_TEMPERATURE_DROP_PLY)
+            generate_block['self_play_root_dirichlet_alpha'] = float(SELF_PLAY_ROOT_DIRICHLET_ALPHA)
+            generate_block['self_play_root_dirichlet_epsilon'] = float(SELF_PLAY_ROOT_DIRICHLET_EPSILON)
+            generate_block['self_play_deterministic'] = bool(SELF_PLAY_DETERMINISTIC)
         generate_block['global_target_enabled'] = bool(GLOBAL_TARGET_ENABLED)
         generate_block['global_target_id'] = str(GLOBAL_TARGET_ID)
         generate_block['global_target_samples'] = int(GLOBAL_TARGET_SAMPLES)
@@ -1222,6 +1261,14 @@ cells = [
         build_block['input_sampled_dir'] = f'data/{DATASET_SOURCE_ID}'
         build_block['dataset_id'] = DATASET_BUILD_ID
         build_block['target_labeled_samples'] = int(TARGET_LABELED_SAMPLES)
+        requested_build_mode = str(DATASET_BUILD_MODE_OVERRIDE).strip().lower()
+        if requested_build_mode:
+            if requested_build_mode not in {'auto', 'teacher_label', 'source_prelabeled'}:
+                raise ValueError(f'DATASET_BUILD_MODE_OVERRIDE non supporte: {requested_build_mode}')
+            build_mode = requested_build_mode
+        else:
+            build_mode = 'source_prelabeled' if generate_source_mode == 'self_play_puct' else 'teacher_label'
+        build_block['build_mode'] = build_mode
         build_block['follow_source_updates'] = True
         build_block['source_poll_interval_seconds'] = float(SOURCE_POLL_INTERVAL_SECONDS)
         build_block['dedupe_sample_ids'] = bool(DATASET_BUILD_DEDUPE_SAMPLE_IDS)
@@ -1381,6 +1428,8 @@ cells = [
         print('EVALUATION_20M_CONFIG_ACTIVE     =', EVALUATION_20M_CONFIG_ACTIVE)
         print('EVALUATION_CONFIG_ACTIVE       =', EVALUATION_CONFIG_ACTIVE)
         print('BENCHMARK_CONFIG_ACTIVE        =', BENCHMARK_CONFIG_ACTIVE)
+        print('generate_source_mode           =', generate_source_mode)
+        print('dataset_build_mode             =', build_mode)
         print('output_raw_dir                 =', output_raw_dir)
         print('output_sampled_dir             =', output_sampled_dir)
         print('model_scan_dir                 =', model_scan_dir)

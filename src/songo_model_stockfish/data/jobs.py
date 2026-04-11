@@ -4,6 +4,7 @@ import concurrent.futures
 import functools
 import hashlib
 import json
+import math
 import multiprocessing
 import os
 import shutil
@@ -25,7 +26,7 @@ from songo_model_stockfish.ops.io_utils import (
 from songo_model_stockfish.ops.job import JobContext
 from songo_model_stockfish.ops.logging import utc_now_iso
 from songo_model_stockfish.ops.model_registry import latest_model_record, load_registry, promoted_best_metadata
-from songo_model_stockfish.training.features import build_runtime_tactical_analysis, encode_model_features
+from songo_model_stockfish.training.features import adapt_feature_dim, build_runtime_tactical_analysis, encode_model_features
 
 
 def _slugify_matchup(matchup_spec: str) -> str:
@@ -1937,6 +1938,7 @@ def _export_built_dataset_snapshot(
     labeled_samples_total: int,
     target_labeled_samples: int,
     build_status: str,
+    build_mode: str,
     dedupe_sample_ids: bool,
 ) -> tuple[dict[str, dict[str, int]], int, int]:
     game_files = [relative_name for relative_name in sampled_relative_names if relative_name in completed_files]
@@ -2039,7 +2041,7 @@ def _export_built_dataset_snapshot(
         split_summary=split_summary,
         labeled_samples=labeled_samples_total,
         target_labeled_samples=target_labeled_samples,
-        build_mode="teacher_label",
+        build_mode=str(build_mode).strip() or "teacher_label",
         parent_dataset_ids=[],
         build_status=build_status,
         input_dim=exported_input_dim,
@@ -2750,6 +2752,519 @@ def _build_external_agent(spec: str, *, models_root: Path | None = None, device:
     return _build_external_agent_cached(normalized_spec, str(resolved_models_root), resolved_device)
 
 
+def _state_signature_for_search(state: Any) -> tuple[Any, ...]:
+    raw_state = songo_ai_game.to_raw_state(state)
+    scores = raw_state.get("scores", {})
+    return (
+        tuple(int(value) for value in raw_state.get("board", [])),
+        str(raw_state.get("player_to_move", "")),
+        int(scores.get("south", 0)),
+        int(scores.get("north", 0)),
+        bool(raw_state.get("is_terminal", False)),
+    )
+
+
+def _terminal_outcome_for_player(state: Any, *, player: int) -> float:
+    winner = songo_ai_game.winner(state)
+    if winner is not None:
+        return 1.0 if int(winner) == int(player) else -1.0
+    south, north = songo_ai_game.scores(state)
+    if south == north:
+        return 0.0
+    if int(player) == 0:
+        return 1.0 if south > north else -1.0
+    return 1.0 if north > south else -1.0
+
+
+def _normalize_distribution_for_legal_moves(
+    legal_moves: list[int],
+    distribution: dict[int | str, Any] | None,
+) -> dict[int, float]:
+    if not legal_moves:
+        return {}
+    normalized: dict[int, float] = {}
+    source = distribution if isinstance(distribution, dict) else {}
+    for move in legal_moves:
+        raw = source.get(move, source.get(str(move), 0.0))
+        try:
+            value = float(raw)
+        except Exception:
+            value = 0.0
+        normalized[int(move)] = max(0.0, value)
+    total = float(sum(normalized.values()))
+    if total <= 0.0:
+        uniform = 1.0 / float(len(legal_moves))
+        return {int(move): uniform for move in legal_moves}
+    return {int(move): float(value / total) for move, value in normalized.items()}
+
+
+def _sample_move_from_distribution(
+    distribution: dict[int, float],
+    *,
+    rng: np.random.Generator,
+    deterministic: bool,
+) -> int:
+    if not distribution:
+        raise ValueError("Distribution vide pour la selection de coup.")
+    ordered = sorted(distribution.items(), key=lambda item: item[0])
+    moves = [int(move) for move, _prob in ordered]
+    probs = np.asarray([max(0.0, float(prob)) for _move, prob in ordered], dtype=np.float64)
+    total = float(np.sum(probs))
+    if not np.isfinite(total) or total <= 0.0:
+        return int(moves[0])
+    probs = probs / total
+    if deterministic:
+        return int(moves[int(np.argmax(probs))])
+    sampled_index = int(rng.choice(len(moves), p=probs))
+    return int(moves[sampled_index])
+
+
+class _SelfPlayTreeNode:
+    __slots__ = (
+        "state",
+        "player_to_move",
+        "legal_moves",
+        "is_terminal",
+        "expanded",
+        "priors",
+        "children",
+        "edge_visits",
+        "edge_value_sums",
+    )
+
+    def __init__(self, state: Any) -> None:
+        self.state = state
+        self.player_to_move = int(songo_ai_game.current_player(state))
+        self.legal_moves = list(songo_ai_game.legal_moves(state))
+        self.is_terminal = bool(songo_ai_game.is_terminal(state)) or not self.legal_moves
+        self.expanded = False
+        self.priors: dict[int, float] = {}
+        self.children: dict[int, _SelfPlayTreeNode] = {}
+        self.edge_visits: dict[int, int] = {int(move): 0 for move in self.legal_moves}
+        self.edge_value_sums: dict[int, float] = {int(move): 0.0 for move in self.legal_moves}
+
+
+class _SelfPlayPolicyValueModel:
+    def __init__(self, checkpoint_path: str, *, model_id: str, device: str = "cpu") -> None:
+        import torch
+        from songo_model_stockfish.training.model import PolicyValueMLP
+
+        self._torch = torch
+        self._checkpoint_path = Path(checkpoint_path)
+        self._model_id = str(model_id).strip() or self._checkpoint_path.stem
+        if not self._checkpoint_path.exists():
+            raise FileNotFoundError(f"Checkpoint self-play introuvable: {self._checkpoint_path}")
+        resolved_device = str(device).strip().lower() or "cpu"
+        self._device = torch.device(resolved_device if (resolved_device == "cpu" or torch.cuda.is_available()) else "cpu")
+        checkpoint = torch.load(self._checkpoint_path, map_location=self._device)
+        model_config = checkpoint.get("model_config", {})
+        self._input_dim = int(model_config.get("input_dim", 17))
+        self._model = PolicyValueMLP(
+            input_dim=self._input_dim,
+            hidden_sizes=list(model_config.get("hidden_sizes", [256, 256, 128])),
+            policy_dim=int(model_config.get("policy_dim", 7)),
+            use_layer_norm=bool(model_config.get("use_layer_norm", False)),
+            dropout=float(model_config.get("dropout", 0.0)),
+            residual_connections=bool(model_config.get("residual_connections", False)),
+        )
+        self._model.load_state_dict(checkpoint["model_state"])
+        self._model.to(self._device)
+        self._model.eval()
+        self._inference_cache: dict[tuple[Any, ...], tuple[dict[int, float], float]] = {}
+        self._cache_max_entries = 50_000
+
+    @property
+    def model_id(self) -> str:
+        return self._model_id
+
+    def infer(self, state: Any) -> tuple[dict[int, float], float]:
+        legal_moves = list(songo_ai_game.legal_moves(state))
+        if not legal_moves:
+            player = int(songo_ai_game.current_player(state))
+            return {}, _terminal_outcome_for_player(state, player=player)
+        signature = _state_signature_for_search(state)
+        cached = self._inference_cache.get(signature)
+        if cached is not None:
+            return cached
+
+        raw_state = songo_ai_game.to_raw_state(state)
+        features, legal_mask = encode_model_features(raw_state, legal_moves, tactical_analysis=None)
+        features = adapt_feature_dim(features, self._input_dim)
+
+        x = self._torch.from_numpy(features).unsqueeze(0).to(self._device)
+        mask = self._torch.from_numpy(legal_mask).unsqueeze(0).to(self._device)
+        with self._torch.no_grad():
+            policy_logits, value = self._model(x)
+            mask_value = self._torch.finfo(policy_logits.dtype).min
+            masked_logits = policy_logits.masked_fill(mask <= 0, mask_value)
+            probs = self._torch.softmax(masked_logits, dim=1).squeeze(0).detach().cpu().numpy()
+            value_estimate = float(value.item())
+
+        priors = {int(move): float(max(0.0, probs[int(move) - 1])) for move in legal_moves}
+        priors = _normalize_distribution_for_legal_moves(legal_moves, priors)
+        result = (priors, value_estimate)
+        if len(self._inference_cache) >= self._cache_max_entries:
+            self._inference_cache.clear()
+        self._inference_cache[signature] = result
+        return result
+
+
+@functools.lru_cache(maxsize=8)
+def _load_self_play_model_cached(
+    checkpoint_path: str,
+    model_id: str,
+    device: str,
+) -> _SelfPlayPolicyValueModel:
+    return _SelfPlayPolicyValueModel(
+        checkpoint_path,
+        model_id=model_id,
+        device=device,
+    )
+
+
+def _expand_self_play_node(
+    node: _SelfPlayTreeNode,
+    *,
+    model: _SelfPlayPolicyValueModel,
+) -> float:
+    if node.expanded:
+        if node.is_terminal:
+            return _terminal_outcome_for_player(node.state, player=node.player_to_move)
+        priors, value_estimate = model.infer(node.state)
+        node.priors = _normalize_distribution_for_legal_moves(node.legal_moves, priors)
+        return float(value_estimate)
+    node.expanded = True
+    if node.is_terminal:
+        return _terminal_outcome_for_player(node.state, player=node.player_to_move)
+    priors, value_estimate = model.infer(node.state)
+    node.priors = _normalize_distribution_for_legal_moves(node.legal_moves, priors)
+    return float(value_estimate)
+
+
+def _run_single_puct_simulation(
+    node: _SelfPlayTreeNode,
+    *,
+    model: _SelfPlayPolicyValueModel,
+    c_puct: float,
+    root_prior_override: dict[int, float] | None = None,
+    is_root: bool = False,
+) -> float:
+    if node.is_terminal:
+        return _terminal_outcome_for_player(node.state, player=node.player_to_move)
+    if not node.expanded:
+        return _expand_self_play_node(node, model=model)
+
+    total_visits = max(1, sum(int(node.edge_visits.get(move, 0)) for move in node.legal_moves))
+    best_move = int(node.legal_moves[0])
+    best_score = float("-inf")
+    for move in node.legal_moves:
+        move_int = int(move)
+        prior_source = root_prior_override if (is_root and root_prior_override is not None) else node.priors
+        prior = float(prior_source.get(move_int, node.priors.get(move_int, 0.0)))
+        visit_count = int(node.edge_visits.get(move_int, 0))
+        value_sum = float(node.edge_value_sums.get(move_int, 0.0))
+        q_value = (value_sum / visit_count) if visit_count > 0 else 0.0
+        exploration = float(c_puct) * prior * math.sqrt(float(total_visits)) / float(1 + visit_count)
+        score = q_value + exploration
+        if score > best_score:
+            best_score = score
+            best_move = move_int
+
+    child = node.children.get(best_move)
+    if child is None:
+        child_state = songo_ai_game.simulate_move(node.state, int(best_move))
+        child = _SelfPlayTreeNode(child_state)
+        node.children[int(best_move)] = child
+    child_value = _run_single_puct_simulation(
+        child,
+        model=model,
+        c_puct=c_puct,
+        root_prior_override=None,
+        is_root=False,
+    )
+    value_from_current_player = -float(child_value)
+    node.edge_visits[int(best_move)] = int(node.edge_visits.get(int(best_move), 0)) + 1
+    node.edge_value_sums[int(best_move)] = float(node.edge_value_sums.get(int(best_move), 0.0)) + value_from_current_player
+    return value_from_current_player
+
+
+def _visit_counts_to_policy_distribution(
+    legal_moves: list[int],
+    visit_counts: dict[int, int],
+    *,
+    temperature: float,
+) -> dict[int, float]:
+    if not legal_moves:
+        return {}
+    temp = float(temperature)
+    if temp <= 1e-6:
+        best_move = max(legal_moves, key=lambda move: int(visit_counts.get(int(move), 0)))
+        return {int(move): (1.0 if int(move) == int(best_move) else 0.0) for move in legal_moves}
+
+    exponent = 1.0 / max(1e-6, temp)
+    values = np.asarray(
+        [max(0.0, float(int(visit_counts.get(int(move), 0)))) ** exponent for move in legal_moves],
+        dtype=np.float64,
+    )
+    total = float(np.sum(values))
+    if not np.isfinite(total) or total <= 0.0:
+        uniform = 1.0 / float(len(legal_moves))
+        return {int(move): uniform for move in legal_moves}
+    probs = values / total
+    return {int(move): float(prob) for move, prob in zip(legal_moves, probs.tolist())}
+
+
+def _run_self_play_puct_search(
+    state: Any,
+    *,
+    model: _SelfPlayPolicyValueModel,
+    rng: np.random.Generator,
+    num_simulations: int,
+    c_puct: float,
+    root_dirichlet_alpha: float,
+    root_dirichlet_epsilon: float,
+    temperature: float,
+    deterministic: bool,
+) -> dict[str, Any]:
+    root = _SelfPlayTreeNode(songo_ai_game.clone_state(state))
+    root_value = _expand_self_play_node(root, model=model)
+    if root.is_terminal or not root.legal_moves:
+        return {
+            "move": None,
+            "policy_distribution": {},
+            "visit_counts": {},
+            "root_value": float(root_value),
+        }
+
+    root_prior_override: dict[int, float] | None = None
+    epsilon = max(0.0, min(1.0, float(root_dirichlet_epsilon)))
+    if epsilon > 0.0 and len(root.legal_moves) > 1:
+        alpha = max(1e-3, float(root_dirichlet_alpha))
+        noise = rng.dirichlet([alpha] * len(root.legal_moves)).tolist()
+        root_prior_override = {}
+        for move, noise_value in zip(root.legal_moves, noise):
+            base_prior = float(root.priors.get(int(move), 0.0))
+            root_prior_override[int(move)] = ((1.0 - epsilon) * base_prior) + (epsilon * float(noise_value))
+        root_prior_override = _normalize_distribution_for_legal_moves(root.legal_moves, root_prior_override)
+
+    for _ in range(max(1, int(num_simulations))):
+        _run_single_puct_simulation(
+            root,
+            model=model,
+            c_puct=float(c_puct),
+            root_prior_override=root_prior_override,
+            is_root=True,
+        )
+
+    visit_counts = {int(move): int(root.edge_visits.get(int(move), 0)) for move in root.legal_moves}
+    if sum(visit_counts.values()) <= 0:
+        visit_counts = {int(move): 1 for move in root.legal_moves}
+    policy_distribution = _visit_counts_to_policy_distribution(
+        root.legal_moves,
+        visit_counts,
+        temperature=float(temperature),
+    )
+    move = _sample_move_from_distribution(policy_distribution, rng=rng, deterministic=bool(deterministic))
+    return {
+        "move": int(move),
+        "policy_distribution": policy_distribution,
+        "visit_counts": visit_counts,
+        "root_value": float(root_value),
+    }
+
+
+def _outcome_value_for_player_to_move(
+    *,
+    winner_index: int | None,
+    final_scores: tuple[int, int],
+    player_to_move_label: str,
+) -> float:
+    player = 0 if str(player_to_move_label).strip().lower() == "south" else 1
+    if winner_index is not None:
+        return 1.0 if int(winner_index) == int(player) else -1.0
+    south, north = final_scores
+    if south == north:
+        return 0.0
+    if int(player) == 0:
+        return 1.0 if south > north else -1.0
+    return 1.0 if north > south else -1.0
+
+
+def _play_and_sample_self_play_game(
+    *,
+    model: _SelfPlayPolicyValueModel,
+    matchup_id: str,
+    game_id: str,
+    seed: int,
+    sample_every_n_plies: int,
+    max_moves: int,
+    num_simulations: int,
+    c_puct: float,
+    temperature: float,
+    temperature_end: float,
+    temperature_drop_ply: int,
+    root_dirichlet_alpha: float,
+    root_dirichlet_epsilon: float,
+    deterministic: bool,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    state = songo_ai_game.create_state()
+    started_at = utc_now_iso()
+    moves: list[int] = []
+    samples: list[dict[str, Any]] = []
+    sample_index = 0
+    ply = 0
+    rng = np.random.default_rng(int(seed))
+    end_reason = "finished"
+
+    while not songo_ai_game.is_terminal(state) and ply < int(max_moves):
+        legal_moves = list(songo_ai_game.legal_moves(state))
+        if not legal_moves:
+            end_reason = "no_legal_moves_available"
+            break
+        active_temperature = float(temperature if ply < int(max(0, temperature_drop_ply)) else temperature_end)
+        search = _run_self_play_puct_search(
+            state,
+            model=model,
+            rng=rng,
+            num_simulations=int(num_simulations),
+            c_puct=float(c_puct),
+            root_dirichlet_alpha=float(root_dirichlet_alpha),
+            root_dirichlet_epsilon=float(root_dirichlet_epsilon),
+            temperature=active_temperature,
+            deterministic=bool(deterministic),
+        )
+        move = search.get("move")
+        if move is None or int(move) not in legal_moves:
+            move = int(legal_moves[0])
+
+        if ply % int(sample_every_n_plies) == 0:
+            sample_index += 1
+            sample = _sample_position(
+                game_id=game_id,
+                matchup_id=matchup_id,
+                sample_index=sample_index,
+                ply=ply,
+                seed=seed,
+                state=state,
+            )
+            policy_distribution = _normalize_distribution_for_legal_moves(
+                legal_moves,
+                search.get("policy_distribution", {}),
+            )
+            best_move = int(max(policy_distribution.items(), key=lambda item: item[1])[0])
+            sample["policy_target"] = {
+                "best_move": best_move,
+                "distribution": {str(key): float(value) for key, value in policy_distribution.items()},
+            }
+            sample["source_engine"] = "self_play_puct"
+            sample["source_level"] = model.model_id
+            sample["self_play_player_to_move"] = sample.get("player_to_move")
+            sample["self_play_search"] = {
+                "num_simulations": int(num_simulations),
+                "c_puct": float(c_puct),
+                "temperature": float(active_temperature),
+                "root_dirichlet_alpha": float(root_dirichlet_alpha),
+                "root_dirichlet_epsilon": float(root_dirichlet_epsilon),
+                "deterministic": bool(deterministic),
+                "visit_counts": {str(key): int(value) for key, value in dict(search.get("visit_counts", {})).items()},
+                "root_value": float(search.get("root_value", 0.0)),
+            }
+            samples.append(sample)
+
+        moves.append(int(move))
+        state = songo_ai_game.simulate_move(state, int(move))
+        ply += 1
+
+    winner_index = songo_ai_game.winner(state)
+    final_scores = songo_ai_game.scores(state)
+    for sample in samples:
+        player_label = str(sample.get("self_play_player_to_move", sample.get("player_to_move", "south")))
+        sample["value_target"] = float(
+            _outcome_value_for_player_to_move(
+                winner_index=winner_index,
+                final_scores=final_scores,
+                player_to_move_label=player_label,
+            )
+        )
+        sample.pop("self_play_player_to_move", None)
+
+    winner_label: str | None
+    if winner_index is None:
+        winner_label = None
+    else:
+        winner_label = "south" if int(winner_index) == 0 else "north"
+    raw_log = {
+        "game_id": game_id,
+        "matchup_id": matchup_id,
+        "seed": int(seed),
+        "starter": 0,
+        "player_a": f"model:{model.model_id}",
+        "player_b": f"model:{model.model_id}",
+        "winner": winner_label,
+        "winner_index": (None if winner_index is None else int(winner_index)),
+        "moves": moves,
+        "ply_count": int(ply),
+        "started_at": started_at,
+        "completed_at": utc_now_iso(),
+        "scores": [int(final_scores[0]), int(final_scores[1])],
+        "reason": "finished" if songo_ai_game.is_terminal(state) else (end_reason if end_reason != "finished" else f"max_moves_reached:{max_moves}"),
+        "self_play": {
+            "model_id": model.model_id,
+            "num_simulations": int(num_simulations),
+            "c_puct": float(c_puct),
+            "temperature": float(temperature),
+            "temperature_end": float(temperature_end),
+            "temperature_drop_ply": int(temperature_drop_ply),
+            "root_dirichlet_alpha": float(root_dirichlet_alpha),
+            "root_dirichlet_epsilon": float(root_dirichlet_epsilon),
+            "deterministic": bool(deterministic),
+        },
+    }
+    return raw_log, samples
+
+
+def _play_and_sample_self_play_game_from_checkpoint(
+    *,
+    checkpoint_path: str,
+    model_id: str,
+    model_device: str,
+    matchup_id: str,
+    game_id: str,
+    seed: int,
+    sample_every_n_plies: int,
+    max_moves: int,
+    num_simulations: int,
+    c_puct: float,
+    temperature: float,
+    temperature_end: float,
+    temperature_drop_ply: int,
+    root_dirichlet_alpha: float,
+    root_dirichlet_epsilon: float,
+    deterministic: bool,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    model = _load_self_play_model_cached(
+        str(checkpoint_path),
+        str(model_id),
+        str(model_device),
+    )
+    return _play_and_sample_self_play_game(
+        model=model,
+        matchup_id=matchup_id,
+        game_id=game_id,
+        seed=int(seed),
+        sample_every_n_plies=int(sample_every_n_plies),
+        max_moves=int(max_moves),
+        num_simulations=int(num_simulations),
+        c_puct=float(c_puct),
+        temperature=float(temperature),
+        temperature_end=float(temperature_end),
+        temperature_drop_ply=int(temperature_drop_ply),
+        root_dirichlet_alpha=float(root_dirichlet_alpha),
+        root_dirichlet_epsilon=float(root_dirichlet_epsilon),
+        deterministic=bool(deterministic),
+    )
+
+
 def _teacher_choose(state: Any, *, engine: str, level: str) -> tuple[int, dict[str, Any]]:
     if engine == "minimax":
         from songo_model_stockfish.reference_songo.levels import get_config
@@ -3182,6 +3697,102 @@ def _label_samples_from_file(
     return source_count, labeled_samples, skipped_terminal, skipped_no_legal
 
 
+def _prepare_prelabeled_sample(
+    sample: dict[str, Any],
+    *,
+    include_tactical_analysis: bool = True,
+) -> dict[str, Any]:
+    legal_moves = [int(move) for move in list(sample.get("legal_moves", []))]
+    if bool(sample.get("state", {}).get("is_terminal", False)):
+        raise ValueError(f"Cannot use terminal sample in source_prelabeled mode: {sample.get('sample_id', '<unknown>')}")
+    if not legal_moves:
+        raise ValueError(f"Cannot use sample without legal moves in source_prelabeled mode: {sample.get('sample_id', '<unknown>')}")
+
+    policy_target = sample.get("policy_target", {})
+    if not isinstance(policy_target, dict):
+        raise ValueError(f"Missing policy_target in source_prelabeled sample: {sample.get('sample_id', '<unknown>')}")
+    distribution = _normalize_distribution_for_legal_moves(legal_moves, policy_target.get("distribution", {}))
+    if not distribution:
+        raise ValueError(f"Invalid policy_target distribution in source_prelabeled sample: {sample.get('sample_id', '<unknown>')}")
+    best_move = _safe_int(policy_target.get("best_move", 0), 0)
+    if best_move not in legal_moves:
+        best_move = int(max(distribution.items(), key=lambda item: item[1])[0])
+
+    if "value_target" not in sample:
+        raise ValueError(f"Missing value_target in source_prelabeled sample: {sample.get('sample_id', '<unknown>')}")
+    value_target = float(sample.get("value_target", 0.0))
+    if not np.isfinite(value_target):
+        raise ValueError(f"Invalid value_target in source_prelabeled sample: {sample.get('sample_id', '<unknown>')}")
+    value_target = float(max(-1.0, min(1.0, value_target)))
+
+    prepared = dict(sample)
+    prepared["policy_target"] = {
+        "best_move": int(best_move),
+        "distribution": {str(move): float(prob) for move, prob in distribution.items()},
+    }
+    prepared["value_target"] = value_target
+
+    if include_tactical_analysis and not isinstance(prepared.get("tactical_analysis"), dict):
+        runtime_state = _raw_state_to_runtime_state(prepared["state"])
+        move_scores = {int(move): float(distribution.get(int(move), 0.0)) for move in legal_moves}
+        prepared["tactical_analysis"] = _build_tactical_analysis(
+            runtime_state,
+            legal_moves,
+            move_scores,
+            best_move=int(best_move),
+        )
+    return prepared
+
+
+def _prepare_prelabeled_samples_from_file(
+    sampled_file_path: str,
+    *,
+    include_tactical_analysis: bool = True,
+) -> tuple[int, list[dict[str, Any]], int, int, int]:
+    source_samples = list(_iter_jsonl(Path(sampled_file_path)))
+    source_count = len(source_samples)
+    prepared_samples: list[dict[str, Any]] = []
+    skipped_terminal = 0
+    skipped_no_legal = 0
+    skipped_invalid = 0
+    for sample in source_samples:
+        if bool(sample.get("state", {}).get("is_terminal", False)):
+            skipped_terminal += 1
+            continue
+        if not list(sample.get("legal_moves", [])):
+            skipped_no_legal += 1
+            continue
+        try:
+            prepared_samples.append(
+                _prepare_prelabeled_sample(
+                    sample,
+                    include_tactical_analysis=include_tactical_analysis,
+                )
+            )
+        except Exception:
+            skipped_invalid += 1
+            continue
+    return source_count, prepared_samples, skipped_terminal, skipped_no_legal, skipped_invalid
+
+
+def _detect_source_samples_are_prelabeled(sampled_file_path: Path, *, max_samples: int = 32) -> bool:
+    try:
+        for idx, sample in enumerate(_iter_jsonl(sampled_file_path)):
+            if idx >= int(max_samples):
+                break
+            if bool(sample.get("state", {}).get("is_terminal", False)):
+                continue
+            if not list(sample.get("legal_moves", [])):
+                continue
+            policy_target = sample.get("policy_target", {})
+            distribution = policy_target.get("distribution", {}) if isinstance(policy_target, dict) else {}
+            if "value_target" in sample and isinstance(distribution, dict) and bool(distribution):
+                return True
+    except Exception:
+        return False
+    return False
+
+
 def _play_and_sample_game(
     agent_a,
     agent_b,
@@ -3437,6 +4048,582 @@ def _run_pending_games_sequential(
     return completed_games, completed_samples, "sequential"
 
 
+def _run_dataset_generation_self_play_puct(
+    job: JobContext,
+    *,
+    cfg: dict[str, Any],
+    source_mode: str,
+    dataset_source_id: str,
+    source_dataset_id: str,
+    source_dataset_ids: list[str],
+    derivation_strategy: str,
+    derivation_params: dict[str, Any],
+    raw_dir: Path,
+    sampled_dir: Path,
+    target_samples: int,
+    games: int,
+    sample_every_n_plies: int,
+    max_moves: int,
+    num_workers: int,
+    max_pending_futures: int,
+    multiprocessing_start_method: str,
+    effective_max_tasks_per_child: int | None,
+    cycle_matchups_until_target: bool,
+    max_matchup_cycles: int,
+    base_seed: int,
+) -> dict[str, Any]:
+    model_spec = str(cfg.get("self_play_model", "auto_best")).strip() or "auto_best"
+    model_device = str(cfg.get("self_play_model_device", cfg.get("model_agent_device", "cpu"))).strip().lower() or "cpu"
+    search_simulations = max(1, int(cfg.get("self_play_num_simulations", 64)))
+    search_c_puct = float(cfg.get("self_play_c_puct", 1.5))
+    search_temperature = max(1e-6, float(cfg.get("self_play_temperature", 1.0)))
+    search_temperature_end = max(1e-6, float(cfg.get("self_play_temperature_end", 0.1)))
+    search_temperature_drop_ply = max(0, int(cfg.get("self_play_temperature_drop_ply", 12)))
+    search_root_dirichlet_alpha = max(1e-6, float(cfg.get("self_play_root_dirichlet_alpha", 0.3)))
+    search_root_dirichlet_epsilon = max(0.0, min(1.0, float(cfg.get("self_play_root_dirichlet_epsilon", 0.25))))
+    search_deterministic = _as_bool(cfg.get("self_play_deterministic", False), default=False)
+    progress_update_every_n_games = max(1, int(cfg.get("progress_update_every_n_games", 10)))
+
+    model_id, checkpoint_path = _resolve_model_checkpoint_for_generation(model_spec, models_root=job.paths.models_root)
+    model_matchup = f"model:{model_id} vs model:{model_id}"
+    matchup_id = _slugify_matchup(f"self_play_{model_id}")
+
+    state = job.read_state()
+    summaries: list[dict[str, Any]] = []
+    initial_total_samples = _count_total_jsonl_lines(sampled_dir)
+    initial_total_games = _count_jsonl_files(sampled_dir)
+    total_samples_after_run = initial_total_samples
+    last_completed_game_id = str(state.get("last_completed_game_id", "")).strip()
+
+    job.logger.info(
+        "dataset generation self-play startup | dataset_source_id=%s | model_spec=%s | resolved_model_id=%s | checkpoint=%s | target_samples=%s | games_per_cycle=%s | simulations=%s | c_puct=%.3f | temp_start=%.3f | temp_end=%.3f | temp_drop_ply=%s | dir_alpha=%.3f | dir_eps=%.3f | deterministic=%s | workers=%s | max_pending_futures=%s",
+        dataset_source_id,
+        model_spec,
+        model_id,
+        checkpoint_path,
+        target_samples,
+        games,
+        search_simulations,
+        search_c_puct,
+        search_temperature,
+        search_temperature_end,
+        search_temperature_drop_ply,
+        search_root_dirichlet_alpha,
+        search_root_dirichlet_epsilon,
+        search_deterministic,
+        num_workers,
+        max_pending_futures,
+    )
+    if _as_bool(cfg.get("global_target_enabled", False), default=False):
+        job.logger.info(
+            "dataset generation self-play global target integration disabled for this mode | source_mode=%s",
+            source_mode,
+        )
+    job.write_event(
+        "dataset_generation_self_play_started",
+        dataset_source_id=dataset_source_id,
+        model_spec=model_spec,
+        model_id=model_id,
+        checkpoint_path=str(checkpoint_path),
+        target_samples=target_samples,
+        games_per_cycle=games,
+        num_simulations=search_simulations,
+        c_puct=search_c_puct,
+        temperature=search_temperature,
+        temperature_end=search_temperature_end,
+        temperature_drop_ply=search_temperature_drop_ply,
+        root_dirichlet_alpha=search_root_dirichlet_alpha,
+        root_dirichlet_epsilon=search_root_dirichlet_epsilon,
+        deterministic=search_deterministic,
+    )
+    job.set_phase("dataset_generation")
+    job.write_metric(
+        {
+            "metric_type": "dataset_generation_started",
+            "source_mode": source_mode,
+            "dataset_source_id": dataset_source_id,
+            "target_samples": target_samples,
+        }
+    )
+
+    if target_samples > 0 and initial_total_samples >= target_samples:
+        _register_dataset_source(
+            job,
+            dataset_source_id=dataset_source_id,
+            source_mode=source_mode,
+            raw_dir=raw_dir,
+            sampled_dir=sampled_dir,
+            target_samples=target_samples,
+            games_per_matchup=games,
+            sample_every_n_plies=sample_every_n_plies,
+            matchups=[model_matchup],
+            source_dataset_id=source_dataset_id,
+            source_dataset_ids=source_dataset_ids,
+            derivation_strategy=derivation_strategy,
+            derivation_params=derivation_params,
+            source_status="completed",
+            raw_files_override=_count_json_files(raw_dir),
+            sampled_files_override=_count_jsonl_files(sampled_dir),
+            sampled_positions_override=initial_total_samples,
+        )
+        summary = {
+            "job_id": job.job_id,
+            "dataset_source_id": dataset_source_id,
+            "source_mode": source_mode,
+            "matchups": [],
+            "cycles_completed": 0,
+            "source_status": "completed",
+            "existing_samples": initial_total_samples,
+            "added_games": 0,
+            "failed_games": 0,
+            "added_samples": 0,
+            "total_samples": initial_total_samples,
+            "target_samples": target_samples,
+            "self_play": {
+                "model_id": model_id,
+                "checkpoint_path": str(checkpoint_path),
+                "num_simulations": search_simulations,
+                "c_puct": search_c_puct,
+                "temperature": search_temperature,
+                "temperature_end": search_temperature_end,
+                "temperature_drop_ply": search_temperature_drop_ply,
+                "root_dirichlet_alpha": search_root_dirichlet_alpha,
+                "root_dirichlet_epsilon": search_root_dirichlet_epsilon,
+                "deterministic": search_deterministic,
+            },
+        }
+        _write_json(job.job_dir / "dataset_generation" / "dataset_generation_summary.json", summary)
+        return summary
+
+    cycle_index = 0
+    while True:
+        cycle_index += 1
+        job.set_phase(f"dataset_generation:{matchup_id}")
+        cycle_samples_before = int(total_samples_after_run)
+        pending_games = _build_pending_incremental_games(
+            raw_dir=raw_dir,
+            sampled_dir=sampled_dir,
+            matchup_id=matchup_id,
+            games_to_add=games,
+            seed_base=base_seed + (cycle_index * 1_000_000),
+        )
+        if not pending_games:
+            job.logger.warning(
+                "dataset generation self-play found no pending games | cycle=%s | matchup_id=%s",
+                cycle_index,
+                matchup_id,
+            )
+            break
+
+        matchup_game_count = 0
+        matchup_sample_count = 0
+        matchup_failed_game_count = 0
+
+        def _remaining_sample_budget() -> int:
+            if target_samples <= 0:
+                return 1_000_000_000
+            return max(0, int(target_samples) - int(total_samples_after_run))
+
+        def _update_runtime_progress(*, completed_game_id: str) -> None:
+            nonlocal last_completed_game_id
+            last_completed_game_id = str(completed_game_id).strip() or last_completed_game_id
+            job.write_state(
+                {
+                    "current_matchup": matchup_id,
+                    "completed_games": matchup_game_count,
+                    "remaining_games": max(0, games - matchup_game_count),
+                    "last_completed_game_id": last_completed_game_id,
+                    "sample_count": int(total_samples_after_run),
+                    "target_samples": int(target_samples),
+                    "source_mode": source_mode,
+                }
+            )
+            _register_dataset_source(
+                job,
+                dataset_source_id=dataset_source_id,
+                source_mode=source_mode,
+                raw_dir=raw_dir,
+                sampled_dir=sampled_dir,
+                target_samples=target_samples,
+                games_per_matchup=games,
+                sample_every_n_plies=sample_every_n_plies,
+                matchups=[model_matchup],
+                source_dataset_id=source_dataset_id,
+                source_dataset_ids=source_dataset_ids,
+                derivation_strategy=derivation_strategy,
+                derivation_params=derivation_params,
+                source_status="partial",
+                partial_summary={
+                    "cycles_completed": cycle_index,
+                    "added_games": int(max(0, _count_jsonl_files(sampled_dir) - initial_total_games)),
+                    "added_samples": int(max(0, int(total_samples_after_run) - int(initial_total_samples))),
+                    "total_samples": int(total_samples_after_run),
+                    "target_samples": int(target_samples),
+                },
+                raw_files_override=_count_json_files(raw_dir),
+                sampled_files_override=_count_jsonl_files(sampled_dir),
+                sampled_positions_override=int(total_samples_after_run),
+            )
+            partial_summary = {
+                "job_id": job.job_id,
+                "dataset_source_id": dataset_source_id,
+                "source_mode": source_mode,
+                "matchups": summaries,
+                "cycles_completed": cycle_index,
+                "source_status": "partial",
+                "existing_samples": initial_total_samples,
+                "added_games": int(max(0, _count_jsonl_files(sampled_dir) - initial_total_games)),
+                "failed_games": int(sum(int(item.get("games_failed", 0)) for item in summaries)),
+                "added_samples": int(max(0, int(total_samples_after_run) - int(initial_total_samples))),
+                "total_samples": int(total_samples_after_run),
+                "target_samples": int(target_samples),
+                "self_play": {
+                    "model_spec": model_spec,
+                    "model_id": model_id,
+                    "checkpoint_path": str(checkpoint_path),
+                    "model_device": model_device,
+                    "num_simulations": search_simulations,
+                    "c_puct": search_c_puct,
+                },
+            }
+            _write_json(job.job_dir / "dataset_generation" / "dataset_generation_summary.json", partial_summary)
+
+        def _run_single_pending_game(pending: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+            return _play_and_sample_self_play_game_from_checkpoint(
+                checkpoint_path=str(checkpoint_path),
+                model_id=str(model_id),
+                model_device=model_device,
+                matchup_id=matchup_id,
+                game_id=str(pending["game_id"]),
+                seed=int(pending["seed"]),
+                sample_every_n_plies=sample_every_n_plies,
+                max_moves=max_moves,
+                num_simulations=search_simulations,
+                c_puct=search_c_puct,
+                temperature=search_temperature,
+                temperature_end=search_temperature_end,
+                temperature_drop_ply=search_temperature_drop_ply,
+                root_dirichlet_alpha=search_root_dirichlet_alpha,
+                root_dirichlet_epsilon=search_root_dirichlet_epsilon,
+                deterministic=search_deterministic,
+            )
+
+        if num_workers <= 1:
+            for pending in pending_games:
+                remaining_before_game = _remaining_sample_budget()
+                if remaining_before_game <= 0:
+                    break
+                try:
+                    raw_payload, samples = _run_single_pending_game(pending)
+                except Exception as exc:
+                    matchup_failed_game_count += 1
+                    job.logger.warning(
+                        "dataset self-play game failed | matchup=%s | game=%s/%s | error=%s: %s | mode=sequential",
+                        matchup_id,
+                        pending["game_no"],
+                        games,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    job.write_event(
+                        "dataset_game_failed",
+                        matchup=matchup_id,
+                        game_id=pending["game_id"],
+                        game_index=pending["game_no"],
+                        execution_mode="self_play_sequential",
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                    continue
+                admitted_samples = min(len(samples), max(0, int(remaining_before_game)))
+                games_inc, samples_inc = _materialize_completed_game(
+                    job,
+                    pending=pending,
+                    raw_payload=raw_payload,
+                    samples=samples,
+                    matchup_id=matchup_id,
+                    games=games,
+                    execution_mode="self_play_sequential",
+                    max_samples_to_write=admitted_samples,
+                )
+                matchup_game_count += games_inc
+                matchup_sample_count += samples_inc
+                total_samples_after_run += samples_inc
+                if games_inc > 0 and (matchup_game_count % progress_update_every_n_games == 0):
+                    _update_runtime_progress(completed_game_id=str(pending["game_id"]))
+                if _remaining_sample_budget() <= 0:
+                    break
+        else:
+            future_map: dict[concurrent.futures.Future, dict[str, Any]] = {}
+            pending_queue = list(pending_games)
+            try:
+                mp_context = multiprocessing.get_context(multiprocessing_start_method)
+                with concurrent.futures.ProcessPoolExecutor(
+                    max_workers=num_workers,
+                    mp_context=mp_context,
+                    max_tasks_per_child=effective_max_tasks_per_child,
+                ) as executor:
+                    while pending_queue or future_map:
+                        while pending_queue and len(future_map) < max_pending_futures and _remaining_sample_budget() > 0:
+                            pending = pending_queue.pop(0)
+                            future = executor.submit(
+                                _play_and_sample_self_play_game_from_checkpoint,
+                                checkpoint_path=str(checkpoint_path),
+                                model_id=str(model_id),
+                                model_device=model_device,
+                                matchup_id=matchup_id,
+                                game_id=str(pending["game_id"]),
+                                seed=int(pending["seed"]),
+                                sample_every_n_plies=sample_every_n_plies,
+                                max_moves=max_moves,
+                                num_simulations=search_simulations,
+                                c_puct=search_c_puct,
+                                temperature=search_temperature,
+                                temperature_end=search_temperature_end,
+                                temperature_drop_ply=search_temperature_drop_ply,
+                                root_dirichlet_alpha=search_root_dirichlet_alpha,
+                                root_dirichlet_epsilon=search_root_dirichlet_epsilon,
+                                deterministic=search_deterministic,
+                            )
+                            future_map[future] = pending
+                        if not future_map:
+                            break
+                        done, _ = concurrent.futures.wait(
+                            future_map.keys(),
+                            return_when=concurrent.futures.FIRST_COMPLETED,
+                        )
+                        for future in done:
+                            pending = future_map.pop(future)
+                            try:
+                                raw_payload, samples = future.result()
+                            except Exception as exc:
+                                matchup_failed_game_count += 1
+                                job.logger.warning(
+                                    "dataset self-play game failed | matchup=%s | game=%s/%s | error=%s: %s | mode=parallel",
+                                    matchup_id,
+                                    pending["game_no"],
+                                    games,
+                                    type(exc).__name__,
+                                    exc,
+                                )
+                                job.write_event(
+                                    "dataset_game_failed",
+                                    matchup=matchup_id,
+                                    game_id=pending["game_id"],
+                                    game_index=pending["game_no"],
+                                    execution_mode="self_play_parallel",
+                                    error=f"{type(exc).__name__}: {exc}",
+                                )
+                                continue
+                            admitted_samples = min(len(samples), max(0, int(_remaining_sample_budget())))
+                            games_inc, samples_inc = _materialize_completed_game(
+                                job,
+                                pending=pending,
+                                raw_payload=raw_payload,
+                                samples=samples,
+                                matchup_id=matchup_id,
+                                games=games,
+                                execution_mode="self_play_parallel",
+                                max_samples_to_write=admitted_samples,
+                            )
+                            matchup_game_count += games_inc
+                            matchup_sample_count += samples_inc
+                            total_samples_after_run += samples_inc
+                            if games_inc > 0 and (matchup_game_count % progress_update_every_n_games == 0):
+                                _update_runtime_progress(completed_game_id=str(pending["game_id"]))
+                            if _remaining_sample_budget() <= 0:
+                                pending_queue.clear()
+            except concurrent.futures.process.BrokenProcessPool as exc:
+                failed_pending = list(future_map.values()) + list(pending_queue)
+                job.logger.warning(
+                    "dataset self-play parallel pool broken | cycle=%s | completed_games=%s | remaining_fallback=%s | error=%s",
+                    cycle_index,
+                    matchup_game_count,
+                    len(failed_pending),
+                    exc,
+                )
+                job.write_event(
+                    "dataset_parallel_execution_broken",
+                    matchup=matchup_id,
+                    completed_games=matchup_game_count,
+                    remaining_fallback=len(failed_pending),
+                    error=str(exc),
+                    execution_mode="self_play_parallel",
+                )
+                for pending in failed_pending:
+                    if _remaining_sample_budget() <= 0:
+                        break
+                    try:
+                        raw_payload, samples = _run_single_pending_game(pending)
+                    except Exception as inner_exc:
+                        matchup_failed_game_count += 1
+                        job.logger.warning(
+                            "dataset self-play game failed | matchup=%s | game=%s/%s | error=%s: %s | mode=sequential_fallback",
+                            matchup_id,
+                            pending["game_no"],
+                            games,
+                            type(inner_exc).__name__,
+                            inner_exc,
+                        )
+                        continue
+                    admitted_samples = min(len(samples), max(0, int(_remaining_sample_budget())))
+                    games_inc, samples_inc = _materialize_completed_game(
+                        job,
+                        pending=pending,
+                        raw_payload=raw_payload,
+                        samples=samples,
+                        matchup_id=matchup_id,
+                        games=games,
+                        execution_mode="self_play_sequential_fallback",
+                        max_samples_to_write=admitted_samples,
+                    )
+                    matchup_game_count += games_inc
+                    matchup_sample_count += samples_inc
+                    total_samples_after_run += samples_inc
+                    if games_inc > 0 and (matchup_game_count % progress_update_every_n_games == 0):
+                        _update_runtime_progress(completed_game_id=str(pending["game_id"]))
+
+        if last_completed_game_id:
+            _update_runtime_progress(completed_game_id=last_completed_game_id)
+
+        summary_payload = {
+            "matchup_id": matchup_id,
+            "cycle_index": cycle_index,
+            "player_a": f"model:{model_id}",
+            "player_b": f"model:{model_id}",
+            "existing_games": int(_count_jsonl_files(sampled_dir) - matchup_game_count),
+            "games_added": matchup_game_count,
+            "games_failed": matchup_failed_game_count,
+            "samples_added": matchup_sample_count,
+            "sample_every_n_plies": sample_every_n_plies,
+            "num_workers": num_workers,
+            "self_play_model_id": model_id,
+            "self_play_num_simulations": search_simulations,
+        }
+        _accumulate_matchup_summary(summaries, summary_payload)
+        job.write_metric({"metric_type": "dataset_matchup_completed", **summary_payload})
+        job.write_event(
+            "dataset_matchup_completed",
+            matchup=matchup_id,
+            samples=matchup_sample_count,
+            cycle_index=cycle_index,
+            execution_mode="self_play_puct",
+        )
+
+        cycle_added_samples = int(total_samples_after_run) - int(cycle_samples_before)
+        if target_samples > 0 and int(total_samples_after_run) >= int(target_samples):
+            break
+        if not bool(cycle_matchups_until_target):
+            break
+        if int(max_matchup_cycles) > 0 and int(cycle_index) >= int(max_matchup_cycles):
+            break
+        if cycle_added_samples <= 0:
+            job.logger.warning(
+                "dataset generation self-play cycle produced no new samples, stopping | cycle=%s | total_samples=%s | target_samples=%s",
+                cycle_index,
+                total_samples_after_run,
+                target_samples,
+            )
+            break
+
+    final_total_samples = _count_total_jsonl_lines(sampled_dir)
+    final_total_games = _count_jsonl_files(sampled_dir)
+    added_games = max(0, int(final_total_games) - int(initial_total_games))
+    failed_games = sum(int(item.get("games_failed", 0)) for item in summaries)
+    added_samples = max(0, int(final_total_samples) - int(initial_total_samples))
+    completed_cycles = max(0, int(len(summaries)))
+    source_status = "completed" if (target_samples > 0 and int(final_total_samples) >= int(target_samples)) else "partial"
+    summary = {
+        "job_id": job.job_id,
+        "dataset_source_id": dataset_source_id,
+        "source_mode": source_mode,
+        "matchups": summaries,
+        "cycles_completed": completed_cycles,
+        "source_status": source_status,
+        "existing_samples": initial_total_samples,
+        "added_games": added_games,
+        "failed_games": failed_games,
+        "added_samples": added_samples,
+        "total_samples": final_total_samples,
+        "target_samples": target_samples,
+        "self_play": {
+            "model_spec": model_spec,
+            "model_id": model_id,
+            "checkpoint_path": str(checkpoint_path),
+            "model_device": model_device,
+            "num_simulations": search_simulations,
+            "c_puct": search_c_puct,
+            "temperature": search_temperature,
+            "temperature_end": search_temperature_end,
+            "temperature_drop_ply": search_temperature_drop_ply,
+            "root_dirichlet_alpha": search_root_dirichlet_alpha,
+            "root_dirichlet_epsilon": search_root_dirichlet_epsilon,
+            "deterministic": search_deterministic,
+        },
+    }
+    _register_dataset_source(
+        job,
+        dataset_source_id=dataset_source_id,
+        source_mode=source_mode,
+        raw_dir=raw_dir,
+        sampled_dir=sampled_dir,
+        target_samples=target_samples,
+        games_per_matchup=games,
+        sample_every_n_plies=sample_every_n_plies,
+        matchups=[model_matchup],
+        source_dataset_id=source_dataset_id,
+        source_dataset_ids=source_dataset_ids,
+        derivation_strategy=derivation_strategy,
+        derivation_params=derivation_params,
+        source_status=source_status,
+        partial_summary={} if source_status == "completed" else {
+            "cycles_completed": completed_cycles,
+            "added_games": added_games,
+            "failed_games": failed_games,
+            "added_samples": added_samples,
+            "total_samples": final_total_samples,
+            "target_samples": target_samples,
+        },
+        raw_files_override=_count_json_files(raw_dir),
+        sampled_files_override=_count_jsonl_files(sampled_dir),
+        sampled_positions_override=final_total_samples,
+    )
+    _write_json(job.job_dir / "dataset_generation" / "dataset_generation_summary.json", summary)
+    job.write_metric(
+        {
+            "metric_type": "dataset_generation_completed",
+            "source_mode": source_mode,
+            "dataset_source_id": dataset_source_id,
+            "source_status": source_status,
+            "added_games": added_games,
+            "added_samples": added_samples,
+            "total_samples": final_total_samples,
+            "target_samples": target_samples,
+        }
+    )
+    job.write_event(
+        "dataset_generation_completed",
+        source_mode=source_mode,
+        dataset_source_id=dataset_source_id,
+        source_status=source_status,
+        added_games=added_games,
+        added_samples=added_samples,
+        total_samples=final_total_samples,
+        target_samples=target_samples,
+    )
+    job.write_state(
+        {
+            "current_matchup": None,
+            "completed_games": added_games,
+            "remaining_games": 0,
+            "last_completed_game_id": last_completed_game_id,
+            "sample_count": final_total_samples,
+            "target_samples": target_samples,
+            "source_mode": source_mode,
+        }
+    )
+    return summary
+
+
 def run_dataset_generation(job: JobContext) -> dict[str, object]:
     cfg = job.config.get("dataset_generation", {})
     runtime_cfg = job.config.get("runtime", {})
@@ -3564,7 +4751,7 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
             str(global_progress_backend.get("backend", "file")),
         )
 
-    if source_mode not in {"benchmatch", "clone_existing", "derive_existing", "augment_existing", "merge_existing"}:
+    if source_mode not in {"benchmatch", "self_play_puct", "clone_existing", "derive_existing", "augment_existing", "merge_existing"}:
         raise ValueError(f"Unsupported dataset generation source_mode: {source_mode}")
 
     if source_mode == "benchmatch":
@@ -3906,6 +5093,31 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
             }
         )
         return summary
+
+    if source_mode == "self_play_puct":
+        return _run_dataset_generation_self_play_puct(
+            job,
+            cfg=cfg,
+            source_mode=source_mode,
+            dataset_source_id=dataset_source_id,
+            source_dataset_id=source_dataset_id,
+            source_dataset_ids=source_dataset_ids,
+            derivation_strategy=derivation_strategy,
+            derivation_params=derivation_params,
+            raw_dir=raw_dir,
+            sampled_dir=sampled_dir,
+            target_samples=target_samples,
+            games=games,
+            sample_every_n_plies=sample_every_n_plies,
+            max_moves=max_moves,
+            num_workers=num_workers,
+            max_pending_futures=max_pending_futures,
+            multiprocessing_start_method=multiprocessing_start_method,
+            effective_max_tasks_per_child=effective_max_tasks_per_child,
+            cycle_matchups_until_target=cycle_matchups_until_target,
+            max_matchup_cycles=max_matchup_cycles,
+            base_seed=base_seed,
+        )
 
     state = job.read_state()
     summaries: list[dict[str, Any]] = []
@@ -4728,6 +5940,11 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
     teacher_level = str(teacher_cfg.get("level", "hard"))
     dataset_id = str(cfg.get("dataset_id", "dataset_v1"))
     source_dataset_id = str(cfg.get("source_dataset_id", "")).strip()
+    build_mode_requested = str(cfg.get("build_mode", "auto")).strip().lower() or "auto"
+    if build_mode_requested not in {"auto", "teacher_label", "source_prelabeled"}:
+        raise ValueError(
+            f"Unsupported dataset_build.build_mode: {build_mode_requested} (attendu: auto|teacher_label|source_prelabeled)"
+        )
     configured_follow_source_updates = _as_bool(cfg.get("follow_source_updates", False), default=False)
     source_poll_interval_seconds = max(1.0, float(cfg.get("source_poll_interval_seconds", 30.0)))
     split_cfg = cfg.get("split", {})
@@ -4780,10 +5997,11 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         )
 
     job.logger.info(
-        "dataset build startup | dataset=%s | source_dataset_id=%s | configured_input_sampled_dir=%s | workers=%s | max_pending_futures=%s | include_tactical_analysis=%s | dedupe_sample_ids=%s | export_partial_every_n_files=%s | follow_source_updates=%s | source_poll_interval_seconds=%.1f | adaptive_source_polling=%s | global_target_backend=%s",
+        "dataset build startup | dataset=%s | source_dataset_id=%s | configured_input_sampled_dir=%s | build_mode_requested=%s | workers=%s | max_pending_futures=%s | include_tactical_analysis=%s | dedupe_sample_ids=%s | export_partial_every_n_files=%s | follow_source_updates=%s | source_poll_interval_seconds=%.1f | adaptive_source_polling=%s | global_target_backend=%s",
         dataset_id,
         source_dataset_id or "<auto>",
         str(cfg.get("input_sampled_dir", "")),
+        build_mode_requested,
         num_workers,
         max_pending_futures,
         include_tactical_analysis,
@@ -4807,6 +6025,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
     )
 
     dataset_dir = job.job_dir / "dataset_build"
+    source_mode_hint = ""
     if source_dataset_id:
         source_entry = None
         while source_entry is None:
@@ -4828,6 +6047,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
                 time.sleep(current_poll_interval_seconds)
                 if adaptive_source_polling:
                     current_poll_interval_seconds = min(source_poll_interval_max_seconds, current_poll_interval_seconds * 1.5)
+        source_mode_hint = str(source_entry.get("source_mode", "")).strip().lower() if isinstance(source_entry, dict) else ""
         sampled_root = Path(str(source_entry["sampled_dir"]))
     else:
         sampled_root = _resolve_storage_path(job.paths.drive_root, cfg.get("input_sampled_dir"), dataset_dir.parent / "dataset_generation" / "sampled_positions")
@@ -4949,10 +6169,12 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
                 "target_labeled_samples": target_labeled_samples,
                 "input_dim": 17,
                 "feature_schema_version": "policy_value_tactical_v3",
+                "build_mode": ("source_prelabeled" if build_mode_requested == "source_prelabeled" else "teacher_label"),
                 "dedupe_sample_ids": dedupe_sample_ids,
                 "duplicate_samples_removed": 0,
                 "skipped_terminal_samples": 0,
                 "skipped_no_legal_samples": 0,
+                "skipped_invalid_samples": 0,
                 "build_status": "completed_empty_global_target_reached",
             }
             _write_json(dataset_dir / "dataset_build_summary.json", summary)
@@ -4964,6 +6186,26 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
             _write_global_progress_read_telemetry_metric()
             return summary
         raise FileNotFoundError(f"Aucun fichier sampled_positions trouve dans {sampled_root}")
+
+    if build_mode_requested == "teacher_label":
+        effective_build_mode = "teacher_label"
+    elif build_mode_requested == "source_prelabeled":
+        effective_build_mode = "source_prelabeled"
+    else:
+        if source_mode_hint in {"self_play_puct"}:
+            effective_build_mode = "source_prelabeled"
+        else:
+            effective_build_mode = "teacher_label"
+            for candidate_file in sampled_files[: min(8, len(sampled_files))]:
+                if _detect_source_samples_are_prelabeled(candidate_file):
+                    effective_build_mode = "source_prelabeled"
+                    break
+    job.logger.info(
+        "dataset build mode resolved | requested=%s | effective=%s | source_mode_hint=%s",
+        build_mode_requested,
+        effective_build_mode,
+        source_mode_hint or "<none>",
+    )
 
     state = job.read_state()
     completed_files = set(state.get("completed_files", []))
@@ -4982,6 +6224,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
     labeled_samples_total = int(state.get("labeled_samples", 0)) if contiguous_completed_prefix > 0 else 0
     skipped_terminal_samples = 0
     skipped_no_legal_samples = 0
+    skipped_invalid_samples = 0
     log_every_n_files = max(1, int(cfg.get("log_every_n_files", 1)))
     last_logged_progress_count = -1
     build_started_monotonic = time.monotonic()
@@ -5015,6 +6258,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
                 "labeled_samples": labeled_samples_total,
                 "skipped_terminal_samples": skipped_terminal_samples,
                 "skipped_no_legal_samples": skipped_no_legal_samples,
+                "skipped_invalid_samples": skipped_invalid_samples,
                 "target_labeled_samples": target_labeled_samples,
                 "include_tactical_analysis": include_tactical_analysis,
                 "contiguous_completed_prefix": contiguous_completed_prefix,
@@ -5032,12 +6276,13 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
             return
         files_per_second, samples_per_second = _throughput_metrics()
         job.logger.info(
-            "dataset build progress | files=%s/%s | labeled_samples=%s | skipped_terminal=%s | skipped_no_legal=%s | files_per_sec=%.2f | samples_per_sec=%.2f | eta=%s",
+            "dataset build progress | files=%s/%s | labeled_samples=%s | skipped_terminal=%s | skipped_no_legal=%s | skipped_invalid=%s | files_per_sec=%.2f | samples_per_sec=%.2f | eta=%s",
             processed_count,
             len(sampled_files),
             labeled_samples_total,
             skipped_terminal_samples,
             skipped_no_legal_samples,
+            skipped_invalid_samples,
             files_per_second or 0.0,
             samples_per_second or 0.0,
             _format_eta_seconds(_estimate_remaining_seconds()),
@@ -5072,6 +6317,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
             labeled_samples_total=labeled_samples_total,
             target_labeled_samples=target_labeled_samples,
             build_status="partial",
+            build_mode=effective_build_mode,
             dedupe_sample_ids=dedupe_sample_ids,
         )
         last_partial_export_processed = processed_count
@@ -5102,9 +6348,10 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         )
 
     job.logger.info(
-        "dataset build started | dataset=%s | source_dataset_id=%s | teacher=%s:%s | sampled_root=%s | label_cache=%s | output_dir=%s | files=%s | target_labeled_samples=%s | workers=%s | include_tactical_analysis=%s | dedupe_sample_ids=%s",
+        "dataset build started | dataset=%s | source_dataset_id=%s | build_mode=%s | teacher=%s:%s | sampled_root=%s | label_cache=%s | output_dir=%s | files=%s | target_labeled_samples=%s | workers=%s | include_tactical_analysis=%s | dedupe_sample_ids=%s",
         dataset_id,
         source_dataset_id,
+        effective_build_mode,
         teacher_engine,
         teacher_level,
         sampled_root,
@@ -5121,6 +6368,8 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         "dataset_build_started",
         dataset_id=dataset_id,
         source_dataset_id=source_dataset_id,
+        build_mode_requested=build_mode_requested,
+        build_mode=effective_build_mode,
         teacher_engine=teacher_engine,
         teacher_level=teacher_level,
         sampled_root=str(sampled_root),
@@ -5211,29 +6460,48 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         source_status=latest_source_status,
     )
 
+    def _extract_samples_from_file(
+        sampled_file: Path,
+    ) -> tuple[int, list[dict[str, Any]], int, int, int]:
+        if effective_build_mode == "source_prelabeled":
+            source_count, file_samples, skipped_terminal, skipped_no_legal, skipped_invalid = _prepare_prelabeled_samples_from_file(
+                str(sampled_file),
+                include_tactical_analysis=include_tactical_analysis,
+            )
+            return source_count, file_samples, skipped_terminal, skipped_no_legal, skipped_invalid
+        source_count, file_samples, skipped_terminal, skipped_no_legal = _label_samples_from_file(
+            str(sampled_file),
+            teacher_engine=teacher_engine,
+            teacher_level=teacher_level,
+            include_tactical_analysis=include_tactical_analysis,
+        )
+        return source_count, file_samples, skipped_terminal, skipped_no_legal, 0
+
     def _materialize_labeled_file(
         file_item: dict[str, Any],
         source_count: int,
         file_samples: list[dict[str, Any]],
         skipped_terminal: int,
         skipped_no_legal: int,
+        skipped_invalid: int,
         *,
         mode: str,
     ) -> None:
-        nonlocal processed_count, skipped_terminal_samples, skipped_no_legal_samples, labeled_samples_total, last_completed_file_name
+        nonlocal processed_count, skipped_terminal_samples, skipped_no_legal_samples, skipped_invalid_samples, labeled_samples_total, last_completed_file_name
         output_labeled = Path(file_item["output_labeled"])
         output_labeled.parent.mkdir(parents=True, exist_ok=True)
         write_jsonl_atomic(output_labeled, file_samples, ensure_ascii=True)
 
         skipped_terminal_samples += skipped_terminal
         skipped_no_legal_samples += skipped_no_legal
+        skipped_invalid_samples += skipped_invalid
         completed_files.add(str(file_item["relative_name"]))
         file_sample_counts[str(file_item["relative_name"])] = len(file_samples)
         processed_count += 1
         labeled_samples_total += len(file_samples)
         last_completed_file_name = str(file_item["relative_name"])
         job.logger.info(
-            "dataset build file completed | %s/%s | file=%s | mode=%s | source_samples=%s | labeled_samples=%s | skipped_terminal=%s | skipped_no_legal=%s",
+            "dataset build file completed | %s/%s | file=%s | mode=%s | source_samples=%s | labeled_samples=%s | skipped_terminal=%s | skipped_no_legal=%s | skipped_invalid=%s",
             file_item["file_index"],
             len(sampled_files),
             file_item["relative_name"],
@@ -5242,6 +6510,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
             len(file_samples),
             skipped_terminal_samples,
             skipped_no_legal_samples,
+            skipped_invalid_samples,
         )
         job.write_event("dataset_labeled_file_completed", file=str(file_item["relative_name"]), samples=len(file_samples))
         job.write_metric({"metric_type": "dataset_labeled_file_completed", "file": str(file_item["relative_name"]), "samples": len(file_samples)})
@@ -5260,11 +6529,8 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
                     len(sampled_files),
                     file_item["relative_name"],
                 )
-                source_count, file_samples, skipped_terminal, skipped_no_legal = _label_samples_from_file(
-                    str(file_item["sampled_file"]),
-                    teacher_engine=teacher_engine,
-                    teacher_level=teacher_level,
-                    include_tactical_analysis=include_tactical_analysis,
+                source_count, file_samples, skipped_terminal, skipped_no_legal, skipped_invalid = _extract_samples_from_file(
+                    Path(file_item["sampled_file"])
                 )
                 _materialize_labeled_file(
                     file_item,
@@ -5272,6 +6538,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
                     file_samples,
                     skipped_terminal,
                     skipped_no_legal,
+                    skipped_invalid,
                     mode="sequential",
                 )
                 if _target_reached():
@@ -5302,6 +6569,18 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
             future_map: dict[concurrent.futures.Future, dict[str, Any]] = {}
             pending_queue = list(pending_batch)
             target_reached = False
+            if effective_build_mode == "source_prelabeled":
+                worker_function: Callable[..., Any] = _prepare_prelabeled_samples_from_file
+                worker_kwargs = {
+                    "include_tactical_analysis": include_tactical_analysis,
+                }
+            else:
+                worker_function = _label_samples_from_file
+                worker_kwargs = {
+                    "teacher_engine": teacher_engine,
+                    "teacher_level": teacher_level,
+                    "include_tactical_analysis": include_tactical_analysis,
+                }
             try:
                 mp_context = multiprocessing.get_context(multiprocessing_start_method)
                 with concurrent.futures.ProcessPoolExecutor(
@@ -5319,11 +6598,9 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
                                 file_item["relative_name"],
                             )
                             future = executor.submit(
-                                _label_samples_from_file,
+                                worker_function,
                                 str(file_item["sampled_file"]),
-                                teacher_engine=teacher_engine,
-                                teacher_level=teacher_level,
-                                include_tactical_analysis=include_tactical_analysis,
+                                **worker_kwargs,
                             )
                             future_map[future] = file_item
 
@@ -5335,13 +6612,19 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
                         )
                         for future in done:
                             file_item = future_map.pop(future)
-                            source_count, file_samples, skipped_terminal, skipped_no_legal = future.result()
+                            result_payload = future.result()
+                            if effective_build_mode == "source_prelabeled":
+                                source_count, file_samples, skipped_terminal, skipped_no_legal, skipped_invalid = result_payload
+                            else:
+                                source_count, file_samples, skipped_terminal, skipped_no_legal = result_payload
+                                skipped_invalid = 0
                             _materialize_labeled_file(
                                 file_item,
                                 source_count,
                                 file_samples,
                                 skipped_terminal,
                                 skipped_no_legal,
+                                skipped_invalid,
                                 mode="parallel",
                             )
                             if _target_reached() and not target_reached:
@@ -5375,11 +6658,8 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
                         len(sampled_files),
                         file_item["relative_name"],
                     )
-                    source_count, file_samples, skipped_terminal, skipped_no_legal = _label_samples_from_file(
-                        str(file_item["sampled_file"]),
-                        teacher_engine=teacher_engine,
-                        teacher_level=teacher_level,
-                        include_tactical_analysis=include_tactical_analysis,
+                    source_count, file_samples, skipped_terminal, skipped_no_legal, skipped_invalid = _extract_samples_from_file(
+                        Path(file_item["sampled_file"])
                     )
                     _materialize_labeled_file(
                         file_item,
@@ -5387,6 +6667,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
                         file_samples,
                         skipped_terminal,
                         skipped_no_legal,
+                        skipped_invalid,
                         mode="sequential_fallback",
                     )
                     if _target_reached():
@@ -5526,12 +6807,14 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         labeled_samples_total=labeled_samples_total,
         target_labeled_samples=target_labeled_samples,
         build_status="completed",
+        build_mode=effective_build_mode,
         dedupe_sample_ids=dedupe_sample_ids,
     )
 
     summary = {
         "job_id": job.job_id,
         "dataset_id": dataset_id,
+        "build_mode": effective_build_mode,
         "teacher_engine": teacher_engine,
         "teacher_level": teacher_level,
         "source_dataset_id": source_dataset_id,
@@ -5546,11 +6829,13 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         "duplicate_samples_removed": duplicate_samples_removed,
         "skipped_terminal_samples": skipped_terminal_samples,
         "skipped_no_legal_samples": skipped_no_legal_samples,
+        "skipped_invalid_samples": skipped_invalid_samples,
     }
     _write_json(dataset_dir / "dataset_build_summary.json", summary)
     job.logger.info(
-        "dataset build completed | dataset=%s | build_mode=teacher_label | source_dataset_id=%s | train=%s | validation=%s | test=%s | duplicate_samples_removed=%s | skipped_terminal=%s | skipped_no_legal=%s | output_dir=%s",
+        "dataset build completed | dataset=%s | build_mode=%s | source_dataset_id=%s | train=%s | validation=%s | test=%s | duplicate_samples_removed=%s | skipped_terminal=%s | skipped_no_legal=%s | skipped_invalid=%s | output_dir=%s",
         dataset_id,
+        effective_build_mode,
         source_dataset_id,
         split_summary.get("train", {}).get("samples", 0),
         split_summary.get("validation", {}).get("samples", 0),
@@ -5558,12 +6843,14 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         duplicate_samples_removed,
         skipped_terminal_samples,
         skipped_no_legal_samples,
+        skipped_invalid_samples,
         output_root,
     )
     job.write_metric(
         {
             "metric_type": "dataset_build_completed",
             "dataset_id": dataset_id,
+            "build_mode": effective_build_mode,
             "duplicate_samples_removed": duplicate_samples_removed,
             "dedupe_sample_ids": dedupe_sample_ids,
         }
@@ -5571,6 +6858,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
     job.write_event(
         "dataset_build_completed",
         dataset_id=dataset_id,
+        build_mode=effective_build_mode,
         duplicate_samples_removed=duplicate_samples_removed,
         dedupe_sample_ids=dedupe_sample_ids,
     )

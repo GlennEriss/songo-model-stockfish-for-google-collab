@@ -20,6 +20,16 @@ job:
 
 dataset_generation:
   source_mode: benchmatch
+  self_play_model: auto_best
+  self_play_model_device: cpu
+  self_play_num_simulations: 96
+  self_play_c_puct: 1.5
+  self_play_temperature: 1.0
+  self_play_temperature_end: 0.1
+  self_play_temperature_drop_ply: 12
+  self_play_root_dirichlet_alpha: 0.3
+  self_play_root_dirichlet_epsilon: 0.25
+  self_play_deterministic: false
   dataset_source_id: sampled_full_matrix_colab_pro
   source_dataset_id: ""
   source_dataset_ids: []
