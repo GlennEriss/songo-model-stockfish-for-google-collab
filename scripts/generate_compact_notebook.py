@@ -3117,6 +3117,7 @@ cells = [
         TOURNAMENT_MODEL_SEARCH_TOP_K = 4
         TOURNAMENT_MODEL_SEARCH_POLICY_WEIGHT = 0.35
         TOURNAMENT_MODEL_SEARCH_VALUE_WEIGHT = 1.0
+        TOURNAMENT_LOG_EACH_GAME = True
         TOURNAMENT_AUTO_PRUNE_ENABLED = True
         TOURNAMENT_AUTO_PRUNE_COUNT = 3
         TOURNAMENT_MIN_MODELS_TO_KEEP = 3
@@ -3192,6 +3193,7 @@ cells = [
             wins_left = 0
             wins_right = 0
             draws = 0
+            total_moves_pair = 0
             for game_idx in range(TOURNAMENT_GAMES_PER_PAIR):
                 starter = game_idx % 2
                 result = play_match(
@@ -3202,10 +3204,20 @@ cells = [
                 )
                 if result.winner == 0:
                     wins_left += 1
+                    winner_label = left
                 elif result.winner == 1:
                     wins_right += 1
+                    winner_label = right
                 else:
                     draws += 1
+                    winner_label = 'draw'
+                total_moves_pair += int(result.moves)
+                if TOURNAMENT_LOG_EACH_GAME:
+                    print(
+                        f"game {game_idx + 1:>3}/{TOURNAMENT_GAMES_PER_PAIR:<3} | "
+                        f"{left} vs {right} | starter={'left' if starter == 0 else 'right'} | "
+                        f"winner={winner_label} | moves={int(result.moves)} | reason={result.reason}"
+                    )
 
             table[left]['played'] += TOURNAMENT_GAMES_PER_PAIR
             table[right]['played'] += TOURNAMENT_GAMES_PER_PAIR
@@ -3231,12 +3243,15 @@ cells = [
                     'draws': draws,
                     'points_a': (wins_left * 3) + draws,
                     'points_b': (wins_right * 3) + draws,
+                    'total_moves': int(total_moves_pair),
+                    'avg_moves': (float(total_moves_pair) / float(TOURNAMENT_GAMES_PER_PAIR)) if TOURNAMENT_GAMES_PER_PAIR > 0 else 0.0,
                 }
             )
             print(
                 f"pair done: {left} vs {right} | "
                 f"W={wins_left}-{wins_right} D={draws} | "
-                f"score={((wins_left * 3) + draws)}-{((wins_right * 3) + draws)}"
+                f"score={((wins_left * 3) + draws)}-{((wins_right * 3) + draws)} | "
+                f"avg_moves={((float(total_moves_pair) / float(TOURNAMENT_GAMES_PER_PAIR)) if TOURNAMENT_GAMES_PER_PAIR > 0 else 0.0):.2f}"
             )
 
         for row in table.values():
