@@ -157,6 +157,14 @@ cells = [
         BENCHMATCH_CYCLE_MATCHUPS_UNTIL_TARGET = True
         BENCHMATCH_MAX_MATCHUP_CYCLES = 0  # 0 = illimite
         BENCHMATCH_MODEL_AGENT_DEVICE = 'cpu'
+        TOURNAMENT_REVIEW_ENRICHMENT_ENABLED = True
+        TOURNAMENT_REVIEW_FOCUS_MODEL = 'auto_tournament_winner'  # auto_tournament_winner | auto_best | auto_latest | <model_id>
+        TOURNAMENT_REVIEW_SUMMARY_PATH = ''  # vide => dernier rapport model_tournament_*.json
+        TOURNAMENT_REVIEW_TOP_K = 4
+        TOURNAMENT_REVIEW_REPEAT_FACTOR = 2
+        TOURNAMENT_REVIEW_MAX_SCORE_RATE = 0.55
+        TOURNAMENT_REVIEW_MAX_ADDED_MATCHUPS = 12
+        TOURNAMENT_REVIEW_INCLUDE_REVERSE_MATCHUP = True
         DATASET_GENERATE_SOURCE_MODE = 'benchmatch'  # 'benchmatch' ou 'self_play_puct'
         SELF_PLAY_MODEL = 'auto_best'
         SELF_PLAY_MODEL_DEVICE = 'cpu'
@@ -818,6 +826,9 @@ cells = [
         print('BENCHMATCH_SHUFFLE_MATCHUPS =', BENCHMATCH_SHUFFLE_MATCHUPS)
         print('BENCHMATCH_CYCLE_MATCHUPS_UNTIL_TARGET =', BENCHMATCH_CYCLE_MATCHUPS_UNTIL_TARGET)
         print('BENCHMATCH_MAX_MATCHUP_CYCLES =', BENCHMATCH_MAX_MATCHUP_CYCLES)
+        print('TOURNAMENT_REVIEW_ENRICHMENT_ENABLED =', TOURNAMENT_REVIEW_ENRICHMENT_ENABLED)
+        print('TOURNAMENT_REVIEW_FOCUS_MODEL =', TOURNAMENT_REVIEW_FOCUS_MODEL)
+        print('TOURNAMENT_REVIEW_SUMMARY_PATH =', TOURNAMENT_REVIEW_SUMMARY_PATH or '<auto_latest>')
         print('DATASET_BUILD_DEDUPE_SAMPLE_IDS =', DATASET_BUILD_DEDUPE_SAMPLE_IDS)
         print('DATASET_BUILD_ADAPTIVE_POLLING =', DATASET_BUILD_ADAPTIVE_POLLING)
         print('GLOBAL_TARGET_ENABLED    =', GLOBAL_TARGET_ENABLED)
@@ -1208,6 +1219,14 @@ cells = [
             generate_block['matchups'] = matchups
             generate_block['cycle_matchups_until_target'] = bool(BENCHMATCH_CYCLE_MATCHUPS_UNTIL_TARGET)
             generate_block['max_matchup_cycles'] = int(BENCHMATCH_MAX_MATCHUP_CYCLES)
+            generate_block['tournament_review_enabled'] = bool(TOURNAMENT_REVIEW_ENRICHMENT_ENABLED)
+            generate_block['tournament_review_focus_model'] = str(TOURNAMENT_REVIEW_FOCUS_MODEL)
+            generate_block['tournament_review_summary_path'] = str(TOURNAMENT_REVIEW_SUMMARY_PATH)
+            generate_block['tournament_review_top_k'] = int(TOURNAMENT_REVIEW_TOP_K)
+            generate_block['tournament_review_repeat_factor'] = int(TOURNAMENT_REVIEW_REPEAT_FACTOR)
+            generate_block['tournament_review_max_score_rate'] = float(TOURNAMENT_REVIEW_MAX_SCORE_RATE)
+            generate_block['tournament_review_max_added_matchups'] = int(TOURNAMENT_REVIEW_MAX_ADDED_MATCHUPS)
+            generate_block['tournament_review_include_reverse_matchup'] = bool(TOURNAMENT_REVIEW_INCLUDE_REVERSE_MATCHUP)
         else:
             generate_block.pop('matchups', None)
             generate_block['games'] = int(SELF_PLAY_GAMES_PER_CYCLE)

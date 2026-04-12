@@ -3437,6 +3437,227 @@ def _augment_matchups_with_benchmark_review(
     return final_matchups, info
 
 
+def _resolve_tournament_review_summary_path(job: JobContext, cfg: dict[str, Any]) -> Path | None:
+    configured = str(cfg.get("tournament_review_summary_path", "")).strip()
+    if configured:
+        return _resolve_storage_path(job.paths.drive_root, configured, Path(configured))
+
+    tournaments_dir = _resolve_storage_path(
+        job.paths.drive_root,
+        "reports/benchmarks/model_tournaments",
+        job.paths.drive_root / "reports" / "benchmarks" / "model_tournaments",
+    )
+    if not tournaments_dir.exists():
+        return None
+    candidates = sorted(
+        tournaments_dir.glob("model_tournament_*.json"),
+        key=lambda item: item.stat().st_mtime,
+        reverse=True,
+    )
+    return candidates[0] if candidates else None
+
+
+def _resolve_tournament_review_focus_model(
+    job: JobContext,
+    *,
+    cfg: dict[str, Any],
+    payload: dict[str, Any],
+) -> str:
+    requested = str(cfg.get("tournament_review_focus_model", "auto_tournament_winner")).strip() or "auto_tournament_winner"
+    normalized = requested.lower()
+    if normalized in {"auto_tournament_winner", "auto_winner"}:
+        auto_actions = payload.get("auto_actions", {})
+        if isinstance(auto_actions, dict):
+            winner_model_id = str(auto_actions.get("winner_model_id", "")).strip()
+            if winner_model_id:
+                return winner_model_id
+        ranking = payload.get("ranking", [])
+        if isinstance(ranking, list) and ranking:
+            first = ranking[0]
+            if isinstance(first, dict):
+                first_model_id = str(first.get("model_id", "")).strip()
+                if first_model_id:
+                    return first_model_id
+        return ""
+    if normalized in {"auto_best", "auto_promoted_best"}:
+        metadata = promoted_best_metadata(job.paths.models_root)
+        return str(metadata.get("model_id", "")).strip() if isinstance(metadata, dict) else ""
+    if normalized in {"auto_latest", "auto"}:
+        latest = latest_model_record(job.paths.models_root)
+        return str(latest.get("model_id", "")).strip() if isinstance(latest, dict) else ""
+    return requested
+
+
+def _augment_matchups_with_tournament_review(
+    job: JobContext,
+    *,
+    cfg: dict[str, Any],
+    base_matchups: list[str],
+) -> tuple[list[str], dict[str, Any]]:
+    enabled = _as_bool(cfg.get("tournament_review_enabled", False), default=False)
+    if not enabled:
+        return list(base_matchups), {"enabled": False, "added": 0}
+
+    summary_path = _resolve_tournament_review_summary_path(job, cfg)
+    if summary_path is None or not summary_path.exists():
+        job.logger.warning(
+            "dataset generation tournament review enabled but summary missing | path=%s",
+            summary_path,
+        )
+        return list(base_matchups), {
+            "enabled": True,
+            "added": 0,
+            "reason": "summary_missing",
+            "summary_path": str(summary_path) if summary_path is not None else "",
+        }
+
+    payload = _read_json(summary_path)
+    if not isinstance(payload, dict):
+        return list(base_matchups), {
+            "enabled": True,
+            "added": 0,
+            "reason": "invalid_payload",
+            "summary_path": str(summary_path),
+        }
+
+    focus_model = _resolve_tournament_review_focus_model(job, cfg=cfg, payload=payload)
+    if not focus_model:
+        return list(base_matchups), {
+            "enabled": True,
+            "added": 0,
+            "reason": "missing_focus_model",
+            "summary_path": str(summary_path),
+        }
+
+    pairs_payload = payload.get("pairs", [])
+    top_k = max(1, int(cfg.get("tournament_review_top_k", 4)))
+    repeat_factor = max(1, int(cfg.get("tournament_review_repeat_factor", 2)))
+    max_added_matchups = max(1, int(cfg.get("tournament_review_max_added_matchups", 12)))
+    max_score_rate = float(cfg.get("tournament_review_max_score_rate", 0.55))
+    include_reverse = _as_bool(cfg.get("tournament_review_include_reverse_matchup", True), default=True)
+
+    # opponent -> {"weighted_score_sum": float, "weighted_max_score_sum": float, "games": int}
+    aggregated: dict[str, dict[str, float]] = {}
+    if isinstance(pairs_payload, list):
+        for item in pairs_payload:
+            if not isinstance(item, dict):
+                continue
+            model_a = str(item.get("model_a", "")).strip()
+            model_b = str(item.get("model_b", "")).strip()
+            if not model_a or not model_b:
+                continue
+            if focus_model not in {model_a, model_b}:
+                continue
+            opponent = model_b if model_a == focus_model else model_a
+            if not opponent or opponent == focus_model:
+                continue
+
+            games = max(1, int(item.get("games", 0) or 0))
+            draws = max(0, int(item.get("draws", 0) or 0))
+            wins_focus = max(
+                0,
+                int(item.get("wins_a", 0) or 0) if model_a == focus_model else int(item.get("wins_b", 0) or 0),
+            )
+            points_focus_default = (wins_focus * 3) + draws
+            points_focus = (
+                max(0, int(item.get("points_a", points_focus_default) or points_focus_default))
+                if model_a == focus_model
+                else max(0, int(item.get("points_b", points_focus_default) or points_focus_default))
+            )
+            max_points = max(1, games * 3)
+            row = aggregated.setdefault(
+                opponent,
+                {"weighted_score_sum": 0.0, "weighted_max_score_sum": 0.0, "games": 0.0},
+            )
+            row["weighted_score_sum"] += float(points_focus)
+            row["weighted_max_score_sum"] += float(max_points)
+            row["games"] += float(games)
+
+    normalized: list[dict[str, Any]] = []
+    for opponent, stats in aggregated.items():
+        denom = float(stats.get("weighted_max_score_sum", 0.0) or 0.0)
+        score_rate = (float(stats.get("weighted_score_sum", 0.0)) / denom) if denom > 0 else 0.0
+        normalized.append(
+            {
+                "opponent": opponent,
+                "score_rate": score_rate,
+                "games": int(stats.get("games", 0.0) or 0.0),
+            }
+        )
+
+    if not normalized:
+        ranking_payload = payload.get("ranking", [])
+        ranking_model_ids: list[str] = []
+        if isinstance(ranking_payload, list):
+            for row in ranking_payload:
+                if not isinstance(row, dict):
+                    continue
+                model_id = str(row.get("model_id", "")).strip()
+                if model_id and model_id != focus_model:
+                    ranking_model_ids.append(model_id)
+        if not ranking_model_ids:
+            return list(base_matchups), {
+                "enabled": True,
+                "added": 0,
+                "reason": "no_pairs_for_focus_model",
+                "summary_path": str(summary_path),
+                "focus_model": focus_model,
+            }
+        normalized = [
+            {"opponent": model_id, "score_rate": 0.0, "games": 0}
+            for model_id in ranking_model_ids[:top_k]
+        ]
+
+    normalized.sort(key=lambda item: (float(item["score_rate"]), -int(item["games"]), str(item["opponent"])))
+    selected = [item for item in normalized if float(item["score_rate"]) <= max_score_rate]
+    if not selected:
+        selected = normalized[:top_k]
+    else:
+        selected = selected[:top_k]
+
+    added_raw: list[str] = []
+    for item in selected:
+        opponent = str(item.get("opponent", "")).strip()
+        if not opponent or opponent == focus_model:
+            continue
+        direct_matchup = f"model:{focus_model} vs model:{opponent}"
+        reverse_matchup = f"model:{opponent} vs model:{focus_model}"
+        for _ in range(repeat_factor):
+            added_raw.append(direct_matchup)
+            if include_reverse:
+                added_raw.append(reverse_matchup)
+            if len(added_raw) >= max_added_matchups:
+                break
+        if len(added_raw) >= max_added_matchups:
+            break
+
+    existing = {str(matchup).strip() for matchup in base_matchups if str(matchup).strip()}
+    added_unique: list[str] = []
+    for matchup in added_raw:
+        normalized_matchup = str(matchup).strip()
+        if not normalized_matchup or normalized_matchup in existing:
+            continue
+        existing.add(normalized_matchup)
+        added_unique.append(normalized_matchup)
+        if len(added_unique) >= max_added_matchups:
+            break
+
+    final_matchups = list(base_matchups) + added_unique
+    info = {
+        "enabled": True,
+        "added": len(added_unique),
+        "summary_path": str(summary_path),
+        "focus_model": focus_model,
+        "selected_opponents": [str(item.get("opponent", "")) for item in selected],
+        "repeat_factor": repeat_factor,
+        "top_k": top_k,
+        "max_score_rate": max_score_rate,
+        "max_added_matchups": max_added_matchups,
+        "include_reverse_matchup": include_reverse,
+    }
+    return final_matchups, info
+
+
 def _validate_generation_agent_spec(
     spec: str,
     *,
@@ -4775,6 +4996,28 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
                 selected_opponents=benchmark_review_info.get("selected_opponents", []),
                 summary_path=str(benchmark_review_info.get("summary_path", "")),
                 reason=str(benchmark_review_info.get("reason", "")),
+            )
+        matchups, tournament_review_info = _augment_matchups_with_tournament_review(
+            job,
+            cfg=cfg,
+            base_matchups=[str(matchup) for matchup in matchups],
+        )
+        if bool(tournament_review_info.get("enabled", False)):
+            job.logger.info(
+                "dataset generation tournament review enrichment | added_matchups=%s | focus_model=%s | selected_opponents=%s | summary_path=%s",
+                int(tournament_review_info.get("added", 0)),
+                str(tournament_review_info.get("focus_model", "")) or "<none>",
+                tournament_review_info.get("selected_opponents", []),
+                str(tournament_review_info.get("summary_path", "")) or "<none>",
+            )
+            job.write_event(
+                "dataset_generation_tournament_review_enrichment",
+                added_matchups=int(tournament_review_info.get("added", 0)),
+                focus_model=str(tournament_review_info.get("focus_model", "")),
+                selected_opponents=tournament_review_info.get("selected_opponents", []),
+                summary_path=str(tournament_review_info.get("summary_path", "")),
+                reason=str(tournament_review_info.get("reason", "")),
+                include_reverse_matchup=bool(tournament_review_info.get("include_reverse_matchup", False)),
             )
 
         validation_cache: dict[str, tuple[bool, str]] = {}

@@ -78,3 +78,12 @@ dataset_generation:
   benchmark_review_max_winrate: 0.35
   benchmark_review_max_added_matchups: 12
   benchmark_review_supported_only: true
+  # Tournament inter-models review mini-dataset enrichment
+  tournament_review_enabled: true
+  tournament_review_focus_model: auto_tournament_winner  # auto_tournament_winner | auto_best | auto_latest | <model_id>
+  tournament_review_summary_path: ""  # vide => dernier rapport reports/benchmarks/model_tournaments/model_tournament_*.json
+  tournament_review_top_k: 4
+  tournament_review_repeat_factor: 2
+  tournament_review_max_score_rate: 0.55
+  tournament_review_max_added_matchups: 12
+  tournament_review_include_reverse_matchup: true
