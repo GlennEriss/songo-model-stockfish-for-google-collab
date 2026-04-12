@@ -3098,14 +3098,18 @@ cells = [
         # Tournoi round-robin entre modeles uniquement (sans minimax/mcts)
         import json
         import itertools
+        import os
+        import platform
+        import shutil
+        import socket
         import sys
         import time
+        import uuid
+        from contextlib import contextmanager
         from pathlib import Path
         from datetime import UTC, datetime
 
         sys.path.insert(0, f"{WORKTREE}/src")
-        from songo_model_stockfish.benchmark.model_agent import ModelAgent
-        from songo_model_stockfish.benchmark.play_match import play_match
         from songo_model_stockfish.ops.model_registry import load_registry, save_registry, promote_best_model
 
         TOURNAMENT_GAMES_PER_PAIR = 8   # total games par paire
@@ -3117,7 +3121,30 @@ cells = [
         TOURNAMENT_MODEL_SEARCH_TOP_K = 4
         TOURNAMENT_MODEL_SEARCH_POLICY_WEIGHT = 0.35
         TOURNAMENT_MODEL_SEARCH_VALUE_WEIGHT = 1.0
-        TOURNAMENT_LOG_EACH_GAME = True
+        TOURNAMENT_LOG_EACH_GAME = False
+        TOURNAMENT_INCLUDE_GAME_LOGS_IN_REPORT = False
+        TOURNAMENT_MAX_GAME_LOGS_PER_PAIR = 0  # 0 = illimite
+        TOURNAMENT_PARALLEL_ENABLED = True
+        TOURNAMENT_PARALLEL_BACKEND = 'process'  # 'process', 'thread', 'sequential'
+        TOURNAMENT_MAX_PARALLEL_PAIRS = 4
+        TOURNAMENT_PARALLEL_FALLBACK_SEQUENTIAL = True
+        TOURNAMENT_PARALLEL_SECONDARY_BACKEND = 'thread'
+        TOURNAMENT_PROCESS_START_METHOD = 'auto'  # 'auto', 'spawn', 'forkserver', 'fork'
+        TOURNAMENT_CPU_THREADS_PER_WORKER = 1
+        TOURNAMENT_AUTO_CAP_PARALLEL_BY_CPU = True
+        TOURNAMENT_MAX_PARALLEL_PAIRS_HARD_CAP = 16
+        TOURNAMENT_RETRY_FAILED_PAIRS = 1
+        TOURNAMENT_RETRY_FAILED_PAIRS_BACKEND = 'thread'
+        TOURNAMENT_AUTO_ACTIONS_MIN_GAMES_PER_PAIR = 20
+        TOURNAMENT_DISABLE_AUTO_ACTIONS_WHEN_LOW_GAMES = True
+        TOURNAMENT_GLOBAL_LOCK_ENABLED = True
+        TOURNAMENT_GLOBAL_LOCK_BACKEND = 'firestore'  # 'firestore' ou 'drive'
+        TOURNAMENT_GLOBAL_LOCK_COLLECTION = 'tournament_locks'
+        TOURNAMENT_GLOBAL_LOCK_ID = 'inter_models_rankings'
+        TOURNAMENT_GLOBAL_LOCK_TTL_SECONDS = 1800
+        TOURNAMENT_GLOBAL_LOCK_WAIT_SECONDS = 120
+        TOURNAMENT_GLOBAL_LOCK_POLL_SECONDS = 2.0
+        TOURNAMENT_ABORT_AUTO_ACTIONS_IF_MODEL_SET_CHANGED = True
         TOURNAMENT_AUTO_PRUNE_ENABLED = True
         TOURNAMENT_AUTO_PRUNE_COUNT = 3
         TOURNAMENT_MIN_MODELS_TO_KEEP = 3
@@ -3162,18 +3189,323 @@ cells = [
         for m in models:
             print(' -', m['model_id'])
 
-        agents = {
-            m['model_id']: ModelAgent(
-                m['checkpoint_path'],
-                display_name=m['model_id'],
-                device=TOURNAMENT_DEVICE,
-                search_enabled=TOURNAMENT_MODEL_SEARCH_ENABLED,
-                search_top_k=TOURNAMENT_MODEL_SEARCH_TOP_K,
-                search_policy_weight=TOURNAMENT_MODEL_SEARCH_POLICY_WEIGHT,
-                search_value_weight=TOURNAMENT_MODEL_SEARCH_VALUE_WEIGHT,
+        model_ids = [m['model_id'] for m in models]
+        model_checkpoint_by_id = {m['model_id']: str(m['checkpoint_path']) for m in models}
+        fixtures = [{'left': left, 'right': right} for left, right in itertools.combinations(model_ids, 2)]
+        print('Paires a jouer =', len(fixtures))
+        if len(fixtures) == 0:
+            raise ValueError('Tournoi impossible: aucune paire generee.')
+
+        auto_actions_allowed = True
+        min_games_for_auto_actions = max(1, int(TOURNAMENT_AUTO_ACTIONS_MIN_GAMES_PER_PAIR))
+        if bool(TOURNAMENT_DISABLE_AUTO_ACTIONS_WHEN_LOW_GAMES) and int(TOURNAMENT_GAMES_PER_PAIR) < min_games_for_auto_actions:
+            auto_actions_allowed = False
+            print(
+                'auto_actions_guard     = disabled (games_per_pair insuffisant) | '
+                f'games_per_pair={int(TOURNAMENT_GAMES_PER_PAIR)} < min_required={min_games_for_auto_actions}'
             )
-            for m in models
-        }
+        else:
+            print(
+                'auto_actions_guard     = enabled | '
+                f'games_per_pair={int(TOURNAMENT_GAMES_PER_PAIR)}'
+            )
+
+        cpu_count = max(1, int(os.cpu_count() or 1))
+        requested_parallel_workers = max(1, int(TOURNAMENT_MAX_PARALLEL_PAIRS))
+        hard_cap = max(1, int(TOURNAMENT_MAX_PARALLEL_PAIRS_HARD_CAP))
+        requested_parallel_workers = min(requested_parallel_workers, hard_cap)
+        if bool(TOURNAMENT_AUTO_CAP_PARALLEL_BY_CPU):
+            requested_parallel_workers = min(requested_parallel_workers, cpu_count)
+        effective_parallel_workers = min(requested_parallel_workers, max(1, len(fixtures)))
+        print(
+            'Parallelisme tournoi =',
+            (
+                f"{effective_parallel_workers} pair(s) simultanees"
+                if bool(TOURNAMENT_PARALLEL_ENABLED)
+                and str(TOURNAMENT_PARALLEL_BACKEND).strip().lower() != 'sequential'
+                and effective_parallel_workers > 1
+                else '1 paire simultanee (sequentiel)'
+            ),
+            '| cpu_count =', cpu_count,
+            '| max_pairs_requested =', TOURNAMENT_MAX_PARALLEL_PAIRS,
+            '| hard_cap =', TOURNAMENT_MAX_PARALLEL_PAIRS_HARD_CAP,
+        )
+
+        def _apply_runtime_thread_limits(threads: int) -> None:
+            n_threads = max(1, int(threads))
+            os.environ['OMP_NUM_THREADS'] = str(n_threads)
+            os.environ['MKL_NUM_THREADS'] = str(n_threads)
+            os.environ['OPENBLAS_NUM_THREADS'] = str(n_threads)
+            os.environ['NUMEXPR_NUM_THREADS'] = str(n_threads)
+            os.environ['VECLIB_MAXIMUM_THREADS'] = str(n_threads)
+            os.environ['BLIS_NUM_THREADS'] = str(n_threads)
+            try:
+                import torch
+                torch.set_num_threads(n_threads)
+                if hasattr(torch, 'set_num_interop_threads'):
+                    torch.set_num_interop_threads(1)
+            except Exception:
+                pass
+
+        _apply_runtime_thread_limits(int(TOURNAMENT_CPU_THREADS_PER_WORKER))
+        print('CPU threads/worker    =', int(TOURNAMENT_CPU_THREADS_PER_WORKER))
+
+        def _winner_label_for_pair(winner: int | None, left: str, right: str) -> str:
+            if winner == 0:
+                return left
+            if winner == 1:
+                return right
+            return 'draw'
+
+        def _resolve_process_start_method(preferred: str) -> str:
+            import multiprocessing as mp
+
+            preferred_norm = str(preferred).strip().lower()
+            methods = [str(m).strip().lower() for m in mp.get_all_start_methods()]
+            if preferred_norm and preferred_norm != 'auto':
+                if preferred_norm in methods:
+                    return preferred_norm
+                raise ValueError(f'Process start method non supporte: {preferred_norm} (available={methods})')
+            # auto: priorite portabilite/stabilite, pas fork en premier.
+            for candidate in ('forkserver', 'spawn', 'fork'):
+                if candidate in methods:
+                    return candidate
+            return mp.get_start_method(allow_none=True) or 'spawn'
+
+        def _run_pair_series(task: dict) -> dict:
+            from songo_model_stockfish.benchmark.model_agent import ModelAgent as _ModelAgent
+            from songo_model_stockfish.benchmark.play_match import play_match as _play_match
+
+            left = str(task['left'])
+            right = str(task['right'])
+            left_checkpoint_path = str(task['left_checkpoint_path'])
+            right_checkpoint_path = str(task['right_checkpoint_path'])
+            games = int(task['games'])
+            max_moves = int(task['max_moves'])
+            device = str(task['device'])
+            search_enabled = bool(task['search_enabled'])
+            search_top_k = int(task['search_top_k'])
+            search_policy_weight = float(task['search_policy_weight'])
+            search_value_weight = float(task['search_value_weight'])
+            capture_game_logs = bool(task.get('capture_game_logs', False))
+            max_game_logs = int(task.get('max_game_logs', 0))
+            thread_limit = int(task.get('thread_limit', 1))
+
+            _apply_runtime_thread_limits(thread_limit)
+
+            left_agent = _ModelAgent(
+                left_checkpoint_path,
+                display_name=left,
+                device=device,
+                search_enabled=search_enabled,
+                search_top_k=search_top_k,
+                search_policy_weight=search_policy_weight,
+                search_value_weight=search_value_weight,
+            )
+            right_agent = _ModelAgent(
+                right_checkpoint_path,
+                display_name=right,
+                device=device,
+                search_enabled=search_enabled,
+                search_top_k=search_top_k,
+                search_policy_weight=search_policy_weight,
+                search_value_weight=search_value_weight,
+            )
+
+            wins_left = 0
+            wins_right = 0
+            draws = 0
+            total_moves_pair = 0
+            game_logs: list[dict] = []
+            game_logs_truncated = False
+            for game_idx in range(games):
+                starter = game_idx % 2
+                result = _play_match(left_agent, right_agent, max_moves=max_moves, starter=starter)
+                if result.winner == 0:
+                    wins_left += 1
+                elif result.winner == 1:
+                    wins_right += 1
+                else:
+                    draws += 1
+                moves = int(result.moves)
+                total_moves_pair += moves
+                if capture_game_logs:
+                    if max_game_logs <= 0 or len(game_logs) < max_game_logs:
+                        game_logs.append(
+                            {
+                                'game_index': game_idx + 1,
+                                'starter': 'left' if starter == 0 else 'right',
+                                'winner_label': _winner_label_for_pair(result.winner, left, right),
+                                'moves': moves,
+                                'reason': str(result.reason),
+                            }
+                        )
+                    else:
+                        game_logs_truncated = True
+            return {
+                'model_a': left,
+                'model_b': right,
+                'games': games,
+                'wins_a': wins_left,
+                'wins_b': wins_right,
+                'draws': draws,
+                'points_a': (wins_left * 3) + draws,
+                'points_b': (wins_right * 3) + draws,
+                'total_moves': int(total_moves_pair),
+                'avg_moves': (float(total_moves_pair) / float(games)) if games > 0 else 0.0,
+                'game_logs': game_logs if capture_game_logs else [],
+                'game_logs_truncated': bool(game_logs_truncated),
+            }
+
+        capture_game_logs = bool(TOURNAMENT_LOG_EACH_GAME) or bool(TOURNAMENT_INCLUDE_GAME_LOGS_IN_REPORT)
+        task_payloads = [
+            {
+                'left': task['left'],
+                'right': task['right'],
+                'left_checkpoint_path': model_checkpoint_by_id[task['left']],
+                'right_checkpoint_path': model_checkpoint_by_id[task['right']],
+                'games': int(TOURNAMENT_GAMES_PER_PAIR),
+                'max_moves': int(TOURNAMENT_MAX_MOVES),
+                'device': str(TOURNAMENT_DEVICE),
+                'search_enabled': bool(TOURNAMENT_MODEL_SEARCH_ENABLED),
+                'search_top_k': int(TOURNAMENT_MODEL_SEARCH_TOP_K),
+                'search_policy_weight': float(TOURNAMENT_MODEL_SEARCH_POLICY_WEIGHT),
+                'search_value_weight': float(TOURNAMENT_MODEL_SEARCH_VALUE_WEIGHT),
+                'capture_game_logs': bool(capture_game_logs),
+                'max_game_logs': int(TOURNAMENT_MAX_GAME_LOGS_PER_PAIR),
+                'thread_limit': int(TOURNAMENT_CPU_THREADS_PER_WORKER),
+            }
+            for task in fixtures
+        ]
+
+        def _execute_with_backend(payloads: list[dict], backend_name: str, max_workers: int) -> tuple[list[dict], list[dict], str]:
+            backend = str(backend_name).strip().lower()
+            workers = max(1, min(int(max_workers), len(payloads)))
+            results: list[dict] = []
+            failed: list[dict] = []
+            backend_error = ''
+            try:
+                if backend == 'thread':
+                    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+                    with ThreadPoolExecutor(max_workers=workers) as pool:
+                        future_map = {pool.submit(_run_pair_series, payload): payload for payload in payloads}
+                        for future in as_completed(future_map):
+                            payload = future_map[future]
+                            try:
+                                results.append(future.result())
+                            except Exception as exc:
+                                failed.append({'payload': payload, 'error': f'{type(exc).__name__}: {exc}'})
+                elif backend == 'process':
+                    import multiprocessing as mp
+                    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+                    method = _resolve_process_start_method(str(TOURNAMENT_PROCESS_START_METHOD))
+                    print(f'process start_method     = {method}')
+                    mp_ctx = mp.get_context(method)
+                    with ProcessPoolExecutor(max_workers=workers, mp_context=mp_ctx) as pool:
+                        future_map = {pool.submit(_run_pair_series, payload): payload for payload in payloads}
+                        for future in as_completed(future_map):
+                            payload = future_map[future]
+                            try:
+                                results.append(future.result())
+                            except Exception as exc:
+                                failed.append({'payload': payload, 'error': f'{type(exc).__name__}: {exc}'})
+                else:
+                    raise ValueError(f'Backend parallel inconnu: {backend}')
+            except Exception as exc:
+                backend_error = f'{type(exc).__name__}: {exc}'
+            return results, failed, backend_error
+
+        def _execute_sequential(payloads: list[dict]) -> tuple[list[dict], list[dict]]:
+            results: list[dict] = []
+            failed: list[dict] = []
+            for payload in payloads:
+                try:
+                    results.append(_run_pair_series(payload))
+                except Exception as exc:
+                    failed.append({'payload': payload, 'error': f'{type(exc).__name__}: {exc}'})
+            return results, failed
+
+        pair_results: list[dict] = []
+        pending_payloads = list(task_payloads)
+        parallel_mode = (
+            bool(TOURNAMENT_PARALLEL_ENABLED)
+            and str(TOURNAMENT_PARALLEL_BACKEND).strip().lower() != 'sequential'
+            and effective_parallel_workers > 1
+        )
+        if parallel_mode:
+            primary_backend = str(TOURNAMENT_PARALLEL_BACKEND).strip().lower()
+            print(f'Execution parallelisee: backend={primary_backend} | workers={effective_parallel_workers}')
+            current_payloads = list(pending_payloads)
+            results, failed, backend_error = _execute_with_backend(current_payloads, primary_backend, effective_parallel_workers)
+            pair_results.extend(results)
+            pending_payloads = list(current_payloads) if (backend_error and not results and not failed) else [item['payload'] for item in failed]
+            for item in failed[:5]:
+                print('pair_failed(primary)   =', item['error'])
+            if len(failed) > 5:
+                print(f'pair_failed(primary)   = +{len(failed) - 5} erreurs')
+            if backend_error:
+                print('parallel_backend_error =', backend_error)
+
+            secondary_backend = str(TOURNAMENT_PARALLEL_SECONDARY_BACKEND).strip().lower()
+            if pending_payloads and secondary_backend and secondary_backend not in ('', primary_backend, 'sequential'):
+                print(f'Retry backend secondaire: backend={secondary_backend} | pairs={len(pending_payloads)}')
+                secondary_workers = min(effective_parallel_workers, max(1, len(pending_payloads)))
+                current_payloads = list(pending_payloads)
+                sec_results, sec_failed, sec_backend_error = _execute_with_backend(current_payloads, secondary_backend, secondary_workers)
+                pair_results.extend(sec_results)
+                pending_payloads = list(current_payloads) if (sec_backend_error and not sec_results and not sec_failed) else [item['payload'] for item in sec_failed]
+                for item in sec_failed[:5]:
+                    print('pair_failed(secondary) =', item['error'])
+                if len(sec_failed) > 5:
+                    print(f'pair_failed(secondary) = +{len(sec_failed) - 5} erreurs')
+                if sec_backend_error:
+                    print('secondary_backend_error =', sec_backend_error)
+
+            retry_rounds = max(0, int(TOURNAMENT_RETRY_FAILED_PAIRS))
+            retry_backend = str(TOURNAMENT_RETRY_FAILED_PAIRS_BACKEND).strip().lower() or 'thread'
+            for retry_idx in range(retry_rounds):
+                if not pending_payloads:
+                    break
+                print(f'Retry pairs {retry_idx + 1}/{retry_rounds} | backend={retry_backend} | pairs={len(pending_payloads)}')
+                retry_workers = min(effective_parallel_workers, max(1, len(pending_payloads)))
+                current_payloads = list(pending_payloads)
+                retry_results, retry_failed, retry_backend_error = _execute_with_backend(current_payloads, retry_backend, retry_workers)
+                pair_results.extend(retry_results)
+                pending_payloads = list(current_payloads) if (retry_backend_error and not retry_results and not retry_failed) else [item['payload'] for item in retry_failed]
+                for item in retry_failed[:5]:
+                    print(f'pair_failed(retry#{retry_idx + 1}) =', item['error'])
+                if len(retry_failed) > 5:
+                    print(f'pair_failed(retry#{retry_idx + 1}) = +{len(retry_failed) - 5} erreurs')
+                if retry_backend_error:
+                    print(f'retry_backend_error#{retry_idx + 1} =', retry_backend_error)
+
+        if not parallel_mode:
+            print('Execution sequentielle: parallel_mode=off')
+
+        if pending_payloads:
+            if bool(TOURNAMENT_PARALLEL_FALLBACK_SEQUENTIAL):
+                print(f'Fallback sequentiel cible | pairs restantes={len(pending_payloads)}')
+                seq_results, seq_failed = _execute_sequential(pending_payloads)
+                pair_results.extend(seq_results)
+                pending_payloads = [item['payload'] for item in seq_failed]
+                for item in seq_failed[:5]:
+                    print('pair_failed(sequential) =', item['error'])
+                if len(seq_failed) > 5:
+                    print(f'pair_failed(sequential) = +{len(seq_failed) - 5} erreurs')
+            else:
+                raise RuntimeError(
+                    f'{len(pending_payloads)} paires en echec et fallback sequentiel desactive.'
+                )
+
+        if pending_payloads:
+            failed_pairs = [f"{item['left']} vs {item['right']}" for item in pending_payloads]
+            raise RuntimeError(
+                'Tournoi incomplet: certaines paires ont echoue apres retries. '
+                f'failed_pairs={failed_pairs}'
+            )
+
         table = {
             m['model_id']: {
                 'model_id': m['model_id'],
@@ -3189,38 +3521,60 @@ cells = [
         }
 
         pair_summaries = []
-        for left, right in itertools.combinations([m['model_id'] for m in models], 2):
-            wins_left = 0
-            wins_right = 0
-            draws = 0
-            total_moves_pair = 0
-            for game_idx in range(TOURNAMENT_GAMES_PER_PAIR):
-                starter = game_idx % 2
-                result = play_match(
-                    agents[left],
-                    agents[right],
-                    max_moves=TOURNAMENT_MAX_MOVES,
-                    starter=starter,
-                )
-                if result.winner == 0:
-                    wins_left += 1
-                    winner_label = left
-                elif result.winner == 1:
-                    wins_right += 1
-                    winner_label = right
-                else:
-                    draws += 1
-                    winner_label = 'draw'
-                total_moves_pair += int(result.moves)
-                if TOURNAMENT_LOG_EACH_GAME:
-                    print(
-                        f"game {game_idx + 1:>3}/{TOURNAMENT_GAMES_PER_PAIR:<3} | "
-                        f"{left} vs {right} | starter={'left' if starter == 0 else 'right'} | "
-                        f"winner={winner_label} | moves={int(result.moves)} | reason={result.reason}"
-                    )
+        pair_results_by_key = {
+            (str(item.get('model_a', '')).strip(), str(item.get('model_b', '')).strip()): item
+            for item in pair_results
+            if isinstance(item, dict)
+        }
+        if len(pair_results_by_key) != len(pair_results):
+            raise RuntimeError(
+                'Resultats tournoi invalides: paires dupliquees detectees '
+                f'(results={len(pair_results)}, unique_pairs={len(pair_results_by_key)}).'
+            )
+        if len(pair_results_by_key) != len(fixtures):
+            raise RuntimeError(
+                'Resultats tournoi incomplets: nombre de paires inattendu '
+                f'(expected={len(fixtures)}, received={len(pair_results_by_key)}).'
+            )
+        for task in fixtures:
+            left = str(task['left'])
+            right = str(task['right'])
+            series = pair_results_by_key.get((left, right))
+            if series is None:
+                raise RuntimeError(f'Resultat de paire introuvable: {left} vs {right}')
 
-            table[left]['played'] += TOURNAMENT_GAMES_PER_PAIR
-            table[right]['played'] += TOURNAMENT_GAMES_PER_PAIR
+            wins_left = int(series.get('wins_a', 0))
+            wins_right = int(series.get('wins_b', 0))
+            draws = int(series.get('draws', 0))
+            total_moves_pair = int(series.get('total_moves', 0))
+            games_for_pair = int(series.get('games', TOURNAMENT_GAMES_PER_PAIR))
+            pair_game_logs = list(series.get('game_logs', []))
+            pair_logs_truncated = bool(series.get('game_logs_truncated', False))
+            if (wins_left + wins_right + draws) != games_for_pair:
+                raise RuntimeError(
+                    f'Incoherence score paire {left} vs {right}: '
+                    f'wins_left+wins_right+draws={wins_left + wins_right + draws} '
+                    f'!= games={games_for_pair}'
+                )
+
+            if TOURNAMENT_LOG_EACH_GAME:
+                for game_row in pair_game_logs:
+                    print(
+                        f"game {int(game_row.get('game_index', 0)):>3}/{games_for_pair:<3} | "
+                        f"{left} vs {right} | starter={str(game_row.get('starter', '<none>'))} | "
+                        f"winner={str(game_row.get('winner_label', '<none>'))} | "
+                        f"moves={int(game_row.get('moves', 0))} | reason={str(game_row.get('reason', '<none>'))}"
+                    )
+                if pair_logs_truncated:
+                    print(
+                        f'game_logs_truncated   = yes | pair={left} vs {right} | '
+                        f'max_game_logs_per_pair={int(TOURNAMENT_MAX_GAME_LOGS_PER_PAIR)}'
+                    )
+            if not TOURNAMENT_INCLUDE_GAME_LOGS_IN_REPORT:
+                series['game_logs'] = []
+
+            table[left]['played'] += games_for_pair
+            table[right]['played'] += games_for_pair
             table[left]['wins'] += wins_left
             table[left]['draws'] += draws
             table[left]['losses'] += wins_right
@@ -3230,29 +3584,47 @@ cells = [
 
             table[left]['points'] += (wins_left * 3) + draws
             table[right]['points'] += (wins_right * 3) + draws
-            table[left]['max_points'] += TOURNAMENT_GAMES_PER_PAIR * 3
-            table[right]['max_points'] += TOURNAMENT_GAMES_PER_PAIR * 3
+            table[left]['max_points'] += games_for_pair * 3
+            table[right]['max_points'] += games_for_pair * 3
 
-            pair_summaries.append(
-                {
-                    'model_a': left,
-                    'model_b': right,
-                    'games': TOURNAMENT_GAMES_PER_PAIR,
-                    'wins_a': wins_left,
-                    'wins_b': wins_right,
-                    'draws': draws,
-                    'points_a': (wins_left * 3) + draws,
-                    'points_b': (wins_right * 3) + draws,
-                    'total_moves': int(total_moves_pair),
-                    'avg_moves': (float(total_moves_pair) / float(TOURNAMENT_GAMES_PER_PAIR)) if TOURNAMENT_GAMES_PER_PAIR > 0 else 0.0,
-                }
-            )
+            pair_summary = {
+                'model_a': left,
+                'model_b': right,
+                'games': games_for_pair,
+                'wins_a': wins_left,
+                'wins_b': wins_right,
+                'draws': draws,
+                'points_a': (wins_left * 3) + draws,
+                'points_b': (wins_right * 3) + draws,
+                'total_moves': total_moves_pair,
+                'avg_moves': (float(total_moves_pair) / float(games_for_pair)) if games_for_pair > 0 else 0.0,
+                'game_logs_truncated': pair_logs_truncated,
+            }
+            if TOURNAMENT_INCLUDE_GAME_LOGS_IN_REPORT:
+                pair_summary['game_logs'] = pair_game_logs
+            pair_summaries.append(pair_summary)
             print(
                 f"pair done: {left} vs {right} | "
                 f"W={wins_left}-{wins_right} D={draws} | "
                 f"score={((wins_left * 3) + draws)}-{((wins_right * 3) + draws)} | "
-                f"avg_moves={((float(total_moves_pair) / float(TOURNAMENT_GAMES_PER_PAIR)) if TOURNAMENT_GAMES_PER_PAIR > 0 else 0.0):.2f}"
+                f"avg_moves={pair_summary['avg_moves']:.2f}"
             )
+
+        total_games_played = sum(int(item.get('games', 0)) for item in pair_summaries)
+        total_draws_played = sum(int(item.get('draws', 0)) for item in pair_summaries)
+        total_points_expected = (3 * total_games_played) - total_draws_played
+        total_points_actual = sum(int(row.get('points', 0)) for row in table.values())
+        if total_points_actual != total_points_expected:
+            raise RuntimeError(
+                'Incoherence points tournoi: '
+                f'actual={total_points_actual} vs expected={total_points_expected} '
+                f'(games={total_games_played}, draws={total_draws_played}).'
+            )
+        print(
+            'integrity_check        = ok | '
+            f'total_games={total_games_played} | total_draws={total_draws_played} | '
+            f'total_points={total_points_actual}'
+        )
 
         for row in table.values():
             max_pts = int(row['max_points'])
@@ -3306,117 +3678,286 @@ cells = [
                 if _safe_unlink(path):
                     removed.append(str(path))
             return {'model_id': model_id, 'removed_paths': removed, 'removed_count': len(removed)}
+        def _acquire_firestore_lock(owner_id: str) -> dict:
+            from google.cloud import firestore
+
+            client = _get_firestore_client()
+            collection = str(TOURNAMENT_GLOBAL_LOCK_COLLECTION).strip() or 'tournament_locks'
+            doc_ref = client.collection(collection).document(str(TOURNAMENT_GLOBAL_LOCK_ID).strip() or 'inter_models_rankings')
+            ttl_seconds = max(30.0, float(TOURNAMENT_GLOBAL_LOCK_TTL_SECONDS))
+            wait_seconds = max(1.0, float(TOURNAMENT_GLOBAL_LOCK_WAIT_SECONDS))
+            poll_seconds = max(0.25, float(TOURNAMENT_GLOBAL_LOCK_POLL_SECONDS))
+            deadline = time.time() + wait_seconds
+            while time.time() < deadline:
+                tx = client.transaction()
+
+                @firestore.transactional
+                def _try_acquire(transaction):
+                    snap = doc_ref.get(transaction=transaction)
+                    payload = snap.to_dict() if snap.exists else {}
+                    if not isinstance(payload, dict):
+                        payload = {}
+                    now = time.time()
+                    lock_owner = str(payload.get('owner', '')).strip()
+                    expires_at_epoch = float(payload.get('expires_at_epoch', 0.0) or 0.0)
+                    if lock_owner and expires_at_epoch > now and lock_owner != owner_id:
+                        return {'acquired': False, 'owner': lock_owner, 'expires_at_epoch': expires_at_epoch}
+                    new_payload = {
+                        'owner': owner_id,
+                        'acquired_at_epoch': now,
+                        'expires_at_epoch': now + ttl_seconds,
+                        'updated_at': datetime.now(UTC).isoformat().replace('+00:00', 'Z'),
+                        'hostname': socket.gethostname(),
+                        'platform': platform.platform(),
+                    }
+                    transaction.set(doc_ref, new_payload)
+                    return {'acquired': True, 'owner': owner_id, 'expires_at_epoch': now + ttl_seconds}
+
+                result = _try_acquire(tx)
+                if bool(result.get('acquired', False)):
+                    result.update({'backend': 'firestore', 'client': client, 'doc_ref': doc_ref})
+                    return result
+                time.sleep(poll_seconds)
+            raise TimeoutError(
+                f'Impossible d obtenir le lock Firestore {collection}/{TOURNAMENT_GLOBAL_LOCK_ID} '
+                f'apres {wait_seconds}s.'
+            )
+
+        def _release_firestore_lock(lock_meta: dict, owner_id: str) -> None:
+            from google.cloud import firestore
+
+            client = lock_meta.get('client')
+            doc_ref = lock_meta.get('doc_ref')
+            if client is None or doc_ref is None:
+                return
+            tx = client.transaction()
+
+            @firestore.transactional
+            def _release(transaction):
+                snap = doc_ref.get(transaction=transaction)
+                if not snap.exists:
+                    return False
+                payload = snap.to_dict() or {}
+                lock_owner = str(payload.get('owner', '')).strip()
+                if lock_owner == owner_id:
+                    transaction.delete(doc_ref)
+                    return True
+                return False
+
+            _release(tx)
+
+        def _acquire_drive_lock(owner_id: str) -> dict:
+            lock_dir = Path(DRIVE_ROOT) / 'locks' / f"{str(TOURNAMENT_GLOBAL_LOCK_ID).strip() or 'inter_models_rankings'}.lock"
+            ttl_seconds = max(30.0, float(TOURNAMENT_GLOBAL_LOCK_TTL_SECONDS))
+            wait_seconds = max(1.0, float(TOURNAMENT_GLOBAL_LOCK_WAIT_SECONDS))
+            poll_seconds = max(0.25, float(TOURNAMENT_GLOBAL_LOCK_POLL_SECONDS))
+            lock_dir.parent.mkdir(parents=True, exist_ok=True)
+            deadline = time.time() + wait_seconds
+            while time.time() < deadline:
+                try:
+                    lock_dir.mkdir(parents=False, exist_ok=False)
+                    (lock_dir / 'owner.txt').write_text(owner_id, encoding='utf-8')
+                    return {'acquired': True, 'backend': 'drive', 'owner': owner_id, 'lock_dir': lock_dir}
+                except FileExistsError:
+                    try:
+                        stale = (time.time() - float(lock_dir.stat().st_mtime)) > ttl_seconds
+                    except Exception:
+                        stale = False
+                    if stale:
+                        shutil.rmtree(lock_dir, ignore_errors=True)
+                        continue
+                    time.sleep(poll_seconds)
+            raise TimeoutError(f'Impossible d obtenir le lock Drive {lock_dir} apres {wait_seconds}s.')
+
+        def _release_drive_lock(lock_meta: dict, owner_id: str) -> None:
+            lock_dir = lock_meta.get('lock_dir')
+            if not isinstance(lock_dir, Path):
+                return
+            owner_file = lock_dir / 'owner.txt'
+            try:
+                current_owner = owner_file.read_text(encoding='utf-8').strip() if owner_file.exists() else ''
+            except Exception:
+                current_owner = ''
+            if current_owner and current_owner != owner_id:
+                return
+            try:
+                shutil.rmtree(lock_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+        @contextmanager
+        def _tournament_global_lock():
+            lock_enabled = bool(TOURNAMENT_GLOBAL_LOCK_ENABLED)
+            owner_id = (
+                f"{str(WORKER_TAG).strip() or 'worker'}:"
+                f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+            )
+            if not lock_enabled:
+                yield {'acquired': False, 'backend': 'disabled', 'owner': owner_id}
+                return
+            backend = str(TOURNAMENT_GLOBAL_LOCK_BACKEND).strip().lower()
+            lock_meta = {}
+            if backend == 'firestore':
+                try:
+                    lock_meta = _acquire_firestore_lock(owner_id)
+                except Exception as exc:
+                    print('global_lock_firestore_error =', f'{type(exc).__name__}: {exc}')
+                    print('global_lock_fallback        = drive')
+                    lock_meta = _acquire_drive_lock(owner_id)
+            elif backend == 'drive':
+                lock_meta = _acquire_drive_lock(owner_id)
+            else:
+                raise ValueError(f'TOURNAMENT_GLOBAL_LOCK_BACKEND non supporte: {backend}')
+            try:
+                yield lock_meta
+            finally:
+                try:
+                    if str(lock_meta.get('backend', '')).strip() == 'firestore':
+                        _release_firestore_lock(lock_meta, owner_id)
+                    elif str(lock_meta.get('backend', '')).strip() == 'drive':
+                        _release_drive_lock(lock_meta, owner_id)
+                except Exception:
+                    pass
 
         prune_ids = []
         prune_details = []
-        if TOURNAMENT_AUTO_PRUNE_ENABLED and len(ranking) > TOURNAMENT_MIN_MODELS_TO_KEEP:
-            prune_count = min(
-                int(TOURNAMENT_AUTO_PRUNE_COUNT),
-                max(0, len(ranking) - int(TOURNAMENT_MIN_MODELS_TO_KEEP)),
-            )
-            if prune_count > 0:
-                prune_ids = [str(row.get('model_id', '')).strip() for row in ranking[-prune_count:]]
-                print('auto_prune            = enabled')
-                print('prune_count           =', prune_count)
-                print('pruned_models         =', prune_ids)
-                for model_id in prune_ids:
-                    details = _remove_model_artifacts(model_id)
-                    prune_details.append(details)
-                    print(f" - removed {model_id}: files={details['removed_count']}")
-            else:
-                print('auto_prune            = enabled but nothing to prune')
-        else:
-            print(
-                f'auto_prune            = skipped '
-                f'(models={len(ranking)} <= keep_threshold={TOURNAMENT_MIN_MODELS_TO_KEEP})'
-            )
-
-        # Synchroniser model_registry.json avec le resultat du tournoi:
-        # winner en tete, puis le reste, sans les modeles prunes.
-        live_registry = load_registry(models_root)
-        live_records = list(live_registry.get('models', [])) if isinstance(live_registry, dict) else []
-        record_map = {}
-        for item in live_records:
-            if not isinstance(item, dict):
-                continue
-            model_id = str(item.get('model_id', '')).strip()
-            if model_id:
-                record_map[model_id] = dict(item)
-
-        # Completer entries manquantes avec les checkpoints detectes en tournoi.
-        for model in models:
-            model_id = str(model.get('model_id', '')).strip()
-            if not model_id or model_id in prune_ids:
-                continue
-            checkpoint_path = Path(str(model.get('checkpoint_path', '')).strip())
-            if model_id not in record_map:
-                sort_ts = float(checkpoint_path.stat().st_mtime) if checkpoint_path.exists() else time.time()
-                record_map[model_id] = {
-                    'model_id': model_id,
-                    'checkpoint_path': str(checkpoint_path),
-                    'sort_ts': sort_ts,
-                    'best_validation_metric': -1.0,
-                    'evaluation_top1': -1.0,
-                    'benchmark_score': -1.0,
-                }
-            else:
-                rec = record_map[model_id]
-                if checkpoint_path.exists():
-                    rec['checkpoint_path'] = str(checkpoint_path)
-                rec.setdefault('sort_ts', time.time())
-                record_map[model_id] = rec
-
-        # Supprimer pruned du registre.
-        for model_id in prune_ids:
-            record_map.pop(model_id, None)
-
-        if winner_model_id not in record_map:
-            winner_ckpt = final_dir / f'{winner_model_id}.pt'
-            if not winner_ckpt.exists():
-                raise FileNotFoundError(
-                    f'Winner checkpoint introuvable pour promotion: {winner_ckpt}'
-                )
-            record_map[winner_model_id] = {
-                'model_id': winner_model_id,
-                'checkpoint_path': str(winner_ckpt),
-                'sort_ts': float(winner_ckpt.stat().st_mtime),
-                'best_validation_metric': -1.0,
-                'evaluation_top1': -1.0,
-                'benchmark_score': -1.0,
-            }
-
-        # Ordonnancement: winner d'abord, puis le reste du classement tournoi.
-        ranked_ids = [str(row.get('model_id', '')).strip() for row in ranking]
-        ordered_ids = [winner_model_id]
-        for model_id in ranked_ids:
-            if not model_id or model_id == winner_model_id or model_id in prune_ids:
-                continue
-            if model_id in record_map:
-                ordered_ids.append(model_id)
-        # Ajouter d'eventuels modeles hors tournoi encore presents dans le registre.
-        for model_id in sorted(record_map.keys()):
-            if model_id not in ordered_ids:
-                ordered_ids.append(model_id)
-
-        new_models = []
-        for idx, model_id in enumerate(ordered_ids, start=1):
-            rec = dict(record_map.get(model_id, {}))
-            if not rec:
-                continue
-            rec['rank'] = idx
-            new_models.append(rec)
-
-        save_registry(models_root, {'models': new_models})
-        print('registry_sync         = ok | models_kept =', len(new_models))
-
         promoted_meta = None
-        if TOURNAMENT_AUTO_PROMOTE_WINNER:
-            promoted_meta = promote_best_model(models_root)
-            print('auto_promote_winner   = enabled')
-            print('promoted_model_id     =', promoted_meta.get('model_id', '<none>') if isinstance(promoted_meta, dict) else '<none>')
-            print('promoted_checkpoint   =', promoted_meta.get('promoted_checkpoint_path', '<none>') if isinstance(promoted_meta, dict) else '<none>')
-        else:
-            print('auto_promote_winner   = disabled')
+        new_models = []
+        lock_metadata = {'acquired': False, 'backend': 'disabled'}
+        auto_actions_applied = bool(auto_actions_allowed)
+        auto_actions_reason = 'ok'
+
+        expected_model_set = sorted(str(mid).strip() for mid in model_ids if str(mid).strip())
+
+        with _tournament_global_lock() as lock_metadata:
+            print(
+                'global_lock            =',
+                str(lock_metadata.get('backend', '<none>')),
+                '| acquired =',
+                bool(lock_metadata.get('acquired', True)),
+            )
+            if bool(TOURNAMENT_ABORT_AUTO_ACTIONS_IF_MODEL_SET_CHANGED):
+                live_model_set = sorted(
+                    p.stem.strip()
+                    for p in final_dir.glob('*.pt')
+                    if p.is_file() and p.stem.strip()
+                ) if final_dir.exists() else []
+                if live_model_set != expected_model_set:
+                    auto_actions_applied = False
+                    auto_actions_reason = 'model_set_changed_during_tournament'
+                    print('auto_actions_guard     = disabled | reason=model_set_changed_during_tournament')
+
+            if not auto_actions_applied:
+                print('auto_prune            = skipped | reason=', auto_actions_reason)
+                print('registry_sync         = skipped | reason=', auto_actions_reason)
+                print('auto_promote_winner   = skipped | reason=', auto_actions_reason)
+            else:
+                if TOURNAMENT_AUTO_PRUNE_ENABLED and len(ranking) > TOURNAMENT_MIN_MODELS_TO_KEEP:
+                    prune_count = min(
+                        int(TOURNAMENT_AUTO_PRUNE_COUNT),
+                        max(0, len(ranking) - int(TOURNAMENT_MIN_MODELS_TO_KEEP)),
+                    )
+                    if prune_count > 0:
+                        prune_ids = [str(row.get('model_id', '')).strip() for row in ranking[-prune_count:]]
+                        print('auto_prune            = enabled')
+                        print('prune_count           =', prune_count)
+                        print('pruned_models         =', prune_ids)
+                        for model_id in prune_ids:
+                            details = _remove_model_artifacts(model_id)
+                            prune_details.append(details)
+                            print(f" - removed {model_id}: files={details['removed_count']}")
+                    else:
+                        print('auto_prune            = enabled but nothing to prune')
+                else:
+                    print(
+                        f'auto_prune            = skipped '
+                        f'(models={len(ranking)} <= keep_threshold={TOURNAMENT_MIN_MODELS_TO_KEEP})'
+                    )
+
+                # Synchroniser model_registry.json avec le resultat du tournoi:
+                # winner en tete, puis le reste, sans les modeles prunes.
+                live_registry = load_registry(models_root)
+                live_records = list(live_registry.get('models', [])) if isinstance(live_registry, dict) else []
+                record_map = {}
+                for item in live_records:
+                    if not isinstance(item, dict):
+                        continue
+                    model_id = str(item.get('model_id', '')).strip()
+                    if model_id:
+                        record_map[model_id] = dict(item)
+
+                # Completer entries manquantes avec les checkpoints detectes en tournoi.
+                for model in models:
+                    model_id = str(model.get('model_id', '')).strip()
+                    if not model_id or model_id in prune_ids:
+                        continue
+                    checkpoint_path = Path(str(model.get('checkpoint_path', '')).strip())
+                    if model_id not in record_map:
+                        sort_ts = float(checkpoint_path.stat().st_mtime) if checkpoint_path.exists() else time.time()
+                        record_map[model_id] = {
+                            'model_id': model_id,
+                            'checkpoint_path': str(checkpoint_path),
+                            'sort_ts': sort_ts,
+                            'best_validation_metric': -1.0,
+                            'evaluation_top1': -1.0,
+                            'benchmark_score': -1.0,
+                        }
+                    else:
+                        rec = record_map[model_id]
+                        if checkpoint_path.exists():
+                            rec['checkpoint_path'] = str(checkpoint_path)
+                        rec.setdefault('sort_ts', time.time())
+                        record_map[model_id] = rec
+
+                # Supprimer pruned du registre.
+                for model_id in prune_ids:
+                    record_map.pop(model_id, None)
+
+                if winner_model_id not in record_map:
+                    winner_ckpt = final_dir / f'{winner_model_id}.pt'
+                    if not winner_ckpt.exists():
+                        raise FileNotFoundError(
+                            f'Winner checkpoint introuvable pour promotion: {winner_ckpt}'
+                        )
+                    record_map[winner_model_id] = {
+                        'model_id': winner_model_id,
+                        'checkpoint_path': str(winner_ckpt),
+                        'sort_ts': float(winner_ckpt.stat().st_mtime),
+                        'best_validation_metric': -1.0,
+                        'evaluation_top1': -1.0,
+                        'benchmark_score': -1.0,
+                    }
+
+                # Ordonnancement: winner d'abord, puis le reste du classement tournoi.
+                ranked_ids = [str(row.get('model_id', '')).strip() for row in ranking]
+                ordered_ids = [winner_model_id]
+                for model_id in ranked_ids:
+                    if not model_id or model_id == winner_model_id or model_id in prune_ids:
+                        continue
+                    if model_id in record_map:
+                        ordered_ids.append(model_id)
+                # Ajouter d'eventuels modeles hors tournoi encore presents dans le registre.
+                for model_id in sorted(record_map.keys()):
+                    if model_id not in ordered_ids:
+                        ordered_ids.append(model_id)
+
+                for idx, model_id in enumerate(ordered_ids, start=1):
+                    rec = dict(record_map.get(model_id, {}))
+                    if not rec:
+                        continue
+                    rec['rank'] = idx
+                    new_models.append(rec)
+
+                save_registry(models_root, {'models': new_models})
+                print('registry_sync         = ok | models_kept =', len(new_models))
+
+                if TOURNAMENT_AUTO_PROMOTE_WINNER:
+                    promoted_meta = promote_best_model(models_root)
+                    print('auto_promote_winner   = enabled')
+                    print('promoted_model_id     =', promoted_meta.get('model_id', '<none>') if isinstance(promoted_meta, dict) else '<none>')
+                    print('promoted_checkpoint   =', promoted_meta.get('promoted_checkpoint_path', '<none>') if isinstance(promoted_meta, dict) else '<none>')
+                else:
+                    print('auto_promote_winner   = disabled')
 
         if TOURNAMENT_WRITE_REPORT:
             out_dir = Path(DRIVE_ROOT) / 'reports' / 'benchmarks' / 'model_tournaments'
@@ -3435,6 +3976,16 @@ cells = [
                 'ranking': ranking,
                 'auto_actions': {
                     'winner_model_id': winner_model_id,
+                    'auto_actions_applied': bool(auto_actions_applied),
+                    'auto_actions_reason': str(auto_actions_reason),
+                    'auto_actions_min_games_per_pair': int(TOURNAMENT_AUTO_ACTIONS_MIN_GAMES_PER_PAIR),
+                    'games_per_pair': int(TOURNAMENT_GAMES_PER_PAIR),
+                    'global_lock': {
+                        'enabled': bool(TOURNAMENT_GLOBAL_LOCK_ENABLED),
+                        'backend_configured': str(TOURNAMENT_GLOBAL_LOCK_BACKEND),
+                        'backend_effective': str(lock_metadata.get('backend', '<none>')),
+                        'acquired': bool(lock_metadata.get('acquired', True)),
+                    },
                     'auto_prune_enabled': bool(TOURNAMENT_AUTO_PRUNE_ENABLED),
                     'auto_prune_count': int(TOURNAMENT_AUTO_PRUNE_COUNT),
                     'min_models_to_keep': int(TOURNAMENT_MIN_MODELS_TO_KEEP),
@@ -3442,6 +3993,7 @@ cells = [
                     'prune_details': prune_details,
                     'auto_promote_winner': bool(TOURNAMENT_AUTO_PROMOTE_WINNER),
                     'promoted_metadata': promoted_meta if isinstance(promoted_meta, dict) else {},
+                    'registry_models_kept': len(new_models),
                 },
             }
             stamp = datetime.now(UTC).strftime('%Y%m%d_%H%M%S')
