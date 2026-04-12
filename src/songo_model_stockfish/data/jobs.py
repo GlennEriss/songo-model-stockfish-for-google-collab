@@ -3907,14 +3907,21 @@ def _safe_float(value: Any, default: float) -> float:
         return float(default)
 
 
-def _safe_sample_outcome_value(sample: dict[str, Any]) -> float:
+def _safe_sample_outcome_value_with_presence(sample: dict[str, Any]) -> tuple[float, bool]:
+    if "game_outcome_for_player_to_move" not in sample:
+        return 0.0, False
     raw = sample.get("game_outcome_for_player_to_move", 0.0)
     if raw is None:
-        return 0.0
+        return 0.0, False
     value = _safe_float(raw, 0.0)
     if not np.isfinite(value):
-        return 0.0
-    return _clip_unit(value)
+        return 0.0, False
+    return _clip_unit(value), True
+
+
+def _safe_sample_outcome_value(sample: dict[str, Any]) -> float:
+    value, _present = _safe_sample_outcome_value_with_presence(sample)
+    return float(value)
 
 
 def _compute_hard_example_annotation(
@@ -4041,8 +4048,10 @@ def _label_sample(
 
     teacher_score = float(move_scores.get(int(best_move), info.get("score", 0.0)))
     teacher_value_target = _normalize_value(teacher_score)
-    outcome_value_target = _safe_sample_outcome_value(sample)
+    outcome_value_target, outcome_available = _safe_sample_outcome_value_with_presence(sample)
     teacher_mix = max(0.0, min(1.0, float(value_target_mix_teacher_weight)))
+    if not bool(outcome_available):
+        teacher_mix = 1.0
     outcome_mix = 1.0 - teacher_mix
     mixed_value_target = _clip_unit((teacher_mix * float(teacher_value_target)) + (outcome_mix * float(outcome_value_target)))
     normalized_margin, margin_hardness, hard_example_score, hard_example_weight = _compute_hard_example_annotation(
