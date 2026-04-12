@@ -1612,6 +1612,7 @@ cells = [
     code(
         """
         import json
+        import os
         import shlex
         import subprocess
         from datetime import UTC, datetime
@@ -1627,7 +1628,16 @@ cells = [
         generate_log_path = logs_dir / f'{DATASET_GENERATE_JOB_ID}.log'
         build_log_path = logs_dir / f'{DATASET_BUILD_JOB_ID}.log'
 
-        def _launch_background(cmd: str, log_path: Path) -> int:
+        def _append_launch_line(log_path: Path, text: str) -> None:
+            stamp = datetime.now(UTC).isoformat().replace('+00:00', 'Z')
+            try:
+                with log_path.open('a', encoding='utf-8') as handle:
+                    handle.write(f'[{stamp}] [launcher] {text}\\n')
+            except Exception:
+                pass
+
+        def _launch_background(label: str, cmd: str, log_path: Path) -> dict:
+            _append_launch_line(log_path, f'prepare label={label}')
             handle = log_path.open('a', encoding='utf-8')
             proc = subprocess.Popen(
                 ['/bin/bash', '-lc', cmd],
@@ -1636,7 +1646,27 @@ cells = [
                 start_new_session=True,
             )
             handle.close()
-            return int(proc.pid)
+            pid = int(proc.pid)
+            _append_launch_line(log_path, f'spawned label={label} pid={pid} cmd={cmd}')
+            return {
+                'label': str(label),
+                'pid': pid,
+                'command': str(cmd),
+                'log_path': str(log_path),
+                'spawned_at': datetime.now(UTC).isoformat().replace('+00:00', 'Z'),
+            }
+
+        def _ps_snapshot(pid: int) -> str:
+            if int(pid) <= 0:
+                return 'pid absent'
+            proc = subprocess.run(
+                ['ps', '-p', str(pid), '-o', 'pid=,ppid=,etime=,state=,comm=,command='],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            row = proc.stdout.strip()
+            return row if row else 'processus non trouve'
 
         generate_cmd = (
             f'cd {shlex.quote(WORKTREE)} && '
@@ -1654,8 +1684,10 @@ cells = [
             f'--job-id {shlex.quote(DATASET_BUILD_JOB_ID)}'
         )
 
-        generate_pid = _launch_background(generate_cmd, generate_log_path)
-        build_pid = _launch_background(build_cmd, build_log_path)
+        generate_proc = _launch_background('dataset-generate', generate_cmd, generate_log_path)
+        build_proc = _launch_background('dataset-build', build_cmd, build_log_path)
+        generate_pid = int(generate_proc.get('pid', 0) or 0)
+        build_pid = int(build_proc.get('pid', 0) or 0)
 
         manifest = {
             'launched_at': datetime.now(UTC).isoformat().replace('+00:00', 'Z'),
@@ -1665,8 +1697,18 @@ cells = [
             'build_job_id': DATASET_BUILD_JOB_ID,
             'generate_pid': generate_pid,
             'build_pid': build_pid,
+            'generate_cmd': generate_cmd,
+            'build_cmd': build_cmd,
             'generate_log_path': str(generate_log_path),
             'build_log_path': str(build_log_path),
+            'launcher': {
+                'hostname': str(os.uname().nodename),
+                'worker_tag': str(WORKER_TAG),
+            },
+            'processes': {
+                'dataset-generate': generate_proc,
+                'dataset-build': build_proc,
+            },
         }
         latest_path = Path(DRIVE_ROOT) / PIPELINE_MANIFEST_PATH
         latest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1684,9 +1726,15 @@ cells = [
 
         print('Pipeline lance en parallele')
         print('  dataset-generate pid =', generate_pid)
+        print('    process_name       = dataset-generate')
+        print('    process_status     =', _ps_snapshot(generate_pid))
+        print('    process_cmd        =', generate_cmd)
+        print('    process_log        =', generate_log_path)
         print('  dataset-build pid    =', build_pid)
-        print('  generate log         =', generate_log_path)
-        print('  build log            =', build_log_path)
+        print('    process_name       = dataset-build')
+        print('    process_status     =', _ps_snapshot(build_pid))
+        print('    process_cmd        =', build_cmd)
+        print('    process_log        =', build_log_path)
         print('  manifest             =', latest_path)
         print('  firestore_manifest   =', f'{FIRESTORE_PIPELINE_MANIFESTS_COLLECTION}/{WORKER_TAG}')
         print('  firestore_written    =', firestore_manifest_written)
@@ -1699,6 +1747,7 @@ cells = [
         """
         Vue par source:
         - `5bis.A` = Manifest pipeline (Drive prioritaire, Firestore fallback)
+        - `5bis.A2` = Suivi live des processus (refresh `ps`)
         - `5bis.B` = Drive local worker (etat local des jobs)
         - `5bis.C` = Redis cache (et ecart vs Firestore)
         - `5bis.D` = Logs worker (fichiers Drive)
@@ -1709,58 +1758,199 @@ cells = [
     code(
         """
         import json
-        import os
         import subprocess
         from pathlib import Path
 
-        logs_dir = Path(DRIVE_ROOT) / 'logs' / 'pipeline'
-
-        manifest = {}
-        manifest_source = 'none'
         local_manifest_path = Path(DRIVE_ROOT) / PIPELINE_MANIFEST_PATH
 
-        # Priorite: manifest local Drive (toujours ecrit par la cellule de lancement)
-        if local_manifest_path.exists():
-            try:
-                manifest = json.loads(local_manifest_path.read_text(encoding='utf-8'))
-                if isinstance(manifest, dict) and manifest:
-                    manifest_source = f'drive:{local_manifest_path}'
-            except Exception:
-                manifest = {}
-
-        # Fallback: Firestore (utile si local indisponible)
-        if not manifest:
+        def _load_manifest() -> tuple[dict, str]:
+            manifest = {}
+            source = 'none'
+            if local_manifest_path.exists():
+                try:
+                    manifest = json.loads(local_manifest_path.read_text(encoding='utf-8'))
+                    if isinstance(manifest, dict) and manifest:
+                        source = f'drive:{local_manifest_path}'
+                        return manifest, source
+                except Exception:
+                    manifest = {}
             try:
                 manifest = _load_pipeline_manifest_payload(WORKER_TAG)
                 if isinstance(manifest, dict) and manifest:
-                    manifest_source = f'firestore:{FIRESTORE_PIPELINE_MANIFESTS_COLLECTION}/{WORKER_TAG}'
+                    source = f'firestore:{FIRESTORE_PIPELINE_MANIFESTS_COLLECTION}/{WORKER_TAG}'
+                    return manifest, source
             except Exception:
                 manifest = {}
+            return {}, source
 
+        def _manifest_process_records(manifest: dict) -> list[dict]:
+            records: list[dict] = []
+            processes = manifest.get('processes', {})
+            if isinstance(processes, dict):
+                for label, info in processes.items():
+                    if not isinstance(info, dict):
+                        continue
+                    records.append(
+                        {
+                            'label': str(label),
+                            'pid': int(info.get('pid', 0) or 0),
+                            'command': str(info.get('command', '')).strip(),
+                            'log_path': str(info.get('log_path', '')).strip(),
+                        }
+                    )
+            if records:
+                return records
+            # Retro-compatibilite anciens manifests
+            return [
+                {
+                    'label': 'dataset-generate',
+                    'pid': int(manifest.get('generate_pid', 0) or 0),
+                    'command': str(manifest.get('generate_cmd', '')).strip(),
+                    'log_path': str(manifest.get('generate_log_path', '')).strip(),
+                },
+                {
+                    'label': 'dataset-build',
+                    'pid': int(manifest.get('build_pid', 0) or 0),
+                    'command': str(manifest.get('build_cmd', '')).strip(),
+                    'log_path': str(manifest.get('build_log_path', '')).strip(),
+                },
+            ]
+
+        def _ps_snapshot(pid: int) -> str:
+            if int(pid) <= 0:
+                return 'pid absent'
+            proc = subprocess.run(
+                ['ps', '-p', str(pid), '-o', 'pid=,ppid=,etime=,state=,comm=,command='],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            output = proc.stdout.strip()
+            return output if output else 'processus non trouve'
+
+        manifest, manifest_source = _load_manifest()
         if not manifest:
             print('Manifest introuvable (Drive + Firestore)')
             print('  drive_path =', local_manifest_path)
             print('  firestore  =', f'{FIRESTORE_PIPELINE_MANIFESTS_COLLECTION}/{WORKER_TAG}')
         else:
-            generate_pid = int(manifest.get('generate_pid', 0) or 0)
-            build_pid = int(manifest.get('build_pid', 0) or 0)
             print('Manifest source =', manifest_source)
             print('Manifest:')
             print(json.dumps(manifest, indent=2, ensure_ascii=True))
-
-            for label, pid in [('dataset-generate', generate_pid), ('dataset-build', build_pid)]:
-                if pid <= 0:
-                    print(f'\\n{label}: pid absent')
-                    continue
-                proc = subprocess.run(
-                    ['ps', '-p', str(pid), '-o', 'pid=,ppid=,etime=,state=,command='],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                output = proc.stdout.strip()
+            for record in _manifest_process_records(manifest):
+                label = str(record.get('label', '')).strip() or '<unknown>'
+                pid = int(record.get('pid', 0) or 0)
+                cmd = str(record.get('command', '')).strip()
+                log_path = str(record.get('log_path', '')).strip()
                 print(f'\\n{label}:')
-                print(output if output else 'processus non trouve')
+                print('  pid      =', pid)
+                print('  status   =', _ps_snapshot(pid))
+                if cmd:
+                    print('  command  =', cmd)
+                if log_path:
+                    print('  log_path =', log_path)
+        """
+    ),
+    md("### 5bis.A2 Suivi Live Processus (refresh ps)"),
+    code(
+        """
+        import json
+        import subprocess
+        import time
+        from pathlib import Path
+
+        LIVE_REFRESH_SECONDS = float(globals().get('PROCESS_MONITOR_REFRESH_SECONDS', 5.0))
+        LIVE_MAX_LOOPS = int(globals().get('PROCESS_MONITOR_MAX_LOOPS', 120))
+
+        local_manifest_path = Path(DRIVE_ROOT) / PIPELINE_MANIFEST_PATH
+
+        def _load_manifest_live() -> tuple[dict, str]:
+            manifest = {}
+            source = 'none'
+            if local_manifest_path.exists():
+                try:
+                    manifest = json.loads(local_manifest_path.read_text(encoding='utf-8'))
+                    if isinstance(manifest, dict) and manifest:
+                        return manifest, f'drive:{local_manifest_path}'
+                except Exception:
+                    manifest = {}
+            try:
+                manifest = _load_pipeline_manifest_payload(WORKER_TAG)
+                if isinstance(manifest, dict) and manifest:
+                    return manifest, f'firestore:{FIRESTORE_PIPELINE_MANIFESTS_COLLECTION}/{WORKER_TAG}'
+            except Exception:
+                manifest = {}
+            return {}, source
+
+        def _extract_processes(manifest: dict) -> list[dict]:
+            rows: list[dict] = []
+            processes = manifest.get('processes', {})
+            if isinstance(processes, dict):
+                for label, info in processes.items():
+                    if not isinstance(info, dict):
+                        continue
+                    rows.append(
+                        {
+                            'label': str(label),
+                            'pid': int(info.get('pid', 0) or 0),
+                            'command': str(info.get('command', '')).strip(),
+                        }
+                    )
+            if rows:
+                return rows
+            return [
+                {
+                    'label': 'dataset-generate',
+                    'pid': int(manifest.get('generate_pid', 0) or 0),
+                    'command': str(manifest.get('generate_cmd', '')).strip(),
+                },
+                {
+                    'label': 'dataset-build',
+                    'pid': int(manifest.get('build_pid', 0) or 0),
+                    'command': str(manifest.get('build_cmd', '')).strip(),
+                },
+            ]
+
+        def _ps_row(pid: int) -> str:
+            if int(pid) <= 0:
+                return 'pid absent'
+            proc = subprocess.run(
+                ['ps', '-p', str(pid), '-o', 'pid=,ppid=,etime=,state=,comm=,command='],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            out = proc.stdout.strip()
+            return out if out else 'processus non trouve'
+
+        print('Suivi live processus | refresh_s =', LIVE_REFRESH_SECONDS, '| max_loops =', LIVE_MAX_LOOPS)
+        for loop_idx in range(max(1, LIVE_MAX_LOOPS)):
+            now = time.strftime('%Y-%m-%d %H:%M:%S')
+            manifest, source = _load_manifest_live()
+            print(f'\\n[{now}] loop={loop_idx + 1}/{max(1, LIVE_MAX_LOOPS)} | source={source}')
+            if not manifest:
+                print('Manifest indisponible')
+                break
+            rows = _extract_processes(manifest)
+            running = 0
+            for row in rows:
+                label = str(row.get('label', '')).strip() or '<unknown>'
+                pid = int(row.get('pid', 0) or 0)
+                status = _ps_row(pid)
+                is_running = status not in ('pid absent', 'processus non trouve')
+                if is_running:
+                    running += 1
+                print(f' - {label:<16} | pid={pid:<8} | running={\"yes\" if is_running else \"no\"}')
+                print('   ps  =', status)
+                cmd = str(row.get('command', '')).strip()
+                if cmd:
+                    print('   cmd =', cmd)
+            if running == 0:
+                print('Aucun processus actif detecte, arret du suivi live.')
+                break
+            if loop_idx + 1 >= max(1, LIVE_MAX_LOOPS):
+                break
+            time.sleep(max(1.0, float(LIVE_REFRESH_SECONDS)))
         """
     ),
     code(
