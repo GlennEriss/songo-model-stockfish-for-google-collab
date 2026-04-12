@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import math
 from pathlib import Path
@@ -65,6 +66,19 @@ def _resolve_storage_path(base: Path, configured: str | None, fallback: Path) ->
     if path.is_absolute():
         return path
     return base / path
+
+
+def _as_bool(value: object, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return bool(default)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on", "y", "t"}:
+        return True
+    if text in {"0", "false", "no", "off", "n", "f"}:
+        return False
+    return bool(default)
 
 
 def _winner_label(winner: object, target_name: str, opponent_name: str) -> str:
@@ -217,9 +231,24 @@ def run_benchmark_job(job: JobContext) -> dict[str, object]:
     games = int(benchmark_cfg.get("games_per_matchup", 20))
     max_moves = int(benchmark_cfg.get("max_moves", 300))
     matchups = list(benchmark_cfg.get("matchups", []))
+    parallel_enabled = _as_bool(benchmark_cfg.get("parallel_enabled", True), default=True)
+    parallel_backend = str(benchmark_cfg.get("parallel_backend", "thread")).strip().lower() or "thread"
+    parallel_workers = max(1, int(benchmark_cfg.get("parallel_workers", 16) or 16))
+    if parallel_backend not in {"thread", "sequential"}:
+        job.logger.warning("benchmark parallel backend non supporte: %s | fallback=thread", parallel_backend)
+        parallel_backend = "thread"
+    if not parallel_enabled:
+        parallel_backend = "sequential"
     configured_ratings = benchmark_cfg.get("opponent_ratings", {})
     if not isinstance(configured_ratings, dict):
         configured_ratings = {}
+
+    job.logger.info(
+        "benchmark parallel config | enabled=%s | backend=%s | workers=%s",
+        parallel_enabled,
+        parallel_backend,
+        parallel_workers,
+    )
 
     target_agent = _build_target_agent(job)
     benchmark_dir = job.job_dir / "benchmark"
@@ -248,40 +277,132 @@ def run_benchmark_job(job: JobContext) -> dict[str, object]:
         total_moves = 0
         as_first = {"wins": 0, "losses": 0, "draws": 0}
         as_second = {"wins": 0, "losses": 0, "draws": 0}
+        game_results: dict[int, dict[str, object]] = {}
+        pending_game_indices: list[int] = []
         for game_index in range(games):
-            starter = game_index % 2
             game_filename = f"{matchup_key}_game_{game_index + 1:06d}.json"
             game_path = games_dir / game_filename
             if game_path.exists():
-                game_payload = _load_existing_game_result(game_path)
-            else:
-                from songo_model_stockfish.benchmark.play_match import play_match
+                try:
+                    game_results[game_index] = _load_existing_game_result(game_path)
+                    continue
+                except Exception as exc:
+                    job.logger.warning(
+                        "benchmark game cache invalide | matchup=%s | game=%s/%s | cause=%s: %s | recompute=true",
+                        matchup_key,
+                        game_index + 1,
+                        games,
+                        type(exc).__name__,
+                        exc,
+                    )
+            pending_game_indices.append(game_index)
 
-                match_result = play_match(target_agent, opponent, max_moves=max_moves, starter=starter)
-                game_payload = {
-                    "game_index": game_index + 1,
-                    "matchup": matchup_key,
-                    "opponent": str(opponent_spec),
-                    "engine": target_agent.display_name,
-                    **match_result.to_dict(),
+        if game_results:
+            latest_existing_game_index = max(game_results.keys()) + 1
+            job.write_state(
+                {
+                    "completed_matchups": sorted(completed_matchups),
+                    "current_matchup": matchup_key,
+                    "completed_games": len(game_results),
+                    "remaining_games": games - len(game_results),
+                    "last_completed_game_id": f"{matchup_key}_game_{latest_existing_game_index:06d}",
                 }
-                _write_json(game_path, game_payload)
-                job.write_event("benchmark_game_completed", matchup=matchup_key, game_index=game_index + 1, winner=game_payload["winner"])
-                job.write_metric(
-                    {
-                        "metric_type": "game_result",
-                        "matchup_id": matchup_key,
-                        "game_id": game_filename.removesuffix(".json"),
-                        "winner": game_payload["winner"],
-                        "moves": game_payload["moves"],
-                        "avg_move_time_ms": (
-                            (sum(game_payload["think_ms"]) / len(game_payload["think_ms"]))
-                            if game_payload["think_ms"]
-                            else 0.0
-                        ),
-                    }
-                )
+            )
 
+        from songo_model_stockfish.benchmark.play_match import play_match
+
+        def _play_single_game_payload(game_index: int) -> tuple[int, dict[str, object]]:
+            starter = game_index % 2
+            match_result = play_match(target_agent, opponent, max_moves=max_moves, starter=starter)
+            payload = {
+                "game_index": game_index + 1,
+                "matchup": matchup_key,
+                "opponent": str(opponent_spec),
+                "engine": target_agent.display_name,
+                **match_result.to_dict(),
+            }
+            return game_index, payload
+
+        def _persist_new_game(game_index: int, payload: dict[str, object]) -> None:
+            game_filename = f"{matchup_key}_game_{game_index + 1:06d}.json"
+            game_path = games_dir / game_filename
+            _write_json(game_path, payload)
+            job.write_event("benchmark_game_completed", matchup=matchup_key, game_index=game_index + 1, winner=payload["winner"])
+            job.write_metric(
+                {
+                    "metric_type": "game_result",
+                    "matchup_id": matchup_key,
+                    "game_id": game_filename.removesuffix(".json"),
+                    "winner": payload["winner"],
+                    "moves": payload["moves"],
+                    "avg_move_time_ms": (
+                        (sum(payload["think_ms"]) / len(payload["think_ms"]))
+                        if payload["think_ms"]
+                        else 0.0
+                    ),
+                }
+            )
+            completed_games = len(game_results)
+            job.write_state(
+                {
+                    "completed_matchups": sorted(completed_matchups),
+                    "current_matchup": matchup_key,
+                    "completed_games": completed_games,
+                    "remaining_games": games - completed_games,
+                    "last_completed_game_id": game_filename.removesuffix(".json"),
+                }
+            )
+
+        if pending_game_indices:
+            can_run_parallel = (
+                parallel_backend == "thread"
+                and parallel_workers > 1
+                and len(pending_game_indices) > 1
+            )
+            if can_run_parallel:
+                worker_count = min(parallel_workers, len(pending_game_indices))
+                job.logger.info(
+                    "benchmark matchup parallel run | matchup=%s | workers=%s | pending=%s",
+                    matchup_key,
+                    worker_count,
+                    len(pending_game_indices),
+                )
+                with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+                    future_to_game_index = {
+                        executor.submit(_play_single_game_payload, game_index): game_index
+                        for game_index in pending_game_indices
+                    }
+                    for future in concurrent.futures.as_completed(future_to_game_index):
+                        game_index = future_to_game_index[future]
+                        try:
+                            resolved_game_index, game_payload = future.result()
+                        except Exception as exc:
+                            job.logger.exception(
+                                "benchmark worker echec | matchup=%s | game=%s/%s | cause=%s: %s | retry=sequential",
+                                matchup_key,
+                                game_index + 1,
+                                games,
+                                type(exc).__name__,
+                                exc,
+                            )
+                            resolved_game_index, game_payload = _play_single_game_payload(game_index)
+                        game_results[resolved_game_index] = game_payload
+                        _persist_new_game(resolved_game_index, game_payload)
+            else:
+                for game_index in pending_game_indices:
+                    resolved_game_index, game_payload = _play_single_game_payload(game_index)
+                    game_results[resolved_game_index] = game_payload
+                    _persist_new_game(resolved_game_index, game_payload)
+
+        if len(game_results) != games:
+            raise RuntimeError(
+                f"Benchmark incomplet pour matchup={matchup_key}: "
+                f"{len(game_results)}/{games} games disponibles."
+            )
+
+        for game_index in range(games):
+            starter = game_index % 2
+            game_payload = game_results[game_index]
             winner = game_payload["winner"]
             if winner == 0:
                 wins_a += 1
@@ -306,16 +427,6 @@ def run_benchmark_job(job: JobContext) -> dict[str, object]:
                 game_payload["moves"],
                 game_payload.get("reason", ""),
             )
-            job.write_state(
-                {
-                    "completed_matchups": sorted(completed_matchups),
-                    "current_matchup": matchup_key,
-                    "completed_games": game_index + 1,
-                    "remaining_games": games - (game_index + 1),
-                    "last_completed_game_id": game_filename.removesuffix(".json"),
-                }
-            )
-
         payload = {
             "opponent": str(opponent_spec),
             "engine": target_agent.display_name,

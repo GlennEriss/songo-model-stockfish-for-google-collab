@@ -18,6 +18,9 @@ job:
 benchmark:
   target: auto_latest
   checkpoint_path: ""
+  parallel_enabled: true
+  parallel_backend: thread
+  parallel_workers: 16
   model_search_enabled: true
   model_search_top_k: 4
   model_search_policy_weight: 0.35

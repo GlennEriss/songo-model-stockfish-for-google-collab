@@ -124,6 +124,9 @@ cells = [
         TRAIN_SCRATCH_CONFIG = 'config/train.full_matrix.colab_pro.scratch.yaml'
         EVALUATION_CONFIG = 'config/evaluation.full_matrix.colab_pro.yaml'
         BENCHMARK_CONFIG = 'config/benchmark.colab_pro.yaml'
+        BENCHMARK_PARALLEL_ENABLED = True
+        BENCHMARK_PARALLEL_BACKEND = 'thread'
+        BENCHMARK_PARALLEL_WORKERS = 16
 
         BASE_DATASET_SOURCE_ID = 'sampled_full_matrix_colab_pro_bench_models_20m'
         BASE_DATASET_BUILD_ID = 'dataset_v5_full_matrix_colab_pro_insane_20m'
@@ -1531,6 +1534,17 @@ cells = [
         eval_cfg['evaluation'] = eval_block
         EVALUATION_20M_CONFIG_ACTIVE = _write_yaml(eval_cfg, EVALUATION_20M_CONFIG_ACTIVE_PATH)
 
+        benchmark_cfg = yaml.safe_load(Path(BENCHMARK_CONFIG_ACTIVE).read_text(encoding='utf-8')) or {}
+        benchmark_block = dict(benchmark_cfg.get('benchmark', {}) or {})
+        benchmark_block['parallel_enabled'] = bool(BENCHMARK_PARALLEL_ENABLED)
+        benchmark_block['parallel_backend'] = str(BENCHMARK_PARALLEL_BACKEND).strip().lower() or 'thread'
+        benchmark_block['parallel_workers'] = int(max(1, BENCHMARK_PARALLEL_WORKERS))
+        benchmark_cfg['benchmark'] = benchmark_block
+        Path(BENCHMARK_CONFIG_ACTIVE).write_text(
+            yaml.safe_dump(benchmark_cfg, sort_keys=False, allow_unicode=True),
+            encoding='utf-8',
+        )
+
         print('RUNTIME_PROFILE                =', RUNTIME_PROFILE)
         print('TPU_ENV_PRESENT                =', TPU_ENV_PRESENT)
         print('TPU_RUNTIME_READY              =', TPU_RUNTIME_READY)
@@ -1551,6 +1565,9 @@ cells = [
         print('EVALUATION_20M_CONFIG_ACTIVE     =', EVALUATION_20M_CONFIG_ACTIVE)
         print('EVALUATION_CONFIG_ACTIVE       =', EVALUATION_CONFIG_ACTIVE)
         print('BENCHMARK_CONFIG_ACTIVE        =', BENCHMARK_CONFIG_ACTIVE)
+        print('BENCHMARK_PARALLEL_ENABLED     =', BENCHMARK_PARALLEL_ENABLED)
+        print('BENCHMARK_PARALLEL_BACKEND     =', BENCHMARK_PARALLEL_BACKEND)
+        print('BENCHMARK_PARALLEL_WORKERS     =', BENCHMARK_PARALLEL_WORKERS)
         print('pipeline_mode                  =', pipeline_mode)
         print('pipeline_active_pass           =', pipeline_pass)
         print('generate_source_mode_requested =', generate_source_mode_requested)
