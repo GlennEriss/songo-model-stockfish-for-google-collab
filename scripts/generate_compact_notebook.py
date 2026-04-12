@@ -3125,10 +3125,10 @@ cells = [
         TOURNAMENT_INCLUDE_GAME_LOGS_IN_REPORT = False
         TOURNAMENT_MAX_GAME_LOGS_PER_PAIR = 0  # 0 = illimite
         TOURNAMENT_PARALLEL_ENABLED = True
-        TOURNAMENT_PARALLEL_BACKEND = 'process'  # 'process', 'thread', 'sequential'
+        TOURNAMENT_PARALLEL_BACKEND = 'thread'  # 'process', 'thread', 'sequential'
         TOURNAMENT_MAX_PARALLEL_PAIRS = 4
         TOURNAMENT_PARALLEL_FALLBACK_SEQUENTIAL = True
-        TOURNAMENT_PARALLEL_SECONDARY_BACKEND = 'thread'
+        TOURNAMENT_PARALLEL_SECONDARY_BACKEND = 'process'
         TOURNAMENT_PROCESS_START_METHOD = 'auto'  # 'auto', 'spawn', 'forkserver', 'fork'
         TOURNAMENT_CPU_THREADS_PER_WORKER = 1
         TOURNAMENT_AUTO_CAP_PARALLEL_BY_CPU = True
@@ -3136,7 +3136,20 @@ cells = [
         TOURNAMENT_RETRY_FAILED_PAIRS = 1
         TOURNAMENT_RETRY_FAILED_PAIRS_BACKEND = 'thread'
         TOURNAMENT_AUTO_ACTIONS_MIN_GAMES_PER_PAIR = 20
-        TOURNAMENT_DISABLE_AUTO_ACTIONS_WHEN_LOW_GAMES = True
+        TOURNAMENT_DISABLE_AUTO_ACTIONS_WHEN_LOW_GAMES = False
+        TOURNAMENT_RUN_LEASE_ENABLED = True
+        TOURNAMENT_RUN_LEASE_STRICT = False
+        TOURNAMENT_RUN_LEASE_BACKEND = 'firestore'  # 'firestore' ou 'drive'
+        TOURNAMENT_RUN_LEASE_COLLECTION = 'tournament_runs'
+        TOURNAMENT_RUN_LEASE_ID_PREFIX = 'inter_models_rankings'
+        TOURNAMENT_RUN_LEASE_TTL_SECONDS = 21600
+        TOURNAMENT_RELEASE_RUN_LEASE_BEFORE_AUTO_ACTIONS = True
+        TOURNAMENT_WAIT_FOR_OTHER_RUNS_BEFORE_AUTO_ACTIONS = True
+        TOURNAMENT_WAIT_FOR_OTHER_RUNS_TIMEOUT_SECONDS = 1800
+        TOURNAMENT_WAIT_FOR_OTHER_RUNS_POLL_SECONDS = 5.0
+        TOURNAMENT_FORCE_AUTO_ACTIONS_IF_WAIT_TIMEOUT = False
+        TOURNAMENT_REQUIRE_AUTO_ACTIONS = True
+        TOURNAMENT_FORCE_PRUNE_AT_END = True
         TOURNAMENT_GLOBAL_LOCK_ENABLED = True
         TOURNAMENT_GLOBAL_LOCK_BACKEND = 'firestore'  # 'firestore' ou 'drive'
         TOURNAMENT_GLOBAL_LOCK_COLLECTION = 'tournament_locks'
@@ -3209,6 +3222,9 @@ cells = [
                 'auto_actions_guard     = enabled | '
                 f'games_per_pair={int(TOURNAMENT_GAMES_PER_PAIR)}'
             )
+        if bool(TOURNAMENT_REQUIRE_AUTO_ACTIONS) and not auto_actions_allowed:
+            auto_actions_allowed = True
+            print('auto_actions_guard_override = forced | reason=require_auto_actions')
 
         cpu_count = max(1, int(os.cpu_count() or 1))
         requested_parallel_workers = max(1, int(TOURNAMENT_MAX_PARALLEL_PAIRS))
@@ -3249,6 +3265,142 @@ cells = [
 
         _apply_runtime_thread_limits(int(TOURNAMENT_CPU_THREADS_PER_WORKER))
         print('CPU threads/worker    =', int(TOURNAMENT_CPU_THREADS_PER_WORKER))
+
+        tournament_run_owner_id = (
+            f"{str(WORKER_TAG).strip() or 'worker'}:"
+            f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+        )
+
+        def _run_lease_prefix() -> str:
+            return str(TOURNAMENT_RUN_LEASE_ID_PREFIX).strip() or 'inter_models_rankings'
+
+        def _run_lease_ttl_seconds() -> float:
+            return max(60.0, float(TOURNAMENT_RUN_LEASE_TTL_SECONDS))
+
+        def _run_lease_doc_id(owner_id: str) -> str:
+            return f"{_run_lease_prefix()}__{owner_id}"
+
+        def _acquire_tournament_run_lease(owner_id: str) -> dict:
+            ttl_seconds = _run_lease_ttl_seconds()
+            now = time.time()
+            backend = str(TOURNAMENT_RUN_LEASE_BACKEND).strip().lower()
+            if backend == 'firestore':
+                client = _get_firestore_client()
+                collection = str(TOURNAMENT_RUN_LEASE_COLLECTION).strip() or 'tournament_runs'
+                doc_ref = client.collection(collection).document(_run_lease_doc_id(owner_id))
+                payload = {
+                    'lease_prefix': _run_lease_prefix(),
+                    'owner': owner_id,
+                    'hostname': socket.gethostname(),
+                    'worker_tag': str(WORKER_TAG).strip(),
+                    'updated_at': datetime.now(UTC).isoformat().replace('+00:00', 'Z'),
+                    'started_at_epoch': now,
+                    'expires_at_epoch': now + ttl_seconds,
+                }
+                doc_ref.set(payload)
+                return {'backend': 'firestore', 'collection': collection, 'owner': owner_id, 'doc_ref': doc_ref}
+            if backend == 'drive':
+                lease_dir = Path(DRIVE_ROOT) / 'locks' / 'tournament_runs'
+                lease_dir.mkdir(parents=True, exist_ok=True)
+                lease_path = lease_dir / f'{_run_lease_doc_id(owner_id)}.json'
+                payload = {
+                    'lease_prefix': _run_lease_prefix(),
+                    'owner': owner_id,
+                    'hostname': socket.gethostname(),
+                    'worker_tag': str(WORKER_TAG).strip(),
+                    'updated_at': datetime.now(UTC).isoformat().replace('+00:00', 'Z'),
+                    'started_at_epoch': now,
+                    'expires_at_epoch': now + ttl_seconds,
+                }
+                lease_path.write_text(json.dumps(payload, ensure_ascii=True), encoding='utf-8')
+                return {'backend': 'drive', 'owner': owner_id, 'lease_path': lease_path}
+            raise ValueError(f'TOURNAMENT_RUN_LEASE_BACKEND non supporte: {backend}')
+
+        def _release_tournament_run_lease(lease_meta: dict, owner_id: str) -> None:
+            backend = str(lease_meta.get('backend', '')).strip().lower()
+            if backend == 'firestore':
+                doc_ref = lease_meta.get('doc_ref')
+                if doc_ref is not None:
+                    try:
+                        doc_ref.delete()
+                    except Exception:
+                        pass
+                return
+            if backend == 'drive':
+                lease_path = lease_meta.get('lease_path')
+                if isinstance(lease_path, Path):
+                    try:
+                        lease_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+
+        def _count_other_active_tournament_leases(owner_id: str) -> int:
+            now = time.time()
+            prefix = _run_lease_prefix()
+            backend = str(TOURNAMENT_RUN_LEASE_BACKEND).strip().lower()
+            if backend == 'firestore':
+                client = _get_firestore_client()
+                collection = str(TOURNAMENT_RUN_LEASE_COLLECTION).strip() or 'tournament_runs'
+                count = 0
+                for snap in client.collection(collection).stream():
+                    payload = snap.to_dict() or {}
+                    if not isinstance(payload, dict):
+                        continue
+                    if str(payload.get('lease_prefix', '')).strip() != prefix:
+                        continue
+                    lease_owner = str(payload.get('owner', '')).strip()
+                    expires_at_epoch = float(payload.get('expires_at_epoch', 0.0) or 0.0)
+                    if expires_at_epoch <= now:
+                        continue
+                    if lease_owner and lease_owner != owner_id:
+                        count += 1
+                return count
+            if backend == 'drive':
+                lease_dir = Path(DRIVE_ROOT) / 'locks' / 'tournament_runs'
+                if not lease_dir.exists():
+                    return 0
+                count = 0
+                for lease_path in lease_dir.glob(f'{prefix}__*.json'):
+                    try:
+                        payload = json.loads(lease_path.read_text(encoding='utf-8'))
+                    except Exception:
+                        continue
+                    if not isinstance(payload, dict):
+                        continue
+                    lease_owner = str(payload.get('owner', '')).strip()
+                    expires_at_epoch = float(payload.get('expires_at_epoch', 0.0) or 0.0)
+                    if expires_at_epoch <= now:
+                        continue
+                    if lease_owner and lease_owner != owner_id:
+                        count += 1
+                return count
+            return 0
+
+        run_lease_meta = {'backend': 'disabled', 'owner': tournament_run_owner_id}
+        run_lease_registered = False
+        run_lease_released_early = False
+        run_lease_guard_ok = True
+        if bool(TOURNAMENT_RUN_LEASE_ENABLED):
+            try:
+                run_lease_meta = _acquire_tournament_run_lease(tournament_run_owner_id)
+                run_lease_registered = True
+                print(
+                    'run_lease             = active | backend=',
+                    str(run_lease_meta.get('backend', '<none>')),
+                    '| owner=',
+                    tournament_run_owner_id,
+                )
+            except Exception as exc:
+                run_lease_guard_ok = False
+                print('run_lease_error       =', f'{type(exc).__name__}: {exc}')
+                if bool(TOURNAMENT_RUN_LEASE_STRICT):
+                    raise
+        if not bool(run_lease_guard_ok):
+            if bool(TOURNAMENT_REQUIRE_AUTO_ACTIONS):
+                print('auto_actions_guard_warning = run_lease_unavailable (continuing: require_auto_actions=True)')
+            else:
+                auto_actions_allowed = False
+                print('auto_actions_guard     = disabled | reason=run_lease_unavailable')
 
         def _winner_label_for_pair(winner: int | None, left: str, right: str) -> str:
             if winner == 0:
@@ -3398,7 +3550,16 @@ cells = [
                                 failed.append({'payload': payload, 'error': f'{type(exc).__name__}: {exc}'})
                 elif backend == 'process':
                     import multiprocessing as mp
+                    import pickle
                     from concurrent.futures import ProcessPoolExecutor, as_completed
+
+                    try:
+                        pickle.dumps(_run_pair_series)
+                    except Exception as exc:
+                        raise RuntimeError(
+                            'Backend process indisponible dans ce contexte notebook (worker non serialisable). '
+                            'Utiliser TOURNAMENT_PARALLEL_BACKEND=thread ou garder le fallback secondaire.'
+                        ) from exc
 
                     method = _resolve_process_start_method(str(TOURNAMENT_PROCESS_START_METHOD))
                     print(f'process start_method     = {method}')
@@ -3778,7 +3939,7 @@ cells = [
                 current_owner = owner_file.read_text(encoding='utf-8').strip() if owner_file.exists() else ''
             except Exception:
                 current_owner = ''
-            if current_owner and current_owner != owner_id:
+            if current_owner != owner_id:
                 return
             try:
                 shutil.rmtree(lock_dir, ignore_errors=True)
@@ -3826,8 +3987,28 @@ cells = [
         lock_metadata = {'acquired': False, 'backend': 'disabled'}
         auto_actions_applied = bool(auto_actions_allowed)
         auto_actions_reason = 'ok'
+        other_active_runs = 0
+        other_runs_wait_seconds = 0.0
+        auto_actions_wait_timed_out = False
+        auto_actions_forced_after_timeout = False
 
         expected_model_set = sorted(str(mid).strip() for mid in model_ids if str(mid).strip())
+
+        if (
+            auto_actions_applied
+            and bool(TOURNAMENT_RUN_LEASE_ENABLED)
+            and bool(TOURNAMENT_RELEASE_RUN_LEASE_BEFORE_AUTO_ACTIONS)
+            and run_lease_registered
+        ):
+            try:
+                _release_tournament_run_lease(run_lease_meta, tournament_run_owner_id)
+                run_lease_registered = False
+                run_lease_released_early = True
+                print('run_lease_release     = early | reason=pre_auto_actions')
+            except Exception as exc:
+                print('run_lease_release_err =', f'{type(exc).__name__}: {exc}')
+                if bool(TOURNAMENT_RUN_LEASE_STRICT):
+                    raise
 
         with _tournament_global_lock() as lock_metadata:
             print(
@@ -3846,33 +4027,99 @@ cells = [
                     auto_actions_applied = False
                     auto_actions_reason = 'model_set_changed_during_tournament'
                     print('auto_actions_guard     = disabled | reason=model_set_changed_during_tournament')
+            if auto_actions_applied and bool(TOURNAMENT_RUN_LEASE_ENABLED) and bool(run_lease_guard_ok):
+                wait_enabled = bool(TOURNAMENT_WAIT_FOR_OTHER_RUNS_BEFORE_AUTO_ACTIONS)
+                wait_timeout_seconds = float(TOURNAMENT_WAIT_FOR_OTHER_RUNS_TIMEOUT_SECONDS)
+                wait_poll_seconds = max(1.0, float(TOURNAMENT_WAIT_FOR_OTHER_RUNS_POLL_SECONDS))
+                wait_started_at = time.time()
+                wait_deadline = (wait_started_at + wait_timeout_seconds) if wait_timeout_seconds > 0 else None
+                while True:
+                    try:
+                        other_active_runs = int(_count_other_active_tournament_leases(tournament_run_owner_id))
+                    except Exception as exc:
+                        other_active_runs = -1
+                        print('run_lease_count_error  =', f'{type(exc).__name__}: {exc}')
+                        if bool(TOURNAMENT_REQUIRE_AUTO_ACTIONS):
+                            raise
+                        auto_actions_applied = False
+                        auto_actions_reason = 'run_lease_count_error'
+                        break
+                    other_runs_wait_seconds = max(0.0, time.time() - wait_started_at)
+                    print('other_active_tournaments =', other_active_runs)
+                    if other_active_runs <= 0:
+                        break
+                    if not wait_enabled:
+                        break
+                    if wait_deadline is not None and time.time() >= wait_deadline:
+                        auto_actions_wait_timed_out = True
+                        break
+                    print(
+                        'auto_actions_wait      = waiting | '
+                        f'other_active_tournaments={other_active_runs} | '
+                        f'waited_seconds={other_runs_wait_seconds:.1f}'
+                    )
+                    time.sleep(wait_poll_seconds)
+
+                if auto_actions_applied and other_active_runs > 0:
+                    if auto_actions_wait_timed_out and bool(TOURNAMENT_FORCE_AUTO_ACTIONS_IF_WAIT_TIMEOUT):
+                        auto_actions_forced_after_timeout = True
+                        auto_actions_reason = 'forced_after_wait_timeout'
+                        print(
+                            'auto_actions_guard     = forced | '
+                            f'other_active_tournaments={other_active_runs} | '
+                            f'waited_seconds={other_runs_wait_seconds:.1f}'
+                        )
+                    else:
+                        auto_actions_applied = False
+                        auto_actions_reason = 'other_tournament_runs_active'
+                        if bool(TOURNAMENT_REQUIRE_AUTO_ACTIONS):
+                            raise RuntimeError(
+                                'Auto-actions obligatoires: impossible d appliquer prune/promote tant que d autres '
+                                f'tournois sont actifs (other_active_tournaments={other_active_runs}, '
+                                f'waited_seconds={other_runs_wait_seconds:.1f}).'
+                            )
+                        print('auto_actions_guard     = disabled | reason=other_tournament_runs_active')
+            elif auto_actions_applied and bool(TOURNAMENT_RUN_LEASE_ENABLED) and (not bool(run_lease_guard_ok)):
+                print('auto_actions_guard_warning = run_lease_count_bypassed (run_lease_unavailable)')
 
             if not auto_actions_applied:
                 print('auto_prune            = skipped | reason=', auto_actions_reason)
                 print('registry_sync         = skipped | reason=', auto_actions_reason)
                 print('auto_promote_winner   = skipped | reason=', auto_actions_reason)
             else:
-                if TOURNAMENT_AUTO_PRUNE_ENABLED and len(ranking) > TOURNAMENT_MIN_MODELS_TO_KEEP:
-                    prune_count = min(
-                        int(TOURNAMENT_AUTO_PRUNE_COUNT),
-                        max(0, len(ranking) - int(TOURNAMENT_MIN_MODELS_TO_KEEP)),
+                max_prunable = max(0, len(ranking) - int(TOURNAMENT_MIN_MODELS_TO_KEEP))
+                prune_count = (
+                    min(int(TOURNAMENT_AUTO_PRUNE_COUNT), max_prunable)
+                    if bool(TOURNAMENT_AUTO_PRUNE_ENABLED)
+                    else 0
+                )
+                if bool(TOURNAMENT_FORCE_PRUNE_AT_END) and max_prunable > 0 and prune_count <= 0:
+                    raise RuntimeError(
+                        'Suppression obligatoire active, mais aucune suppression possible '
+                        f'(models={len(ranking)}, min_models_to_keep={int(TOURNAMENT_MIN_MODELS_TO_KEEP)}, '
+                        f'auto_prune_enabled={bool(TOURNAMENT_AUTO_PRUNE_ENABLED)}, '
+                        f'auto_prune_count={int(TOURNAMENT_AUTO_PRUNE_COUNT)}).'
                     )
-                    if prune_count > 0:
-                        prune_ids = [str(row.get('model_id', '')).strip() for row in ranking[-prune_count:]]
-                        print('auto_prune            = enabled')
-                        print('prune_count           =', prune_count)
-                        print('pruned_models         =', prune_ids)
-                        for model_id in prune_ids:
-                            details = _remove_model_artifacts(model_id)
-                            prune_details.append(details)
-                            print(f" - removed {model_id}: files={details['removed_count']}")
-                    else:
-                        print('auto_prune            = enabled but nothing to prune')
+                if prune_count > 0:
+                    prune_ids = [str(row.get('model_id', '')).strip() for row in ranking[-prune_count:]]
+                    print('auto_prune            = enabled')
+                    print('prune_count           =', prune_count)
+                    print('pruned_models         =', prune_ids)
+                    for model_id in prune_ids:
+                        details = _remove_model_artifacts(model_id)
+                        prune_details.append(details)
+                        print(f" - removed {model_id}: files={details['removed_count']}")
                 else:
-                    print(
-                        f'auto_prune            = skipped '
-                        f'(models={len(ranking)} <= keep_threshold={TOURNAMENT_MIN_MODELS_TO_KEEP})'
-                    )
+                    if max_prunable <= 0:
+                        print(
+                            f'auto_prune            = skipped '
+                            f'(models={len(ranking)} <= keep_threshold={TOURNAMENT_MIN_MODELS_TO_KEEP})'
+                        )
+                    else:
+                        print(
+                            'auto_prune            = skipped '
+                            f'(enabled={bool(TOURNAMENT_AUTO_PRUNE_ENABLED)} | prune_count={prune_count})'
+                        )
 
                 # Synchroniser model_registry.json avec le resultat du tournoi:
                 # winner en tete, puis le reste, sans les modeles prunes.
@@ -3978,13 +4225,31 @@ cells = [
                     'winner_model_id': winner_model_id,
                     'auto_actions_applied': bool(auto_actions_applied),
                     'auto_actions_reason': str(auto_actions_reason),
+                    'require_auto_actions': bool(TOURNAMENT_REQUIRE_AUTO_ACTIONS),
+                    'force_prune_at_end': bool(TOURNAMENT_FORCE_PRUNE_AT_END),
                     'auto_actions_min_games_per_pair': int(TOURNAMENT_AUTO_ACTIONS_MIN_GAMES_PER_PAIR),
                     'games_per_pair': int(TOURNAMENT_GAMES_PER_PAIR),
+                    'wait_for_other_runs_before_auto_actions': bool(TOURNAMENT_WAIT_FOR_OTHER_RUNS_BEFORE_AUTO_ACTIONS),
+                    'wait_for_other_runs_timeout_seconds': float(TOURNAMENT_WAIT_FOR_OTHER_RUNS_TIMEOUT_SECONDS),
+                    'wait_for_other_runs_poll_seconds': float(TOURNAMENT_WAIT_FOR_OTHER_RUNS_POLL_SECONDS),
+                    'force_auto_actions_if_wait_timeout': bool(TOURNAMENT_FORCE_AUTO_ACTIONS_IF_WAIT_TIMEOUT),
+                    'other_active_tournaments_before_actions': int(other_active_runs),
+                    'other_runs_wait_seconds': float(other_runs_wait_seconds),
+                    'auto_actions_wait_timed_out': bool(auto_actions_wait_timed_out),
+                    'auto_actions_forced_after_timeout': bool(auto_actions_forced_after_timeout),
                     'global_lock': {
                         'enabled': bool(TOURNAMENT_GLOBAL_LOCK_ENABLED),
                         'backend_configured': str(TOURNAMENT_GLOBAL_LOCK_BACKEND),
                         'backend_effective': str(lock_metadata.get('backend', '<none>')),
                         'acquired': bool(lock_metadata.get('acquired', True)),
+                    },
+                    'run_lease': {
+                        'enabled': bool(TOURNAMENT_RUN_LEASE_ENABLED),
+                        'strict': bool(TOURNAMENT_RUN_LEASE_STRICT),
+                        'backend': str(TOURNAMENT_RUN_LEASE_BACKEND),
+                        'registered': bool(run_lease_registered),
+                        'guard_ok': bool(run_lease_guard_ok),
+                        'released_early': bool(run_lease_released_early),
                     },
                     'auto_prune_enabled': bool(TOURNAMENT_AUTO_PRUNE_ENABLED),
                     'auto_prune_count': int(TOURNAMENT_AUTO_PRUNE_COUNT),
@@ -4000,6 +4265,14 @@ cells = [
             out_path = out_dir / f'model_tournament_{stamp}.json'
             out_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding='utf-8')
             print('\\nReport saved:', out_path)
+        if run_lease_released_early:
+            print('run_lease_release     = already_released_before_auto_actions')
+        elif run_lease_registered:
+            try:
+                _release_tournament_run_lease(run_lease_meta, tournament_run_owner_id)
+                print('run_lease_release     = ok')
+            except Exception as exc:
+                print('run_lease_release_err =', f'{type(exc).__name__}: {exc}')
         """
     ),
 ]
