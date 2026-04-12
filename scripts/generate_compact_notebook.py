@@ -3303,6 +3303,9 @@ cells = [
         TOURNAMENT_AUTO_PRUNE_COUNT = 3
         TOURNAMENT_MIN_MODELS_TO_KEEP = 3
         TOURNAMENT_AUTO_PROMOTE_WINNER = True
+        TOURNAMENT_LIVE_PROGRESS_ENABLED = True
+        TOURNAMENT_PROGRESS_PRINT_EVERY_N_PAIRS = 8
+        TOURNAMENT_PROGRESS_LOG_EVERY_N_PAIRS = 1
 
         models_root = Path(DRIVE_ROOT) / 'models'
         registry_path = models_root / 'model_registry.json'
@@ -3349,6 +3352,88 @@ cells = [
         print('Paires a jouer =', len(fixtures))
         if len(fixtures) == 0:
             raise ValueError('Tournoi impossible: aucune paire generee.')
+
+        tournament_reports_dir = Path(DRIVE_ROOT) / 'reports' / 'benchmarks' / 'model_tournaments'
+        tournament_live_dir = tournament_reports_dir / 'live'
+        tournament_live_dir.mkdir(parents=True, exist_ok=True)
+        tournament_started_at_iso = datetime.now(UTC).isoformat().replace('+00:00', 'Z')
+        tournament_started_at_epoch = time.time()
+        tournament_stamp = datetime.now(UTC).strftime('%Y%m%d_%H%M%S')
+        tournament_run_id = (
+            f"model_tournament_{tournament_stamp}_{str(WORKER_TAG).strip() or socket.gethostname()}"
+        )
+        tournament_live_latest_path = tournament_live_dir / 'tournament_progress.latest.json'
+        tournament_live_jsonl_path = tournament_live_dir / f'{tournament_run_id}.progress.jsonl'
+        progress_state = {
+            'completed_pairs': 0,
+            'failed_pairs': 0,
+            'backend': 'pending',
+            'stage': 'starting',
+            'last_pair': '',
+            'last_pair_result': {},
+            'last_error': '',
+        }
+
+        def _write_json_atomic_text(path: Path, payload: dict) -> None:
+            tmp_path = path.with_suffix(path.suffix + '.tmp')
+            tmp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding='utf-8')
+            tmp_path.replace(path)
+
+        def _append_jsonl(path: Path, payload: dict) -> None:
+            with path.open('a', encoding='utf-8') as handle:
+                handle.write(json.dumps(payload, ensure_ascii=True) + '\\n')
+
+        def _emit_tournament_progress(*, stage: str, force_log: bool = False) -> None:
+            if not bool(TOURNAMENT_LIVE_PROGRESS_ENABLED):
+                return
+            total_pairs = max(1, int(len(fixtures)))
+            completed_pairs = int(progress_state.get('completed_pairs', 0))
+            failed_pairs = int(progress_state.get('failed_pairs', 0))
+            now_epoch = time.time()
+            elapsed_seconds = max(0.0, now_epoch - float(tournament_started_at_epoch))
+            completion_rate = float(completed_pairs) / float(total_pairs)
+            avg_pair_seconds = (elapsed_seconds / float(completed_pairs)) if completed_pairs > 0 else None
+            remaining_pairs = max(0, total_pairs - completed_pairs)
+            eta_seconds = (
+                float(avg_pair_seconds) * float(remaining_pairs)
+                if avg_pair_seconds is not None
+                else None
+            )
+            payload = {
+                'run_id': tournament_run_id,
+                'updated_at': datetime.now(UTC).isoformat().replace('+00:00', 'Z'),
+                'started_at': tournament_started_at_iso,
+                'stage': str(stage),
+                'backend': str(progress_state.get('backend', '<none>')),
+                'models_count': int(len(model_ids)),
+                'pairs_total': int(total_pairs),
+                'pairs_completed': int(completed_pairs),
+                'pairs_failed': int(failed_pairs),
+                'pairs_remaining': int(remaining_pairs),
+                'completion_rate': float(completion_rate),
+                'elapsed_seconds': float(elapsed_seconds),
+                'avg_pair_seconds': float(avg_pair_seconds) if avg_pair_seconds is not None else None,
+                'eta_seconds': float(eta_seconds) if eta_seconds is not None else None,
+                'games_per_pair': int(TOURNAMENT_GAMES_PER_PAIR),
+                'parallel_workers': int(effective_parallel_workers),
+                'last_pair': str(progress_state.get('last_pair', '')),
+                'last_pair_result': progress_state.get('last_pair_result', {}),
+                'last_error': str(progress_state.get('last_error', '')),
+            }
+            _write_json_atomic_text(tournament_live_latest_path, payload)
+            log_every = max(1, int(TOURNAMENT_PROGRESS_LOG_EVERY_N_PAIRS))
+            should_log = bool(force_log) or (completed_pairs % log_every == 0) or str(stage) in {
+                'starting',
+                'parallel_completed',
+                'failed',
+                'completed',
+            }
+            if should_log:
+                _append_jsonl(tournament_live_jsonl_path, payload)
+
+        print('tournament_live_latest =', tournament_live_latest_path)
+        print('tournament_live_jsonl  =', tournament_live_jsonl_path)
+        _emit_tournament_progress(stage='starting', force_log=True)
 
         auto_actions_allowed = True
         min_games_for_auto_actions = max(1, int(TOURNAMENT_AUTO_ACTIONS_MIN_GAMES_PER_PAIR))
@@ -3677,6 +3762,7 @@ cells = [
             results: list[dict] = []
             failed: list[dict] = []
             backend_error = ''
+            progress_state['backend'] = backend
             try:
                 if backend == 'thread':
                     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -3686,8 +3772,32 @@ cells = [
                         for future in as_completed(future_map):
                             payload = future_map[future]
                             try:
-                                results.append(future.result())
+                                result = future.result()
+                                results.append(result)
+                                progress_state['completed_pairs'] = int(progress_state.get('completed_pairs', 0)) + 1
+                                progress_state['last_pair'] = f"{result.get('model_a', '?')} vs {result.get('model_b', '?')}"
+                                progress_state['last_pair_result'] = {
+                                    'wins_a': int(result.get('wins_a', 0)),
+                                    'wins_b': int(result.get('wins_b', 0)),
+                                    'draws': int(result.get('draws', 0)),
+                                    'avg_moves': float(result.get('avg_moves', 0.0)),
+                                }
+                                progress_state['last_error'] = ''
+                                print_every = max(1, int(TOURNAMENT_PROGRESS_PRINT_EVERY_N_PAIRS))
+                                if int(progress_state['completed_pairs']) % print_every == 0:
+                                    print(
+                                        'tournament_progress    =',
+                                        f"{progress_state['completed_pairs']}/{len(fixtures)} pairs",
+                                        f"({(100.0 * float(progress_state['completed_pairs']) / float(max(1, len(fixtures)))):.1f}%)",
+                                        '| backend=',
+                                        backend,
+                                    )
+                                _emit_tournament_progress(stage='running')
                             except Exception as exc:
+                                progress_state['failed_pairs'] = int(progress_state.get('failed_pairs', 0)) + 1
+                                progress_state['last_pair'] = f"{payload.get('left', '?')} vs {payload.get('right', '?')}"
+                                progress_state['last_error'] = f'{type(exc).__name__}: {exc}'
+                                _emit_tournament_progress(stage='running')
                                 failed.append({'payload': payload, 'error': f'{type(exc).__name__}: {exc}'})
                 elif backend == 'process':
                     import multiprocessing as mp
@@ -3710,8 +3820,32 @@ cells = [
                         for future in as_completed(future_map):
                             payload = future_map[future]
                             try:
-                                results.append(future.result())
+                                result = future.result()
+                                results.append(result)
+                                progress_state['completed_pairs'] = int(progress_state.get('completed_pairs', 0)) + 1
+                                progress_state['last_pair'] = f"{result.get('model_a', '?')} vs {result.get('model_b', '?')}"
+                                progress_state['last_pair_result'] = {
+                                    'wins_a': int(result.get('wins_a', 0)),
+                                    'wins_b': int(result.get('wins_b', 0)),
+                                    'draws': int(result.get('draws', 0)),
+                                    'avg_moves': float(result.get('avg_moves', 0.0)),
+                                }
+                                progress_state['last_error'] = ''
+                                print_every = max(1, int(TOURNAMENT_PROGRESS_PRINT_EVERY_N_PAIRS))
+                                if int(progress_state['completed_pairs']) % print_every == 0:
+                                    print(
+                                        'tournament_progress    =',
+                                        f"{progress_state['completed_pairs']}/{len(fixtures)} pairs",
+                                        f"({(100.0 * float(progress_state['completed_pairs']) / float(max(1, len(fixtures)))):.1f}%)",
+                                        '| backend=',
+                                        backend,
+                                    )
+                                _emit_tournament_progress(stage='running')
                             except Exception as exc:
+                                progress_state['failed_pairs'] = int(progress_state.get('failed_pairs', 0)) + 1
+                                progress_state['last_pair'] = f"{payload.get('left', '?')} vs {payload.get('right', '?')}"
+                                progress_state['last_error'] = f'{type(exc).__name__}: {exc}'
+                                _emit_tournament_progress(stage='running')
                                 failed.append({'payload': payload, 'error': f'{type(exc).__name__}: {exc}'})
                 else:
                     raise ValueError(f'Backend parallel inconnu: {backend}')
@@ -3722,10 +3856,34 @@ cells = [
         def _execute_sequential(payloads: list[dict]) -> tuple[list[dict], list[dict]]:
             results: list[dict] = []
             failed: list[dict] = []
+            progress_state['backend'] = 'sequential'
             for payload in payloads:
                 try:
-                    results.append(_run_pair_series(payload))
+                    result = _run_pair_series(payload)
+                    results.append(result)
+                    progress_state['completed_pairs'] = int(progress_state.get('completed_pairs', 0)) + 1
+                    progress_state['last_pair'] = f"{result.get('model_a', '?')} vs {result.get('model_b', '?')}"
+                    progress_state['last_pair_result'] = {
+                        'wins_a': int(result.get('wins_a', 0)),
+                        'wins_b': int(result.get('wins_b', 0)),
+                        'draws': int(result.get('draws', 0)),
+                        'avg_moves': float(result.get('avg_moves', 0.0)),
+                    }
+                    progress_state['last_error'] = ''
+                    print_every = max(1, int(TOURNAMENT_PROGRESS_PRINT_EVERY_N_PAIRS))
+                    if int(progress_state['completed_pairs']) % print_every == 0:
+                        print(
+                            'tournament_progress    =',
+                            f"{progress_state['completed_pairs']}/{len(fixtures)} pairs",
+                            f"({(100.0 * float(progress_state['completed_pairs']) / float(max(1, len(fixtures)))):.1f}%)",
+                            '| backend=sequential',
+                        )
+                    _emit_tournament_progress(stage='running')
                 except Exception as exc:
+                    progress_state['failed_pairs'] = int(progress_state.get('failed_pairs', 0)) + 1
+                    progress_state['last_pair'] = f"{payload.get('left', '?')} vs {payload.get('right', '?')}"
+                    progress_state['last_error'] = f'{type(exc).__name__}: {exc}'
+                    _emit_tournament_progress(stage='running')
                     failed.append({'payload': payload, 'error': f'{type(exc).__name__}: {exc}'})
             return results, failed
 
@@ -3803,6 +3961,7 @@ cells = [
 
         if pending_payloads:
             failed_pairs = [f"{item['left']} vs {item['right']}" for item in pending_payloads]
+            _emit_tournament_progress(stage='failed', force_log=True)
             raise RuntimeError(
                 'Tournoi incomplet: certaines paires ont echoue apres retries. '
                 f'failed_pairs={failed_pairs}'
@@ -4406,6 +4565,7 @@ cells = [
             out_path = out_dir / f'model_tournament_{stamp}.json'
             out_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding='utf-8')
             print('\\nReport saved:', out_path)
+        _emit_tournament_progress(stage='completed', force_log=True)
         if run_lease_released_early:
             print('run_lease_release     = already_released_before_auto_actions')
         elif run_lease_registered:
