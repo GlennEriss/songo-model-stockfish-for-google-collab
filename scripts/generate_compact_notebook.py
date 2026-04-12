@@ -2105,13 +2105,20 @@ cells = [
             return fallback
 
         def _latest_job_dir(job_id: str) -> Path | None:
-            exact = jobs_root / str(job_id)
-            if exact.exists() and exact.is_dir():
-                return exact
             if not jobs_root.exists():
                 return None
-            prefix = str(job_id).rsplit('_', 1)[0]
-            candidates = [p for p in jobs_root.iterdir() if p.is_dir() and p.name.startswith(prefix)]
+            requested = str(job_id).strip()
+            if not requested:
+                return None
+            parts = requested.rsplit('_', 1)
+            prefix = parts[0] if len(parts) == 2 and parts[1].isdigit() else requested
+            candidates = []
+            for path in jobs_root.iterdir():
+                if not path.is_dir():
+                    continue
+                name = path.name
+                if name == requested or name == prefix or (prefix and name.startswith(prefix + '_')):
+                    candidates.append(path)
             if not candidates:
                 return None
             return sorted(candidates, key=lambda p: p.stat().st_mtime)[-1]
@@ -2299,13 +2306,20 @@ cells = [
         jobs_root = Path(DRIVE_ROOT) / 'jobs'
 
         def _latest_job_dir(job_id: str) -> Path | None:
-            exact = jobs_root / str(job_id)
-            if exact.exists() and exact.is_dir():
-                return exact
             if not jobs_root.exists():
                 return None
-            prefix = str(job_id).rsplit('_', 1)[0]
-            candidates = [p for p in jobs_root.iterdir() if p.is_dir() and p.name.startswith(prefix)]
+            requested = str(job_id).strip()
+            if not requested:
+                return None
+            parts = requested.rsplit('_', 1)
+            prefix = parts[0] if len(parts) == 2 and parts[1].isdigit() else requested
+            candidates = []
+            for path in jobs_root.iterdir():
+                if not path.is_dir():
+                    continue
+                name = path.name
+                if name == requested or name == prefix or (prefix and name.startswith(prefix + '_')):
+                    candidates.append(path)
             if not candidates:
                 return None
             return sorted(candidates, key=lambda p: p.stat().st_mtime)[-1]
@@ -2852,19 +2866,13 @@ cells = [
             requested = str(job_id).strip()
             if not requested:
                 return None
-            direct = jobs_root / requested
-            if direct.exists() and direct.is_dir():
-                return direct
             prefix = _job_prefix_for_rollover(requested)
             candidates = []
             for path in jobs_root.iterdir():
                 if not path.is_dir():
                     continue
                 name = path.name
-                if name == requested:
-                    candidates.append(path)
-                    continue
-                if prefix and name.startswith(prefix):
+                if name == requested or name == prefix or (prefix and name.startswith(prefix + '_')):
                     candidates.append(path)
             if not candidates:
                 return None
