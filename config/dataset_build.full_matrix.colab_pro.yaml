@@ -30,6 +30,11 @@ dataset_build:
   max_pending_futures: 32
   export_partial_every_n_files: 100
   include_tactical_analysis: true
+  value_target_mix_teacher_weight: 0.85
+  hard_examples_enabled: true
+  hard_examples_margin_threshold: 0.08
+  hard_examples_outcome_focus: 0.35
+  hard_examples_weight_multiplier: 2.0
   teacher:
     engine: minimax
     level: insane

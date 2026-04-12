@@ -42,6 +42,11 @@ dataset_generation:
     max_depth: 2
     max_branching: 3
     max_generated_per_source_sample: 8
+    counterfactual_teacher_engine: minimax
+    counterfactual_teacher_level: insane
+    counterfactual_top_k: 2
+    counterfactual_include_exploration: true
+    counterfactual_exploration_seed_offset: 17
   matchups:
     - minimax:medium vs minimax:medium
     - minimax:medium vs minimax:hard

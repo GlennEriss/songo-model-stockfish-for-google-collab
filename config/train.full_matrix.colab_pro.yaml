@@ -44,6 +44,10 @@ train:
   residual_connections: false
   gradient_clip_norm: 1.0
   early_stopping_patience: 6
+  hard_example_oversampling_enabled: true
+  hard_example_weight_exponent: 1.0
+  hard_example_weight_min: 1.0
+  hard_example_weight_max: 4.0
   scheduler:
     type: cosine
     min_lr: 0.00005

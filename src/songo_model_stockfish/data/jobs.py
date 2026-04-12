@@ -7,6 +7,7 @@ import json
 import math
 import multiprocessing
 import os
+import random
 import shutil
 import time
 from datetime import datetime
@@ -1973,6 +1974,7 @@ def _export_built_dataset_snapshot(
         capture_masks_list = []
         safe_masks_list = []
         risky_masks_list = []
+        hard_example_weight_list = []
         sample_ids = []
         game_id_list = []
         for relative_name in selected_files:
@@ -1987,7 +1989,17 @@ def _export_built_dataset_snapshot(
                         duplicate_samples_removed_total += 1
                         continue
                     seen_sample_ids.add(sample_id)
-                features, legal_mask, policy_index, policy_target_full, value, capture_move_mask, safe_move_mask, risky_move_mask = _encode_features(sample)
+                (
+                    features,
+                    legal_mask,
+                    policy_index,
+                    policy_target_full,
+                    value,
+                    capture_move_mask,
+                    safe_move_mask,
+                    risky_move_mask,
+                    hard_example_weight,
+                ) = _encode_features(sample)
                 features_list.append(features)
                 masks_list.append(legal_mask)
                 policy_list.append(policy_index)
@@ -1996,6 +2008,7 @@ def _export_built_dataset_snapshot(
                 capture_masks_list.append(capture_move_mask)
                 safe_masks_list.append(safe_move_mask)
                 risky_masks_list.append(risky_move_mask)
+                hard_example_weight_list.append(hard_example_weight)
                 sample_ids.append(sample_id or str(sample["sample_id"]))
                 game_id_list.append(str(sample["game_id"]))
 
@@ -2009,6 +2022,11 @@ def _export_built_dataset_snapshot(
         capture_move_mask = np.asarray(capture_masks_list, dtype=np.float32) if capture_masks_list else np.zeros((0, 7), dtype=np.float32)
         safe_move_mask = np.asarray(safe_masks_list, dtype=np.float32) if safe_masks_list else np.zeros((0, 7), dtype=np.float32)
         risky_move_mask = np.asarray(risky_masks_list, dtype=np.float32) if risky_masks_list else np.zeros((0, 7), dtype=np.float32)
+        hard_example_weight = (
+            np.asarray(hard_example_weight_list, dtype=np.float32)
+            if hard_example_weight_list
+            else np.ones((0,), dtype=np.float32)
+        )
         np.savez_compressed(
             output_root / f"{split_name}.npz",
             x=x,
@@ -2019,6 +2037,7 @@ def _export_built_dataset_snapshot(
             capture_move_mask=capture_move_mask,
             safe_move_mask=safe_move_mask,
             risky_move_mask=risky_move_mask,
+            hard_example_weight=hard_example_weight,
             sample_ids=np.asarray(sample_ids, dtype=object),
             game_ids=np.asarray(game_id_list, dtype=object),
         )
@@ -2153,6 +2172,100 @@ def _augment_existing_dataset_source(
     max_depth = max(1, int(augmentation_params.get("max_depth", 2)))
     max_branching = max(1, int(augmentation_params.get("max_branching", 3)))
     max_generated_per_source_sample = max(1, int(augmentation_params.get("max_generated_per_source_sample", 8)))
+    counterfactual_teacher_engine = str(
+        augmentation_params.get("counterfactual_teacher_engine", augmentation_params.get("teacher_engine", "minimax"))
+    ).strip().lower() or "minimax"
+    counterfactual_teacher_level = str(
+        augmentation_params.get("counterfactual_teacher_level", augmentation_params.get("teacher_level", "insane"))
+    ).strip() or "insane"
+    counterfactual_top_k = max(
+        1,
+        int(
+            augmentation_params.get(
+                "counterfactual_top_k",
+                min(2, max_branching),
+            )
+        ),
+    )
+    counterfactual_include_exploration = _as_bool(
+        augmentation_params.get("counterfactual_include_exploration", True),
+        default=True,
+    )
+    counterfactual_exploration_seed_offset = int(augmentation_params.get("counterfactual_exploration_seed_offset", 17))
+
+    def _select_counterfactual_moves(
+        *,
+        runtime_state: Any,
+        legal_moves: list[int],
+        sample_id: str,
+        current_depth: int,
+        lineage_moves: list[int],
+    ) -> tuple[list[int], dict[int, str]]:
+        if not legal_moves:
+            return [], {}
+        if len(legal_moves) <= 1:
+            return list(legal_moves), {int(move): "single_legal" for move in legal_moves}
+
+        move_scores: dict[int, float] = {}
+        selection_reason: dict[int, str] = {}
+        try:
+            _best_move, info = _teacher_choose(
+                runtime_state,
+                engine=counterfactual_teacher_engine,
+                level=counterfactual_teacher_level,
+            )
+            if counterfactual_teacher_engine == "minimax":
+                raw_scores = dict(info.get("root_scores", {}))
+            elif counterfactual_teacher_engine == "mcts":
+                raw_scores = dict(info.get("root_q", {}))
+            else:
+                raw_scores = {}
+            move_scores = {
+                int(move): float(score)
+                for move, score in raw_scores.items()
+                if int(move) in legal_moves
+            }
+        except Exception:
+            move_scores = {}
+
+        selected_moves: list[int] = []
+        remaining_moves = list(legal_moves)
+        if move_scores:
+            ranked = sorted(
+                legal_moves,
+                key=lambda move: float(move_scores.get(int(move), float("-inf"))),
+                reverse=True,
+            )
+            teacher_k = min(max_branching, counterfactual_top_k, len(ranked))
+            for move in ranked[:teacher_k]:
+                if move not in selected_moves:
+                    selected_moves.append(int(move))
+                    selection_reason[int(move)] = "teacher_topk"
+            remaining_moves = [int(move) for move in ranked if int(move) not in selected_moves]
+
+        if counterfactual_include_exploration and remaining_moves and len(selected_moves) < max_branching:
+            if move_scores:
+                exploration_move = min(
+                    remaining_moves,
+                    key=lambda move: float(move_scores.get(int(move), float("inf"))),
+                )
+            else:
+                hash_input = f"{sample_id}|{current_depth}|{','.join(str(move) for move in lineage_moves)}|{counterfactual_exploration_seed_offset}"
+                seed_value = int(hashlib.sha1(hash_input.encode("utf-8")).hexdigest()[:8], 16)
+                rng = random.Random(seed_value)
+                exploration_move = int(rng.choice(remaining_moves))
+            if exploration_move not in selected_moves:
+                selected_moves.append(int(exploration_move))
+                selection_reason[int(exploration_move)] = "exploration_alt"
+
+        if not selected_moves:
+            fallback = [int(move) for move in legal_moves[:max_branching]]
+            return fallback, {int(move): "fallback_legal_order" for move in fallback}
+
+        trimmed = [int(move) for move in selected_moves[:max_branching]]
+        for move in trimmed:
+            selection_reason.setdefault(int(move), "teacher_topk")
+        return trimmed, selection_reason
 
     seen_signatures: set[str] = set()
     scanned_files = 0
@@ -2203,21 +2316,32 @@ def _augment_existing_dataset_source(
                         break
 
             runtime_state = _raw_state_to_runtime_state(sample["state"])
-            frontier: list[tuple[Any, int, list[int]]] = [(runtime_state, 0, [])]
+            root_sample_id = str(sample.get("sample_id", ""))
+            frontier: list[tuple[Any, int, list[int], str, str]] = [
+                (runtime_state, 0, [], root_sample_id, root_sample_id)
+            ]
             generated_from_sample = 0
             local_signatures: set[str] = {sample_signature}
 
             while frontier and generated_from_sample < max_generated_per_source_sample:
                 if target_samples > 0 and selected_samples >= target_samples:
                     break
-                current_state, current_depth, lineage_moves = frontier.pop(0)
+                current_state, current_depth, lineage_moves, parent_sample_id, origin_sample_id = frontier.pop(0)
                 if current_depth >= max_depth:
                     continue
                 legal_moves = list(songo_ai_game.legal_moves(current_state))
                 if not legal_moves:
                     continue
 
-                for move in legal_moves[:max_branching]:
+                selected_moves, selection_reason = _select_counterfactual_moves(
+                    runtime_state=current_state,
+                    legal_moves=[int(move) for move in legal_moves],
+                    sample_id=origin_sample_id or root_sample_id or str(sample.get("sample_id", "")),
+                    current_depth=current_depth,
+                    lineage_moves=list(lineage_moves),
+                )
+
+                for move in selected_moves:
                     if target_samples > 0 and selected_samples >= target_samples:
                         break
                     if generated_from_sample >= max_generated_per_source_sample:
@@ -2250,6 +2374,13 @@ def _augment_existing_dataset_source(
                     augmented_sample["augmented_from_sample_id"] = str(sample.get("sample_id", ""))
                     augmented_sample["augmentation_depth"] = current_depth + 1
                     augmented_sample["augmentation_lineage_moves"] = lineage_moves + [int(move)]
+                    augmented_sample["counterfactual_depth"] = current_depth + 1
+                    augmented_sample["counterfactual_parent_sample_id"] = str(parent_sample_id)
+                    augmented_sample["counterfactual_root_sample_id"] = str(origin_sample_id or root_sample_id)
+                    augmented_sample["counterfactual_lineage_moves"] = lineage_moves + [int(move)]
+                    augmented_sample["counterfactual_selected_by"] = str(selection_reason.get(int(move), "teacher_topk"))
+                    augmented_sample["counterfactual_teacher_engine"] = counterfactual_teacher_engine
+                    augmented_sample["counterfactual_teacher_level"] = counterfactual_teacher_level
                     kept_samples.append(augmented_sample)
                     selected_samples += 1
                     selected_augmented_samples += 1
@@ -2260,7 +2391,15 @@ def _augment_existing_dataset_source(
                     file_stats["max_depth_reached"] = max(file_stats["max_depth_reached"], current_depth + 1)
 
                     if current_depth + 1 < max_depth:
-                        frontier.append((next_state, current_depth + 1, lineage_moves + [int(move)]))
+                        frontier.append(
+                            (
+                                next_state,
+                                current_depth + 1,
+                                lineage_moves + [int(move)],
+                                str(augmented_sample.get("sample_id", parent_sample_id)),
+                                str(origin_sample_id or root_sample_id),
+                            )
+                        )
 
         if kept_samples:
             target_sampled_file = target_sampled_dir / relative_path
@@ -2306,6 +2445,11 @@ def _augment_existing_dataset_source(
             "max_depth": max_depth,
             "max_branching": max_branching,
             "max_generated_per_source_sample": max_generated_per_source_sample,
+            "counterfactual_teacher_engine": counterfactual_teacher_engine,
+            "counterfactual_teacher_level": counterfactual_teacher_level,
+            "counterfactual_top_k": counterfactual_top_k,
+            "counterfactual_include_exploration": counterfactual_include_exploration,
+            "counterfactual_exploration_seed_offset": counterfactual_exploration_seed_offset,
         },
     }
 
@@ -2455,6 +2599,8 @@ def _load_npz_arrays(path: Path) -> dict[str, np.ndarray]:
     for key in ("capture_move_mask", "safe_move_mask", "risky_move_mask"):
         if key not in arrays:
             arrays[key] = np.zeros((count, 7), dtype=np.float32)
+    if "hard_example_weight" not in arrays:
+        arrays["hard_example_weight"] = np.ones((count,), dtype=np.float32)
     return arrays
 
 
@@ -2472,6 +2618,7 @@ def _merge_npz_splits(
         "capture_move_mask": [],
         "safe_move_mask": [],
         "risky_move_mask": [],
+        "hard_example_weight": [],
         "sample_ids": [],
         "game_ids": [],
     }
@@ -2518,6 +2665,7 @@ def _merge_npz_splits(
             "capture_move_mask": np.zeros((0, 7), dtype=np.float32),
             "safe_move_mask": np.zeros((0, 7), dtype=np.float32),
             "risky_move_mask": np.zeros((0, 7), dtype=np.float32),
+            "hard_example_weight": np.ones((0,), dtype=np.float32),
             "sample_ids": np.asarray([], dtype=object),
             "game_ids": np.asarray([], dtype=object),
         }
@@ -2549,6 +2697,7 @@ def _merge_npz_splits_with_source_breakdown(
         "capture_move_mask": [],
         "safe_move_mask": [],
         "risky_move_mask": [],
+        "hard_example_weight": [],
         "sample_ids": [],
         "game_ids": [],
     }
@@ -2608,6 +2757,7 @@ def _merge_npz_splits_with_source_breakdown(
             "capture_move_mask": np.zeros((0, 7), dtype=np.float32),
             "safe_move_mask": np.zeros((0, 7), dtype=np.float32),
             "risky_move_mask": np.zeros((0, 7), dtype=np.float32),
+            "hard_example_weight": np.ones((0,), dtype=np.float32),
             "sample_ids": np.asarray([], dtype=object),
             "game_ids": np.asarray([], dtype=object),
         }
@@ -3746,6 +3896,67 @@ def _normalize_value(value: float) -> float:
     return float(np.tanh(clipped / 200.0))
 
 
+def _clip_unit(value: float) -> float:
+    return float(max(-1.0, min(1.0, float(value))))
+
+
+def _safe_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _safe_sample_outcome_value(sample: dict[str, Any]) -> float:
+    raw = sample.get("game_outcome_for_player_to_move", 0.0)
+    if raw is None:
+        return 0.0
+    value = _safe_float(raw, 0.0)
+    if not np.isfinite(value):
+        return 0.0
+    return _clip_unit(value)
+
+
+def _compute_hard_example_annotation(
+    *,
+    teacher_move_scores: dict[int, float],
+    legal_moves: list[int],
+    best_move: int,
+    outcome_value: float,
+    enabled: bool,
+    margin_threshold: float,
+    outcome_focus: float,
+    weight_multiplier: float,
+) -> tuple[float, float, float, float]:
+    if not enabled:
+        return 0.0, 0.0, 0.0, 1.0
+
+    best_score = float(teacher_move_scores.get(int(best_move), 0.0))
+    second_best_score = float(best_score)
+    if len(legal_moves) > 1:
+        ordered = sorted(
+            [float(teacher_move_scores.get(int(move), best_score)) for move in legal_moves],
+            reverse=True,
+        )
+        best_score = float(ordered[0])
+        second_best_score = float(ordered[1])
+    normalized_margin = max(0.0, _normalize_value(best_score) - _normalize_value(second_best_score))
+    safe_threshold = max(1e-6, float(margin_threshold))
+    margin_hardness = max(0.0, 1.0 - min(1.0, normalized_margin / safe_threshold))
+    outcome_hardness = max(0.0, -_clip_unit(outcome_value))
+    outcome_focus_clamped = max(0.0, min(1.0, float(outcome_focus)))
+    hard_score = max(
+        0.0,
+        min(
+            1.0,
+            ((1.0 - outcome_focus_clamped) * margin_hardness) + (outcome_focus_clamped * outcome_hardness),
+        ),
+    )
+    multiplier = max(1.0, float(weight_multiplier))
+    hard_weight = 1.0 + (hard_score * (multiplier - 1.0))
+    return float(normalized_margin), float(margin_hardness), float(hard_score), float(hard_weight)
+
+
 def _build_policy_distribution_from_scores(
     legal_moves: list[int],
     move_scores: dict[int, float],
@@ -3797,6 +4008,11 @@ def _label_sample(
     teacher_engine: str,
     teacher_level: str,
     include_tactical_analysis: bool = True,
+    value_target_mix_teacher_weight: float = 1.0,
+    hard_examples_enabled: bool = True,
+    hard_examples_margin_threshold: float = 0.08,
+    hard_examples_outcome_focus: float = 0.35,
+    hard_examples_weight_multiplier: float = 2.0,
 ) -> dict[str, Any]:
     if bool(sample["state"].get("is_terminal", False)):
         raise ValueError(f"Cannot label terminal sample: {sample['sample_id']}")
@@ -3824,6 +4040,21 @@ def _label_sample(
         best_move = max(legal_moves, key=lambda move: float(move_scores.get(int(move), float("-inf"))))
 
     teacher_score = float(move_scores.get(int(best_move), info.get("score", 0.0)))
+    teacher_value_target = _normalize_value(teacher_score)
+    outcome_value_target = _safe_sample_outcome_value(sample)
+    teacher_mix = max(0.0, min(1.0, float(value_target_mix_teacher_weight)))
+    outcome_mix = 1.0 - teacher_mix
+    mixed_value_target = _clip_unit((teacher_mix * float(teacher_value_target)) + (outcome_mix * float(outcome_value_target)))
+    normalized_margin, margin_hardness, hard_example_score, hard_example_weight = _compute_hard_example_annotation(
+        teacher_move_scores=move_scores,
+        legal_moves=legal_moves,
+        best_move=int(best_move),
+        outcome_value=outcome_value_target,
+        enabled=bool(hard_examples_enabled),
+        margin_threshold=float(hard_examples_margin_threshold),
+        outcome_focus=float(hard_examples_outcome_focus),
+        weight_multiplier=float(hard_examples_weight_multiplier),
+    )
 
     labeled = dict(sample)
     labeled["teacher_engine"] = teacher_engine
@@ -3840,7 +4071,17 @@ def _label_sample(
             move_scores,
             best_move=int(best_move),
         )
-    labeled["value_target"] = _normalize_value(teacher_score)
+    labeled["value_target_teacher"] = float(teacher_value_target)
+    labeled["value_target_outcome"] = float(outcome_value_target)
+    labeled["value_target_mix"] = float(mixed_value_target)
+    labeled["value_target_mix_teacher_weight"] = float(teacher_mix)
+    labeled["value_target_mix_outcome_weight"] = float(outcome_mix)
+    labeled["value_target"] = float(mixed_value_target)
+    labeled["hard_example_score"] = float(hard_example_score)
+    labeled["hard_example_margin"] = float(normalized_margin)
+    labeled["hard_example_margin_hardness"] = float(margin_hardness)
+    labeled["hard_example_outcome_hardness"] = float(max(0.0, -float(outcome_value_target)))
+    labeled["hard_example_weight"] = float(hard_example_weight)
     return labeled
 
 
@@ -3873,7 +4114,7 @@ def _extract_tactical_move_mask(sample: dict[str, Any], *, mode: str) -> np.ndar
     return mask
 
 
-def _encode_features(sample: dict[str, Any]) -> tuple[np.ndarray, np.ndarray, int, np.ndarray, float, np.ndarray, np.ndarray, np.ndarray]:
+def _encode_features(sample: dict[str, Any]) -> tuple[np.ndarray, np.ndarray, int, np.ndarray, float, np.ndarray, np.ndarray, np.ndarray, float]:
     features, legal_mask = encode_model_features(
         sample["state"],
         sample["legal_moves"],
@@ -3882,10 +4123,23 @@ def _encode_features(sample: dict[str, Any]) -> tuple[np.ndarray, np.ndarray, in
     policy_index = int(sample["policy_target"]["best_move"]) - 1
     policy_target_full = _extract_policy_target_full(sample)
     value = float(sample["value_target"])
+    hard_example_weight = _safe_float(sample.get("hard_example_weight", 1.0), 1.0)
+    if (not np.isfinite(hard_example_weight)) or hard_example_weight <= 0.0:
+        hard_example_weight = 1.0
     capture_move_mask = _extract_tactical_move_mask(sample, mode="capture")
     safe_move_mask = _extract_tactical_move_mask(sample, mode="safe")
     risky_move_mask = _extract_tactical_move_mask(sample, mode="risky")
-    return features, legal_mask, policy_index, policy_target_full, value, capture_move_mask, safe_move_mask, risky_move_mask
+    return (
+        features,
+        legal_mask,
+        policy_index,
+        policy_target_full,
+        value,
+        capture_move_mask,
+        safe_move_mask,
+        risky_move_mask,
+        float(hard_example_weight),
+    )
 
 
 def _label_samples_from_file(
@@ -3894,6 +4148,11 @@ def _label_samples_from_file(
     teacher_engine: str,
     teacher_level: str,
     include_tactical_analysis: bool = True,
+    value_target_mix_teacher_weight: float = 1.0,
+    hard_examples_enabled: bool = True,
+    hard_examples_margin_threshold: float = 0.08,
+    hard_examples_outcome_focus: float = 0.35,
+    hard_examples_weight_multiplier: float = 2.0,
 ) -> tuple[int, list[dict[str, Any]], int, int]:
     source_samples = list(_iter_jsonl(Path(sampled_file_path)))
     source_count = len(source_samples)
@@ -3913,6 +4172,11 @@ def _label_samples_from_file(
                 teacher_engine=teacher_engine,
                 teacher_level=teacher_level,
                 include_tactical_analysis=include_tactical_analysis,
+                value_target_mix_teacher_weight=value_target_mix_teacher_weight,
+                hard_examples_enabled=hard_examples_enabled,
+                hard_examples_margin_threshold=hard_examples_margin_threshold,
+                hard_examples_outcome_focus=hard_examples_outcome_focus,
+                hard_examples_weight_multiplier=hard_examples_weight_multiplier,
             )
         )
     return source_count, labeled_samples, skipped_terminal, skipped_no_legal
@@ -3922,6 +4186,9 @@ def _prepare_prelabeled_sample(
     sample: dict[str, Any],
     *,
     include_tactical_analysis: bool = True,
+    hard_examples_enabled: bool = True,
+    hard_examples_outcome_focus: float = 0.35,
+    hard_examples_weight_multiplier: float = 2.0,
 ) -> dict[str, Any]:
     legal_moves = [int(move) for move in list(sample.get("legal_moves", []))]
     if bool(sample.get("state", {}).get("is_terminal", False)):
@@ -3952,6 +4219,33 @@ def _prepare_prelabeled_sample(
         "distribution": {str(move): float(prob) for move, prob in distribution.items()},
     }
     prepared["value_target"] = value_target
+    if "hard_example_weight" in prepared:
+        existing_weight = _safe_float(prepared.get("hard_example_weight"), 1.0)
+        if np.isfinite(existing_weight) and existing_weight > 0.0:
+            prepared["hard_example_weight"] = float(existing_weight)
+        else:
+            prepared["hard_example_weight"] = 1.0
+        prepared["hard_example_score"] = float(max(0.0, min(1.0, _safe_float(prepared.get("hard_example_score", 0.0), 0.0))))
+    else:
+        distribution_probs = np.asarray(
+            [float(distribution.get(int(move), 0.0)) for move in legal_moves],
+            dtype=np.float64,
+        )
+        entropy = 0.0
+        if distribution_probs.size > 0:
+            probs = np.clip(distribution_probs, 1e-9, 1.0)
+            probs = probs / float(np.sum(probs))
+            entropy = float(-np.sum(probs * np.log(probs)))
+            entropy = entropy / float(np.log(max(2, int(len(probs)))))
+        outcome_value = _safe_sample_outcome_value(prepared)
+        outcome_hardness = max(0.0, -float(outcome_value))
+        outcome_focus = max(0.0, min(1.0, float(hard_examples_outcome_focus)))
+        hard_score = max(0.0, min(1.0, ((1.0 - outcome_focus) * entropy) + (outcome_focus * outcome_hardness)))
+        if not bool(hard_examples_enabled):
+            hard_score = 0.0
+        multiplier = max(1.0, float(hard_examples_weight_multiplier))
+        prepared["hard_example_score"] = float(hard_score)
+        prepared["hard_example_weight"] = float(1.0 + (hard_score * (multiplier - 1.0)))
 
     if include_tactical_analysis and not isinstance(prepared.get("tactical_analysis"), dict):
         runtime_state = _raw_state_to_runtime_state(prepared["state"])
@@ -3969,6 +4263,9 @@ def _prepare_prelabeled_samples_from_file(
     sampled_file_path: str,
     *,
     include_tactical_analysis: bool = True,
+    hard_examples_enabled: bool = True,
+    hard_examples_outcome_focus: float = 0.35,
+    hard_examples_weight_multiplier: float = 2.0,
 ) -> tuple[int, list[dict[str, Any]], int, int, int]:
     source_samples = list(_iter_jsonl(Path(sampled_file_path)))
     source_count = len(source_samples)
@@ -3988,6 +4285,9 @@ def _prepare_prelabeled_samples_from_file(
                 _prepare_prelabeled_sample(
                     sample,
                     include_tactical_analysis=include_tactical_analysis,
+                    hard_examples_enabled=hard_examples_enabled,
+                    hard_examples_outcome_focus=hard_examples_outcome_focus,
+                    hard_examples_weight_multiplier=hard_examples_weight_multiplier,
                 )
             )
         except Exception:
@@ -4097,6 +4397,7 @@ def _play_and_sample_game(
         "player_a": agent_a.display_name,
         "player_b": agent_b.display_name,
         "winner": logical_winner,
+        "winner_index": (None if winner is None else int(winner)),
         "moves": moves,
         "ply_count": ply,
         "started_at": started_at,
@@ -4160,9 +4461,47 @@ def _materialize_completed_game(
         )
         return 0, 0
 
+    winner_index_raw = raw_payload.get("winner_index")
+    winner_index: int | None
+    if winner_index_raw is None:
+        winner_index = None
+    else:
+        try:
+            winner_index = int(winner_index_raw)
+        except Exception:
+            winner_index = None
+    scores_raw = raw_payload.get("scores", [0, 0])
+    try:
+        final_scores = (
+            int(scores_raw[0]) if isinstance(scores_raw, (list, tuple)) and len(scores_raw) > 0 else 0,
+            int(scores_raw[1]) if isinstance(scores_raw, (list, tuple)) and len(scores_raw) > 1 else 0,
+        )
+    except Exception:
+        final_scores = (0, 0)
+
+    # Persist game-level outcome context on each sampled position so labelers can
+    # mix local teacher value with long-horizon game outcome when requested.
+    enriched_samples: list[dict[str, Any]] = []
+    for sample in samples:
+        payload = dict(sample)
+        player_label = str(payload.get("player_to_move", "south"))
+        payload["game_winner_index"] = (None if winner_index is None else int(winner_index))
+        payload["game_final_scores"] = {
+            "south": int(final_scores[0]),
+            "north": int(final_scores[1]),
+        }
+        payload["game_outcome_for_player_to_move"] = float(
+            _outcome_value_for_player_to_move(
+                winner_index=winner_index,
+                final_scores=final_scores,
+                player_to_move_label=player_label,
+            )
+        )
+        enriched_samples.append(payload)
+
     _write_json(Path(pending["raw_game_path"]), raw_payload)
     sampled_game_path = Path(pending["sampled_game_path"])
-    write_jsonl_atomic(sampled_game_path, samples, ensure_ascii=True)
+    write_jsonl_atomic(sampled_game_path, enriched_samples, ensure_ascii=True)
 
     job.logger.info(
         "dataset game completed | matchup=%s | game=%s/%s | moves=%s | samples=%s | winner=%s | mode=%s",
@@ -6198,6 +6537,22 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
     multiprocessing_start_method = str(runtime_cfg.get("multiprocessing_start_method", "spawn")).strip().lower() or "spawn"
     max_tasks_per_child = int(runtime_cfg.get("max_tasks_per_child", 25))
     include_tactical_analysis = _as_bool(cfg.get("include_tactical_analysis", True), default=True)
+    value_target_mix_teacher_weight = max(
+        0.0,
+        min(
+            1.0,
+            float(
+                cfg.get(
+                    "value_target_mix_teacher_weight",
+                    cfg.get("value_target_mix", 1.0),
+                )
+            ),
+        ),
+    )
+    hard_examples_enabled = _as_bool(cfg.get("hard_examples_enabled", True), default=True)
+    hard_examples_margin_threshold = max(1e-6, float(cfg.get("hard_examples_margin_threshold", 0.08)))
+    hard_examples_outcome_focus = max(0.0, min(1.0, float(cfg.get("hard_examples_outcome_focus", 0.35))))
+    hard_examples_weight_multiplier = max(1.0, float(cfg.get("hard_examples_weight_multiplier", 2.0)))
     dedupe_sample_ids = _as_bool(cfg.get("dedupe_sample_ids", True), default=True)
     export_partial_every_n_files = max(1, int(cfg.get("export_partial_every_n_files", 250)))
     adaptive_source_polling = _as_bool(cfg.get("adaptive_source_polling", True), default=True)
@@ -6240,7 +6595,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         )
 
     job.logger.info(
-        "dataset build startup | dataset=%s | source_dataset_id=%s | configured_input_sampled_dir=%s | build_mode_requested=%s | workers=%s | max_pending_futures=%s | include_tactical_analysis=%s | dedupe_sample_ids=%s | export_partial_every_n_files=%s | follow_source_updates=%s | source_poll_interval_seconds=%.1f | adaptive_source_polling=%s | global_target_backend=%s",
+        "dataset build startup | dataset=%s | source_dataset_id=%s | configured_input_sampled_dir=%s | build_mode_requested=%s | workers=%s | max_pending_futures=%s | include_tactical_analysis=%s | value_target_mix_teacher_weight=%.3f | hard_examples_enabled=%s | hard_examples_margin_threshold=%.4f | hard_examples_outcome_focus=%.3f | hard_examples_weight_multiplier=%.3f | dedupe_sample_ids=%s | export_partial_every_n_files=%s | follow_source_updates=%s | source_poll_interval_seconds=%.1f | adaptive_source_polling=%s | global_target_backend=%s",
         dataset_id,
         source_dataset_id or "<auto>",
         str(cfg.get("input_sampled_dir", "")),
@@ -6248,6 +6603,11 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         num_workers,
         max_pending_futures,
         include_tactical_analysis,
+        value_target_mix_teacher_weight,
+        hard_examples_enabled,
+        hard_examples_margin_threshold,
+        hard_examples_outcome_focus,
+        hard_examples_weight_multiplier,
         dedupe_sample_ids,
         export_partial_every_n_files,
         configured_follow_source_updates,
@@ -6621,6 +6981,11 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         target_labeled_samples=target_labeled_samples,
         num_workers=num_workers,
         include_tactical_analysis=include_tactical_analysis,
+        value_target_mix_teacher_weight=value_target_mix_teacher_weight,
+        hard_examples_enabled=hard_examples_enabled,
+        hard_examples_margin_threshold=hard_examples_margin_threshold,
+        hard_examples_outcome_focus=hard_examples_outcome_focus,
+        hard_examples_weight_multiplier=hard_examples_weight_multiplier,
         dedupe_sample_ids=dedupe_sample_ids,
         adaptive_source_polling=adaptive_source_polling,
     )
@@ -6710,6 +7075,9 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
             source_count, file_samples, skipped_terminal, skipped_no_legal, skipped_invalid = _prepare_prelabeled_samples_from_file(
                 str(sampled_file),
                 include_tactical_analysis=include_tactical_analysis,
+                hard_examples_enabled=hard_examples_enabled,
+                hard_examples_outcome_focus=hard_examples_outcome_focus,
+                hard_examples_weight_multiplier=hard_examples_weight_multiplier,
             )
             return source_count, file_samples, skipped_terminal, skipped_no_legal, skipped_invalid
         source_count, file_samples, skipped_terminal, skipped_no_legal = _label_samples_from_file(
@@ -6717,6 +7085,11 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
             teacher_engine=teacher_engine,
             teacher_level=teacher_level,
             include_tactical_analysis=include_tactical_analysis,
+            value_target_mix_teacher_weight=value_target_mix_teacher_weight,
+            hard_examples_enabled=hard_examples_enabled,
+            hard_examples_margin_threshold=hard_examples_margin_threshold,
+            hard_examples_outcome_focus=hard_examples_outcome_focus,
+            hard_examples_weight_multiplier=hard_examples_weight_multiplier,
         )
         return source_count, file_samples, skipped_terminal, skipped_no_legal, 0
 
@@ -6816,6 +7189,9 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
                 worker_function: Callable[..., Any] = _prepare_prelabeled_samples_from_file
                 worker_kwargs = {
                     "include_tactical_analysis": include_tactical_analysis,
+                    "hard_examples_enabled": hard_examples_enabled,
+                    "hard_examples_outcome_focus": hard_examples_outcome_focus,
+                    "hard_examples_weight_multiplier": hard_examples_weight_multiplier,
                 }
             else:
                 worker_function = _label_samples_from_file
@@ -6823,6 +7199,11 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
                     "teacher_engine": teacher_engine,
                     "teacher_level": teacher_level,
                     "include_tactical_analysis": include_tactical_analysis,
+                    "value_target_mix_teacher_weight": value_target_mix_teacher_weight,
+                    "hard_examples_enabled": hard_examples_enabled,
+                    "hard_examples_margin_threshold": hard_examples_margin_threshold,
+                    "hard_examples_outcome_focus": hard_examples_outcome_focus,
+                    "hard_examples_weight_multiplier": hard_examples_weight_multiplier,
                 }
             try:
                 mp_context = multiprocessing.get_context(multiprocessing_start_method)
@@ -7058,6 +7439,11 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         "job_id": job.job_id,
         "dataset_id": dataset_id,
         "build_mode": effective_build_mode,
+        "value_target_mix_teacher_weight": value_target_mix_teacher_weight,
+        "hard_examples_enabled": hard_examples_enabled,
+        "hard_examples_margin_threshold": hard_examples_margin_threshold,
+        "hard_examples_outcome_focus": hard_examples_outcome_focus,
+        "hard_examples_weight_multiplier": hard_examples_weight_multiplier,
         "teacher_engine": teacher_engine,
         "teacher_level": teacher_level,
         "source_dataset_id": source_dataset_id,

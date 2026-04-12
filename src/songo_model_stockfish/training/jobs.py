@@ -45,6 +45,19 @@ def _resolve_storage_path(base: Path, configured: str | None, fallback: Path) ->
     return base / path
 
 
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return bool(default)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on", "y", "t"}:
+        return True
+    if text in {"0", "false", "no", "off", "n", "f"}:
+        return False
+    return bool(default)
+
+
 def _read_dataset_registry(data_root: Path, firestore_cfg: dict[str, Any] | None = None) -> dict[str, Any]:
     cfg = firestore_cfg if isinstance(firestore_cfg, dict) else {}
     backend = str(cfg.get("backend", "file")).strip().lower() or "file"
@@ -396,7 +409,7 @@ def run_train(job: JobContext) -> dict[str, object]:
         cfg.get("promoted_best_checkpoint_path"),
         promoted_best_dir(job.paths.models_root) / "model.pt",
     )
-    init_from_promoted_best = bool(cfg.get("init_from_promoted_best", True))
+    init_from_promoted_best = _as_bool(cfg.get("init_from_promoted_best", True), default=True)
     model_id = str(cfg.get("model_id", "auto"))
     model_id_prefix = str(cfg.get("model_id_prefix", "songo_policy_value_colab_pro"))
     if model_id in {"", "auto"}:
@@ -414,6 +427,10 @@ def run_train(job: JobContext) -> dict[str, object]:
     log_every_n_batches = max(1, int(cfg.get("log_every_n_batches", 1)))
     gradient_clip_norm = float(cfg.get("gradient_clip_norm", 0.0))
     early_stopping_patience = max(0, int(cfg.get("early_stopping_patience", 0)))
+    hard_example_oversampling_enabled = _as_bool(cfg.get("hard_example_oversampling_enabled", True), default=True)
+    hard_example_weight_exponent = max(0.0, float(cfg.get("hard_example_weight_exponent", 1.0)))
+    hard_example_weight_min = max(1e-6, float(cfg.get("hard_example_weight_min", 1.0)))
+    hard_example_weight_max = max(hard_example_weight_min, float(cfg.get("hard_example_weight_max", 5.0)))
     requested_device = str(runtime_cfg.get("device", "cpu")).strip().lower() or "cpu"
     if requested_device in {"tpu", "xla"}:
         try:
@@ -445,6 +462,10 @@ def run_train(job: JobContext) -> dict[str, object]:
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
         prefetch_factor=prefetch_factor,
+        weighted_sampling=hard_example_oversampling_enabled,
+        weighted_sampling_exponent=hard_example_weight_exponent,
+        weighted_sampling_min_weight=hard_example_weight_min,
+        weighted_sampling_max_weight=hard_example_weight_max,
     )
     validation_loader, _ = build_dataloader(
         validation_path,
@@ -454,7 +475,9 @@ def run_train(job: JobContext) -> dict[str, object]:
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
         prefetch_factor=prefetch_factor,
+        weighted_sampling=False,
     )
+    train_sampling_metadata = getattr(train_loader, "songo_sampling_metadata", {})
 
     if expected_dataset_input_dim is not None and int(expected_dataset_input_dim) != int(input_dim):
         raise ValueError(
@@ -603,7 +626,7 @@ def run_train(job: JobContext) -> dict[str, object]:
         )
 
     job.logger.info(
-        "training started | dataset=%s | selection_mode=%s | dataset_path=%s | validation_path=%s | model=%s | init_checkpoint=%s | promoted_best=%s | device=%s | mixed_precision=%s | epochs=%s | batch_size=%s | train_examples=%s | validation_examples=%s",
+        "training started | dataset=%s | selection_mode=%s | dataset_path=%s | validation_path=%s | model=%s | init_checkpoint=%s | promoted_best=%s | device=%s | mixed_precision=%s | epochs=%s | batch_size=%s | train_examples=%s | validation_examples=%s | weighted_sampling=%s | hard_weight_min=%.3f | hard_weight_max=%.3f | hard_weight_mean=%.3f | hard_weight_exponent=%.3f",
         dataset_id,
         dataset_selection_mode,
         dataset_path,
@@ -617,6 +640,11 @@ def run_train(job: JobContext) -> dict[str, object]:
         batch_size,
         len(train_loader.dataset),
         len(validation_loader.dataset),
+        bool(train_sampling_metadata.get("weighted_sampling_enabled", False)),
+        float(train_sampling_metadata.get("hard_example_weight_min", 1.0)),
+        float(train_sampling_metadata.get("hard_example_weight_max", 1.0)),
+        float(train_sampling_metadata.get("hard_example_weight_mean", 1.0)),
+        float(train_sampling_metadata.get("hard_example_weight_exponent", hard_example_weight_exponent)),
     )
     job.set_phase("training")
     job.write_event(
@@ -640,6 +668,11 @@ def run_train(job: JobContext) -> dict[str, object]:
         scheduler_type=scheduler_type,
         gradient_clip_norm=gradient_clip_norm,
         early_stopping_patience=early_stopping_patience,
+        hard_example_oversampling_enabled=hard_example_oversampling_enabled,
+        hard_example_weight_exponent=hard_example_weight_exponent,
+        hard_example_weight_min=hard_example_weight_min,
+        hard_example_weight_max=hard_example_weight_max,
+        train_sampling_metadata=train_sampling_metadata,
     )
     job.write_metric(
         {
@@ -650,6 +683,8 @@ def run_train(job: JobContext) -> dict[str, object]:
             "train_examples": len(train_loader.dataset),
             "validation_examples": len(validation_loader.dataset),
             "mixed_precision": amp_enabled,
+            "hard_example_oversampling_enabled": hard_example_oversampling_enabled,
+            "hard_example_weight_mean": float(train_sampling_metadata.get("hard_example_weight_mean", 1.0)),
         }
     )
 
@@ -1039,6 +1074,11 @@ def run_train(job: JobContext) -> dict[str, object]:
         "scheduler_type": scheduler_type,
         "scheduler": scheduler_params,
         "gradient_clip_norm": gradient_clip_norm,
+        "hard_example_oversampling_enabled": hard_example_oversampling_enabled,
+        "hard_example_weight_exponent": hard_example_weight_exponent,
+        "hard_example_weight_min": hard_example_weight_min,
+        "hard_example_weight_max": hard_example_weight_max,
+        "train_sampling_metadata": train_sampling_metadata,
         "restored_best_checkpoint_for_export": restored_best_checkpoint,
         "final_model_path": str(final_model_path),
         "best_checkpoint_path": str(best_checkpoint_path),
@@ -1083,6 +1123,11 @@ def run_train(job: JobContext) -> dict[str, object]:
             "early_stopping_patience": early_stopping_patience,
             "scheduler_type": scheduler_type,
             "scheduler": scheduler_params,
+            "hard_example_oversampling_enabled": hard_example_oversampling_enabled,
+            "hard_example_weight_exponent": hard_example_weight_exponent,
+            "hard_example_weight_min": hard_example_weight_min,
+            "hard_example_weight_max": hard_example_weight_max,
+            "train_sampling_metadata": train_sampling_metadata,
         },
     }
     _write_json(final_dir / f"{model_id}.model_card.json", model_card)

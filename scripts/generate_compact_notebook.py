@@ -127,6 +127,8 @@ cells = [
 
         BASE_DATASET_SOURCE_ID = 'sampled_full_matrix_colab_pro_bench_models_20m'
         BASE_DATASET_BUILD_ID = 'dataset_v5_full_matrix_colab_pro_insane_20m'
+        DATASET_PIPELINE_MODE = 'two_pass'  # 'single_pass' | 'two_pass'
+        DATASET_PIPELINE_ACTIVE_PASS = 'A'  # 'A' (bench/tournament review) | 'B' (augment_existing contrefactuel)
         MULTI_COLAB_SAFE_MODE = True
         WORKER_TAG = ''  # Laisse vide pour auto, ou fixe manuellement: 'w1', 'w2', etc.
         WORKER_COUNT = 1  # Mets 2,3,4... quand tu lances plusieurs Colab
@@ -165,6 +167,24 @@ cells = [
         TOURNAMENT_REVIEW_MAX_SCORE_RATE = 0.55
         TOURNAMENT_REVIEW_MAX_ADDED_MATCHUPS = 12
         TOURNAMENT_REVIEW_INCLUDE_REVERSE_MATCHUP = True
+        AUGMENT_EXISTING_INCLUDE_ORIGINAL_SAMPLES = True
+        AUGMENT_EXISTING_MAX_DEPTH = 2
+        AUGMENT_EXISTING_MAX_BRANCHING = 3
+        AUGMENT_EXISTING_MAX_GENERATED_PER_SOURCE_SAMPLE = 8
+        AUGMENT_EXISTING_COUNTERFACTUAL_TEACHER_ENGINE = 'minimax'
+        AUGMENT_EXISTING_COUNTERFACTUAL_TEACHER_LEVEL = 'insane'
+        AUGMENT_EXISTING_COUNTERFACTUAL_TOP_K = 2
+        AUGMENT_EXISTING_COUNTERFACTUAL_INCLUDE_EXPLORATION = True
+        AUGMENT_EXISTING_COUNTERFACTUAL_EXPLORATION_SEED_OFFSET = 17
+        VALUE_TARGET_MIX_TEACHER_WEIGHT = 0.85
+        HARD_EXAMPLES_ENABLED = True
+        HARD_EXAMPLES_MARGIN_THRESHOLD = 0.08
+        HARD_EXAMPLES_OUTCOME_FOCUS = 0.35
+        HARD_EXAMPLES_WEIGHT_MULTIPLIER = 2.0
+        TRAIN_HARD_OVERSAMPLING_ENABLED = True
+        TRAIN_HARD_WEIGHT_EXPONENT = 1.0
+        TRAIN_HARD_WEIGHT_MIN = 1.0
+        TRAIN_HARD_WEIGHT_MAX = 4.0
         DATASET_GENERATE_SOURCE_MODE = 'benchmatch'  # 'benchmatch' ou 'self_play_puct'
         SELF_PLAY_MODEL = 'auto_best'
         SELF_PLAY_MODEL_DEVICE = 'cpu'
@@ -771,15 +791,30 @@ cells = [
             WORKER_INDEX = 0
 
         if MULTI_COLAB_SAFE_MODE:
-            DATASET_SOURCE_ID = f'{BASE_DATASET_SOURCE_ID}_{WORKER_TAG}'
-            DATASET_BUILD_ID = f'{BASE_DATASET_BUILD_ID}_{WORKER_TAG}'
+            DATASET_SOURCE_ID_PASS_A = f'{BASE_DATASET_SOURCE_ID}_{WORKER_TAG}'
+            DATASET_BUILD_ID_PASS_A = f'{BASE_DATASET_BUILD_ID}_{WORKER_TAG}'
             TRAIN_CONTINUE_JOB_ID = f'{TRAIN_CONTINUE_JOB_ID}_{WORKER_TAG}'
             TRAIN_SCRATCH_JOB_ID = f'{TRAIN_SCRATCH_JOB_ID}_{WORKER_TAG}'
             EVALUATION_JOB_ID = f'{EVALUATION_JOB_ID}_{WORKER_TAG}'
             BENCHMARK_JOB_ID = f'{BENCHMARK_JOB_ID}_{WORKER_TAG}'
         else:
-            DATASET_SOURCE_ID = BASE_DATASET_SOURCE_ID
-            DATASET_BUILD_ID = BASE_DATASET_BUILD_ID
+            DATASET_SOURCE_ID_PASS_A = BASE_DATASET_SOURCE_ID
+            DATASET_BUILD_ID_PASS_A = BASE_DATASET_BUILD_ID
+
+        DATASET_SOURCE_ID_PASS_B = f'{DATASET_SOURCE_ID_PASS_A}_augment'
+        DATASET_BUILD_ID_PASS_B = f'{DATASET_BUILD_ID_PASS_A}_augment'
+        pipeline_mode = str(DATASET_PIPELINE_MODE).strip().lower() or 'single_pass'
+        pipeline_pass = str(DATASET_PIPELINE_ACTIVE_PASS).strip().upper() or 'A'
+        if pipeline_mode not in {'single_pass', 'two_pass'}:
+            raise ValueError(f'DATASET_PIPELINE_MODE non supporte: {DATASET_PIPELINE_MODE}')
+        if pipeline_pass not in {'A', 'B'}:
+            raise ValueError(f'DATASET_PIPELINE_ACTIVE_PASS non supporte: {DATASET_PIPELINE_ACTIVE_PASS}')
+        if pipeline_mode == 'two_pass' and pipeline_pass == 'B':
+            DATASET_SOURCE_ID = DATASET_SOURCE_ID_PASS_B
+            DATASET_BUILD_ID = DATASET_BUILD_ID_PASS_B
+        else:
+            DATASET_SOURCE_ID = DATASET_SOURCE_ID_PASS_A
+            DATASET_BUILD_ID = DATASET_BUILD_ID_PASS_A
 
         PIPELINE_MANIFEST_PATH = f'logs/pipeline/latest_dataset_pipeline_{WORKER_TAG}.json'
 
@@ -796,6 +831,12 @@ cells = [
 
         print('DATASET_SOURCE_ID       =', DATASET_SOURCE_ID)
         print('DATASET_BUILD_ID        =', DATASET_BUILD_ID)
+        print('DATASET_SOURCE_ID_PASS_A =', DATASET_SOURCE_ID_PASS_A)
+        print('DATASET_BUILD_ID_PASS_A  =', DATASET_BUILD_ID_PASS_A)
+        print('DATASET_SOURCE_ID_PASS_B =', DATASET_SOURCE_ID_PASS_B)
+        print('DATASET_BUILD_ID_PASS_B  =', DATASET_BUILD_ID_PASS_B)
+        print('DATASET_PIPELINE_MODE   =', DATASET_PIPELINE_MODE)
+        print('DATASET_PIPELINE_ACTIVE_PASS =', DATASET_PIPELINE_ACTIVE_PASS)
         print('MULTI_COLAB_SAFE_MODE   =', MULTI_COLAB_SAFE_MODE)
         print('WORKER_TAG              =', WORKER_TAG)
         print('WORKER_COUNT            =', WORKER_COUNT)
@@ -826,6 +867,20 @@ cells = [
         print('BENCHMATCH_SHUFFLE_MATCHUPS =', BENCHMATCH_SHUFFLE_MATCHUPS)
         print('BENCHMATCH_CYCLE_MATCHUPS_UNTIL_TARGET =', BENCHMATCH_CYCLE_MATCHUPS_UNTIL_TARGET)
         print('BENCHMATCH_MAX_MATCHUP_CYCLES =', BENCHMATCH_MAX_MATCHUP_CYCLES)
+        print('AUGMENT_EXISTING_MAX_DEPTH   =', AUGMENT_EXISTING_MAX_DEPTH)
+        print('AUGMENT_EXISTING_MAX_BRANCHING =', AUGMENT_EXISTING_MAX_BRANCHING)
+        print('AUGMENT_EXISTING_MAX_GENERATED_PER_SOURCE_SAMPLE =', AUGMENT_EXISTING_MAX_GENERATED_PER_SOURCE_SAMPLE)
+        print('AUGMENT_EXISTING_COUNTERFACTUAL_TEACHER =', f'{AUGMENT_EXISTING_COUNTERFACTUAL_TEACHER_ENGINE}:{AUGMENT_EXISTING_COUNTERFACTUAL_TEACHER_LEVEL}')
+        print('AUGMENT_EXISTING_COUNTERFACTUAL_TOP_K =', AUGMENT_EXISTING_COUNTERFACTUAL_TOP_K)
+        print('AUGMENT_EXISTING_COUNTERFACTUAL_INCLUDE_EXPLORATION =', AUGMENT_EXISTING_COUNTERFACTUAL_INCLUDE_EXPLORATION)
+        print('VALUE_TARGET_MIX_TEACHER_WEIGHT =', VALUE_TARGET_MIX_TEACHER_WEIGHT)
+        print('HARD_EXAMPLES_ENABLED       =', HARD_EXAMPLES_ENABLED)
+        print('HARD_EXAMPLES_MARGIN_THRESHOLD =', HARD_EXAMPLES_MARGIN_THRESHOLD)
+        print('HARD_EXAMPLES_OUTCOME_FOCUS =', HARD_EXAMPLES_OUTCOME_FOCUS)
+        print('HARD_EXAMPLES_WEIGHT_MULTIPLIER =', HARD_EXAMPLES_WEIGHT_MULTIPLIER)
+        print('TRAIN_HARD_OVERSAMPLING_ENABLED =', TRAIN_HARD_OVERSAMPLING_ENABLED)
+        print('TRAIN_HARD_WEIGHT_EXPONENT  =', TRAIN_HARD_WEIGHT_EXPONENT)
+        print('TRAIN_HARD_WEIGHT_MIN/MAX   =', (TRAIN_HARD_WEIGHT_MIN, TRAIN_HARD_WEIGHT_MAX))
         print('TOURNAMENT_REVIEW_ENRICHMENT_ENABLED =', TOURNAMENT_REVIEW_ENRICHMENT_ENABLED)
         print('TOURNAMENT_REVIEW_FOCUS_MODEL =', TOURNAMENT_REVIEW_FOCUS_MODEL)
         print('TOURNAMENT_REVIEW_SUMMARY_PATH =', TOURNAMENT_REVIEW_SUMMARY_PATH or '<auto_latest>')
@@ -1203,8 +1258,14 @@ cells = [
         else:
             output_sampled_dir = f'data/{DATASET_SOURCE_ID}'
             output_raw_dir = f'data/raw_{DATASET_SOURCE_ID}'
-        generate_source_mode = str(DATASET_GENERATE_SOURCE_MODE).strip().lower() or 'benchmatch'
-        if generate_source_mode not in {'benchmatch', 'self_play_puct'}:
+        pipeline_mode = str(DATASET_PIPELINE_MODE).strip().lower() or 'single_pass'
+        pipeline_pass = str(DATASET_PIPELINE_ACTIVE_PASS).strip().upper() or 'A'
+        generate_source_mode_requested = str(DATASET_GENERATE_SOURCE_MODE).strip().lower() or 'benchmatch'
+        if pipeline_mode == 'two_pass':
+            generate_source_mode = 'benchmatch' if pipeline_pass == 'A' else 'augment_existing'
+        else:
+            generate_source_mode = generate_source_mode_requested
+        if generate_source_mode not in {'benchmatch', 'self_play_puct', 'augment_existing'}:
             raise ValueError(f"DATASET_GENERATE_SOURCE_MODE non supporte: {generate_source_mode}")
         generate_block['source_mode'] = generate_source_mode
         generate_block['dataset_source_id'] = DATASET_SOURCE_ID
@@ -1214,11 +1275,24 @@ cells = [
         generate_block['workers'] = int(DATASET_GENERATE_WORKERS)
         generate_block['max_pending_futures'] = int(DATASET_GENERATE_MAX_PENDING_FUTURES)
         generate_block['model_agent_device'] = str(BENCHMATCH_MODEL_AGENT_DEVICE)
+        derivation_params = dict(generate_block.get('derivation_params', {}) or {})
+        derivation_params['include_original_samples'] = bool(AUGMENT_EXISTING_INCLUDE_ORIGINAL_SAMPLES)
+        derivation_params['max_depth'] = int(AUGMENT_EXISTING_MAX_DEPTH)
+        derivation_params['max_branching'] = int(AUGMENT_EXISTING_MAX_BRANCHING)
+        derivation_params['max_generated_per_source_sample'] = int(AUGMENT_EXISTING_MAX_GENERATED_PER_SOURCE_SAMPLE)
+        derivation_params['counterfactual_teacher_engine'] = str(AUGMENT_EXISTING_COUNTERFACTUAL_TEACHER_ENGINE)
+        derivation_params['counterfactual_teacher_level'] = str(AUGMENT_EXISTING_COUNTERFACTUAL_TEACHER_LEVEL)
+        derivation_params['counterfactual_top_k'] = int(AUGMENT_EXISTING_COUNTERFACTUAL_TOP_K)
+        derivation_params['counterfactual_include_exploration'] = bool(AUGMENT_EXISTING_COUNTERFACTUAL_INCLUDE_EXPLORATION)
+        derivation_params['counterfactual_exploration_seed_offset'] = int(AUGMENT_EXISTING_COUNTERFACTUAL_EXPLORATION_SEED_OFFSET)
+        generate_block['derivation_params'] = derivation_params
         if generate_source_mode == 'benchmatch':
             generate_block['games'] = int(BENCHMATCH_GAMES)
             generate_block['matchups'] = matchups
             generate_block['cycle_matchups_until_target'] = bool(BENCHMATCH_CYCLE_MATCHUPS_UNTIL_TARGET)
             generate_block['max_matchup_cycles'] = int(BENCHMATCH_MAX_MATCHUP_CYCLES)
+            generate_block['source_dataset_id'] = ''
+            generate_block['source_dataset_ids'] = []
             generate_block['tournament_review_enabled'] = bool(TOURNAMENT_REVIEW_ENRICHMENT_ENABLED)
             generate_block['tournament_review_focus_model'] = str(TOURNAMENT_REVIEW_FOCUS_MODEL)
             generate_block['tournament_review_summary_path'] = str(TOURNAMENT_REVIEW_SUMMARY_PATH)
@@ -1227,11 +1301,28 @@ cells = [
             generate_block['tournament_review_max_score_rate'] = float(TOURNAMENT_REVIEW_MAX_SCORE_RATE)
             generate_block['tournament_review_max_added_matchups'] = int(TOURNAMENT_REVIEW_MAX_ADDED_MATCHUPS)
             generate_block['tournament_review_include_reverse_matchup'] = bool(TOURNAMENT_REVIEW_INCLUDE_REVERSE_MATCHUP)
+        elif generate_source_mode == 'augment_existing':
+            generate_block.pop('matchups', None)
+            generate_block['games'] = 0
+            generate_block['cycle_matchups_until_target'] = False
+            generate_block['max_matchup_cycles'] = 1
+            generate_block['source_dataset_id'] = str(DATASET_SOURCE_ID_PASS_A)
+            generate_block['source_dataset_ids'] = []
+            generate_block['tournament_review_enabled'] = False
+            generate_block['tournament_review_focus_model'] = ''
+            generate_block['tournament_review_summary_path'] = ''
+            generate_block['tournament_review_top_k'] = 0
+            generate_block['tournament_review_repeat_factor'] = 0
+            generate_block['tournament_review_max_score_rate'] = 0.0
+            generate_block['tournament_review_max_added_matchups'] = 0
+            generate_block['tournament_review_include_reverse_matchup'] = False
         else:
             generate_block.pop('matchups', None)
             generate_block['games'] = int(SELF_PLAY_GAMES_PER_CYCLE)
             generate_block['cycle_matchups_until_target'] = bool(SELF_PLAY_CYCLE_UNTIL_TARGET)
             generate_block['max_matchup_cycles'] = int(SELF_PLAY_MAX_MATCHUP_CYCLES)
+            generate_block['source_dataset_id'] = ''
+            generate_block['source_dataset_ids'] = []
             generate_block['self_play_model'] = str(SELF_PLAY_MODEL)
             generate_block['self_play_model_device'] = str(SELF_PLAY_MODEL_DEVICE)
             generate_block['self_play_num_simulations'] = int(SELF_PLAY_NUM_SIMULATIONS)
@@ -1280,6 +1371,11 @@ cells = [
         build_block['input_sampled_dir'] = f'data/{DATASET_SOURCE_ID}'
         build_block['dataset_id'] = DATASET_BUILD_ID
         build_block['target_labeled_samples'] = int(TARGET_LABELED_SAMPLES)
+        build_block['value_target_mix_teacher_weight'] = float(VALUE_TARGET_MIX_TEACHER_WEIGHT)
+        build_block['hard_examples_enabled'] = bool(HARD_EXAMPLES_ENABLED)
+        build_block['hard_examples_margin_threshold'] = float(HARD_EXAMPLES_MARGIN_THRESHOLD)
+        build_block['hard_examples_outcome_focus'] = float(HARD_EXAMPLES_OUTCOME_FOCUS)
+        build_block['hard_examples_weight_multiplier'] = float(HARD_EXAMPLES_WEIGHT_MULTIPLIER)
         requested_build_mode = str(DATASET_BUILD_MODE_OVERRIDE).strip().lower()
         if requested_build_mode:
             if requested_build_mode not in {'auto', 'teacher_label', 'source_prelabeled'}:
@@ -1398,6 +1494,10 @@ cells = [
         train_continue_block['dataset_registry_firestore_document'] = str(FIRESTORE_DATASET_REGISTRY_DOCUMENT)
         train_continue_block['dataset_registry_firestore_credentials_path'] = str(FIRESTORE_CREDENTIALS_PATH)
         train_continue_block['dataset_registry_firestore_api_key'] = str(FIRESTORE_API_KEY)
+        train_continue_block['hard_example_oversampling_enabled'] = bool(TRAIN_HARD_OVERSAMPLING_ENABLED)
+        train_continue_block['hard_example_weight_exponent'] = float(TRAIN_HARD_WEIGHT_EXPONENT)
+        train_continue_block['hard_example_weight_min'] = float(TRAIN_HARD_WEIGHT_MIN)
+        train_continue_block['hard_example_weight_max'] = float(TRAIN_HARD_WEIGHT_MAX)
         train_continue_cfg['train'] = train_continue_block
         TRAIN_CONTINUE_20M_CONFIG_ACTIVE = _write_yaml(train_continue_cfg, TRAIN_CONTINUE_20M_CONFIG_ACTIVE_PATH)
 
@@ -1411,6 +1511,10 @@ cells = [
         train_scratch_block['dataset_registry_firestore_document'] = str(FIRESTORE_DATASET_REGISTRY_DOCUMENT)
         train_scratch_block['dataset_registry_firestore_credentials_path'] = str(FIRESTORE_CREDENTIALS_PATH)
         train_scratch_block['dataset_registry_firestore_api_key'] = str(FIRESTORE_API_KEY)
+        train_scratch_block['hard_example_oversampling_enabled'] = bool(TRAIN_HARD_OVERSAMPLING_ENABLED)
+        train_scratch_block['hard_example_weight_exponent'] = float(TRAIN_HARD_WEIGHT_EXPONENT)
+        train_scratch_block['hard_example_weight_min'] = float(TRAIN_HARD_WEIGHT_MIN)
+        train_scratch_block['hard_example_weight_max'] = float(TRAIN_HARD_WEIGHT_MAX)
         train_scratch_cfg['train'] = train_scratch_block
         TRAIN_SCRATCH_20M_CONFIG_ACTIVE = _write_yaml(train_scratch_cfg, TRAIN_SCRATCH_20M_CONFIG_ACTIVE_PATH)
 
@@ -1447,8 +1551,15 @@ cells = [
         print('EVALUATION_20M_CONFIG_ACTIVE     =', EVALUATION_20M_CONFIG_ACTIVE)
         print('EVALUATION_CONFIG_ACTIVE       =', EVALUATION_CONFIG_ACTIVE)
         print('BENCHMARK_CONFIG_ACTIVE        =', BENCHMARK_CONFIG_ACTIVE)
+        print('pipeline_mode                  =', pipeline_mode)
+        print('pipeline_active_pass           =', pipeline_pass)
+        print('generate_source_mode_requested =', generate_source_mode_requested)
         print('generate_source_mode           =', generate_source_mode)
         print('dataset_build_mode             =', build_mode)
+        print('pass_a_source_id               =', DATASET_SOURCE_ID_PASS_A)
+        print('pass_a_build_id                =', DATASET_BUILD_ID_PASS_A)
+        print('pass_b_source_id               =', DATASET_SOURCE_ID_PASS_B)
+        print('pass_b_build_id                =', DATASET_BUILD_ID_PASS_B)
         print('output_raw_dir                 =', output_raw_dir)
         print('output_sampled_dir             =', output_sampled_dir)
         print('model_scan_dir                 =', model_scan_dir)
@@ -1469,6 +1580,17 @@ cells = [
         """
     ),
     md("## 5. Creation Dataset (Generate + Build)"),
+    md(
+        """
+        Pipeline explicite en 2 passes:
+        - Pass A (`DATASET_PIPELINE_ACTIVE_PASS='A'`): `benchmatch` + `tournament_review`.
+        - Pass B (`DATASET_PIPELINE_ACTIVE_PASS='B'`): `augment_existing` contrefactuel (teacher top-k + exploration), puis `dataset-build`.
+
+        Sequence recommandee:
+        1. Laisser `DATASET_PIPELINE_MODE='two_pass'` et `DATASET_PIPELINE_ACTIVE_PASS='A'`, puis executer sections 4 puis 5.A.
+        2. Quand Pass A est avancee/terminee, mettre `DATASET_PIPELINE_ACTIVE_PASS='B'`, reexecuter section 4 puis 5.A.
+        """
+    ),
     md("### 5.A Lancer Le Pipeline Dataset En Parallele"),
     code(
         """

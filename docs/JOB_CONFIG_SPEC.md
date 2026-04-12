@@ -96,6 +96,20 @@ dataset_generation:
   global_budget_enforcement_mode: batched
   global_progress_flush_every_n_games: 200
   global_target_poll_interval_seconds: 60
+
+  # Si source_mode=augment_existing (Passe B):
+  # source_mode: augment_existing
+  # source_dataset_id: sampled_full_matrix_colab_pro_worker_x
+  # derivation_params:
+  #   include_original_samples: true
+  #   max_depth: 2
+  #   max_branching: 3
+  #   max_generated_per_source_sample: 8
+  #   counterfactual_teacher_engine: minimax
+  #   counterfactual_teacher_level: insane
+  #   counterfactual_top_k: 2
+  #   counterfactual_include_exploration: true
+  #   counterfactual_exploration_seed_offset: 17
 ```
 
 ## 5. Config `dataset_build`
@@ -133,6 +147,11 @@ dataset_build:
   max_pending_futures: 32
   export_partial_every_n_files: 200
   include_tactical_analysis: true
+  value_target_mix_teacher_weight: 0.85
+  hard_examples_enabled: true
+  hard_examples_margin_threshold: 0.08
+  hard_examples_outcome_focus: 0.35
+  hard_examples_weight_multiplier: 2.0
   dedupe_sample_ids: true
   stop_when_global_target_reached: true
   global_target_id: bench_models_20m_global
@@ -196,6 +215,10 @@ train:
   learning_rate: 0.0005
   gradient_clip_norm: 1.0
   early_stopping_patience: 6
+  hard_example_oversampling_enabled: true
+  hard_example_weight_exponent: 1.0
+  hard_example_weight_min: 1.0
+  hard_example_weight_max: 4.0
   scheduler:
     type: cosine
     min_lr: 0.00005

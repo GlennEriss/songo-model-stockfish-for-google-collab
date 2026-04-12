@@ -31,9 +31,9 @@ Les parties de reference viendront de:
 - plus tard `engine_v1 vs minimax`
 - plus tard `engine_v1 vs mcts`
 
-## 4. Pipeline dataset recommande
+## 4. Pipeline dataset recommande (2 passes)
 
-### Etape 1 - Match logs bruts
+### Passe A - Match logs bruts
 
 Pour chaque partie, on enregistre:
 
@@ -46,11 +46,11 @@ Pour chaque partie, on enregistre:
 - resultat final
 - temps par coup
 
-Sortie:
+Sortie passe A:
 
 - `raw_match_logs/*.jsonl`
 
-### Etape 2 - Sampling de positions
+### Passe A - Sampling de positions
 
 Pendant ou apres les parties, on extrait des positions candidates:
 
@@ -60,11 +60,24 @@ Pendant ou apres les parties, on extrait des positions candidates:
 - numero de demi-coup
 - meta-info de provenance
 
-Sortie:
+Sortie passe A:
 
 - `sampled_positions/*.jsonl`
 
-### Etape 3 - Labeling
+### Passe B - Augmentation contrefactuelle guidee teacher
+
+Les positions de la passe A sont enrichies avec des branches adverses:
+
+- selection intelligente des coups: `top-k` teacher + `1` coup d'exploration
+- profondeur `max_depth=2..3` pour capturer les reponses adverses
+- metadonnees de tracabilite par sample:
+  - `counterfactual_depth`
+  - `counterfactual_parent_sample_id`
+  - `counterfactual_root_sample_id`
+  - `counterfactual_lineage_moves`
+  - `counterfactual_selected_by`
+
+### Passe B - Labeling robuste
 
 Chaque position est ensuite labelisee avec un enseignant defini:
 
@@ -72,11 +85,17 @@ Chaque position est ensuite labelisee avec un enseignant defini:
 - `mcts`
 - ou mix de plusieurs enseignants
 
-Sortie:
+Label value renforce:
+
+- `value_target_teacher` (signal local du teacher)
+- `value_target_outcome` (resultat final de partie vu du joueur au trait)
+- `value_target = mix(teacher, outcome)` via `value_target_mix_teacher_weight`
+
+Sortie passe B:
 
 - `labeled_positions/*.jsonl`
 
-### Etape 4 - Build dataset
+### Passe B - Build dataset
 
 On transforme les positions labelisees en dataset versionne:
 
@@ -84,7 +103,7 @@ On transforme les positions labelisees en dataset versionne:
 - `validation`
 - `test`
 
-Sortie:
+Sortie finale:
 
 - `datasets/<dataset_version>/`
 
@@ -98,6 +117,10 @@ Un exemple doit contenir au minimum:
 - `legal_moves`
 - `policy_target`
 - `value_target`
+- `value_target_teacher`
+- `value_target_outcome`
+- `value_target_mix`
+- `hard_example_weight`
 - `source_engine`
 - `source_level`
 - `game_id`

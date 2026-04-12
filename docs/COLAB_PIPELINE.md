@@ -10,11 +10,13 @@ Definir une organisation solide pour executer le pipeline dataset/train dans Goo
 2. installer `requirements.txt`
 3. configurer Drive + Firestore credentials
 4. generer les configs actives runtime
-5. lancer `dataset-generate` en parallele
-6. lancer `dataset-build` en parallele
-7. monitorer la progression globale (Redis-first, Firestore snapshot)
-8. reprendre automatiquement si session interrompue
-9. lancer train/evaluation/benchmark sur dataset final
+5. Pass A: lancer `dataset-generate` (benchmatch + tournament review)
+6. Pass A: lancer `dataset-build` (teacher_label)
+7. Pass B: lancer `dataset-generate` en `augment_existing` (branches contrefactuelles teacher)
+8. Pass B: lancer `dataset-build` (teacher_label avec value mix)
+9. monitorer la progression globale (Redis-first, Firestore snapshot)
+10. reprendre automatiquement si session interrompue
+11. lancer train/evaluation/benchmark sur dataset final
 
 ## Execution type par worker
 
@@ -23,6 +25,7 @@ Definir une organisation solide pour executer le pipeline dataset/train dans Goo
 - il ecrit son mini-dataset dans son espace worker Drive
 - il met a jour l'etat global en micro-batch
 - en fin de bloc, il merge vers dataset principal puis passe au bloc suivant
+- en Pass B, il enrichit ce dataset avec des branches "si adversaire repond X, meilleur coup Y"
 
 ## Organisation recommandee
 
@@ -65,6 +68,9 @@ Il couvre:
   - priorite au dataset fusionne `BASE_DATASET_BUILD_ID` si complet
   - fallback sur le plus gros shard de la meme famille
 - benchmark modele avec recherche legere (`model_search_*`) au lieu du pur `argmax` policy
+- pipeline 2 passes explicites via:
+  - `DATASET_PIPELINE_MODE='two_pass'`
+  - `DATASET_PIPELINE_ACTIVE_PASS='A'|'B'`
 
 ## Point de cadrage important
 
