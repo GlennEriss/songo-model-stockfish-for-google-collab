@@ -64,6 +64,23 @@ Sortie passe A:
 
 - `sampled_positions/*.jsonl`
 
+### Passe A - Derivation factory (variants intelligentes)
+
+Quand `source_mode=derive_existing`, on peut fabriquer des variantes sans rejouer les matchs:
+
+- `unique_positions`: dedupe strict des positions
+- `endgame_focus`: focus fins de partie
+- `high_branching`: focus positions avec beaucoup de coups legaux
+- `balanced_score_gap`: echantillonnage equilibre par ecart de score
+- `balanced_legal_moves`: echantillonnage equilibre par nb de coups legaux
+- `rare_seed_profiles`: sur-echantillonnage des profils de plateau rares
+
+Parametres utiles:
+
+- `derivation_params.score_gap_boundaries`
+- `derivation_params.legal_moves_boundaries`
+- `derivation_params.balanced_dedupe_positions`
+
 ### Passe B - Augmentation contrefactuelle guidee teacher
 
 Les positions de la passe A sont enrichies avec des branches adverses:

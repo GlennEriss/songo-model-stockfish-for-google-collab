@@ -39,9 +39,15 @@ Overrides supportes:
 - `--dataset-source-id`
 - `--source-dataset-id`
 - `--source-dataset-ids`
-- `--derivation-strategy` (`unique_positions`, `endgame_focus`, `high_branching`)
+- `--derivation-strategy` (`unique_positions`, `endgame_focus`, `high_branching`, `balanced_score_gap`, `balanced_legal_moves`, `rare_seed_profiles`)
 - `--target-samples`
 - options d'augmentation et de dedup merge
+
+Notes derive_existing:
+- `balanced_score_gap` equilibre les positions selon l'ecart de score (`derivation_params.score_gap_boundaries`)
+- `balanced_legal_moves` equilibre selon le nombre de coups legaux (`derivation_params.legal_moves_boundaries`)
+- `rare_seed_profiles` sur-echantillonne les profils de plateau rares (ponderation inverse-sqrt)
+- `derivation_params.balanced_dedupe_positions=true` evite de dupliquer la meme position dans les strategies balancees
 
 ### 4.2 `dataset-build`
 

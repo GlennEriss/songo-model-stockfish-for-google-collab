@@ -212,7 +212,17 @@ def build_parser() -> argparse.ArgumentParser:
     dataset_generate.add_argument("--dataset-source-id")
     dataset_generate.add_argument("--source-dataset-id")
     dataset_generate.add_argument("--source-dataset-ids", nargs="*")
-    dataset_generate.add_argument("--derivation-strategy", choices=["unique_positions", "endgame_focus", "high_branching"])
+    dataset_generate.add_argument(
+        "--derivation-strategy",
+        choices=[
+            "unique_positions",
+            "endgame_focus",
+            "high_branching",
+            "balanced_score_gap",
+            "balanced_legal_moves",
+            "rare_seed_profiles",
+        ],
+    )
     dataset_generate.add_argument("--target-samples", type=int)
     dataset_generate.add_argument("--augmentation-include-original-samples", dest="augmentation_include_original_samples", action="store_true", default=None)
     dataset_generate.add_argument("--augmentation-only-new-samples", dest="augmentation_include_original_samples", action="store_false")

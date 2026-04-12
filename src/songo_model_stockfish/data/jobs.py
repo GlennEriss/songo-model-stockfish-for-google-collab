@@ -2084,7 +2084,15 @@ def _derive_existing_dataset_source(
     target_raw_dir.mkdir(parents=True, exist_ok=True)
     target_sampled_dir.mkdir(parents=True, exist_ok=True)
 
-    if derivation_strategy not in {"unique_positions", "endgame_focus", "high_branching"}:
+    supported_strategies = {
+        "unique_positions",
+        "endgame_focus",
+        "high_branching",
+        "balanced_score_gap",
+        "balanced_legal_moves",
+        "rare_seed_profiles",
+    }
+    if derivation_strategy not in supported_strategies:
         raise ValueError(f"Unsupported derivation_strategy: {derivation_strategy}")
 
     seen_signatures: set[str] = set()
@@ -2096,6 +2104,168 @@ def _derive_existing_dataset_source(
 
     endgame_max_board_seeds = int(derivation_params.get("endgame_max_board_seeds", 24))
     high_branching_min_legal_moves = int(derivation_params.get("high_branching_min_legal_moves", 4))
+    balanced_dedupe_positions = _as_bool(derivation_params.get("balanced_dedupe_positions", True), default=True)
+
+    def _parse_int_list(value: Any, default: list[int]) -> list[int]:
+        if isinstance(value, (list, tuple)):
+            candidates = list(value)
+        elif isinstance(value, str) and value.strip():
+            candidates = [part.strip() for part in value.split(",") if part.strip()]
+        else:
+            candidates = list(default)
+        parsed: list[int] = []
+        for item in candidates:
+            try:
+                parsed.append(int(item))
+            except Exception:
+                continue
+        if not parsed:
+            parsed = list(default)
+        parsed = sorted({int(v) for v in parsed})
+        return parsed
+
+    score_gap_boundaries = _parse_int_list(
+        derivation_params.get("score_gap_boundaries", [0, 2, 5, 9]),
+        default=[0, 2, 5, 9],
+    )
+    legal_moves_boundaries = _parse_int_list(
+        derivation_params.get("legal_moves_boundaries", [1, 2, 3, 4, 5, 6]),
+        default=[1, 2, 3, 4, 5, 6],
+    )
+
+    def _bucket_from_boundaries(value: int, boundaries: list[int], *, prefix: str) -> str:
+        if not boundaries:
+            return f"{prefix}:all"
+        v = int(value)
+        ordered = sorted(int(x) for x in boundaries)
+        if v <= ordered[0]:
+            return f"{prefix}:<= {ordered[0]}"
+        for lower, upper in zip(ordered, ordered[1:]):
+            if lower < v <= upper:
+                return f"{prefix}:{lower + 1}-{upper}"
+        return f"{prefix}:>= {ordered[-1] + 1}"
+
+    def _safe_state_scores(sample: dict[str, Any]) -> tuple[int, int]:
+        state = sample.get("state", {})
+        scores = state.get("scores", [0, 0]) if isinstance(state, dict) else [0, 0]
+        if isinstance(scores, dict):
+            south = _safe_int(scores.get("south", 0), 0)
+            north = _safe_int(scores.get("north", 0), 0)
+        else:
+            south = _safe_int(scores[0] if isinstance(scores, (list, tuple)) and len(scores) > 0 else 0, 0)
+            north = _safe_int(scores[1] if isinstance(scores, (list, tuple)) and len(scores) > 1 else 0, 0)
+        return int(south), int(north)
+
+    def _safe_state_board(sample: dict[str, Any]) -> list[int]:
+        state = sample.get("state", {})
+        board = state.get("board", []) if isinstance(state, dict) else []
+        if not isinstance(board, (list, tuple)):
+            return []
+        return [int(_safe_int(v, 0)) for v in board]
+
+    def _score_gap_bucket(sample: dict[str, Any]) -> str:
+        south, north = _safe_state_scores(sample)
+        gap = abs(int(south) - int(north))
+        return _bucket_from_boundaries(gap, score_gap_boundaries, prefix="score_gap")
+
+    def _legal_moves_bucket(sample: dict[str, Any]) -> str:
+        legal_count = len(sample.get("legal_moves", []))
+        return _bucket_from_boundaries(int(legal_count), legal_moves_boundaries, prefix="legal_moves")
+
+    def _rare_seed_profile_bucket(sample: dict[str, Any]) -> str:
+        board = _safe_state_board(sample)
+        if not board:
+            return "seed_profile:unknown"
+        occupied = sum(1 for value in board if int(value) > 0)
+        max_stack = max(int(value) for value in board)
+        big_stacks = sum(1 for value in board if int(value) >= 4)
+
+        if occupied <= 4:
+            occupied_band = "sparse"
+        elif occupied <= 8:
+            occupied_band = "mid"
+        else:
+            occupied_band = "dense"
+
+        if max_stack <= 2:
+            max_band = "low"
+        elif max_stack <= 5:
+            max_band = "mid"
+        elif max_stack <= 9:
+            max_band = "high"
+        else:
+            max_band = "extreme"
+
+        if big_stacks == 0:
+            big_band = "none"
+        elif big_stacks <= 2:
+            big_band = "few"
+        else:
+            big_band = "many"
+
+        return f"seed_profile:occ={occupied_band}|max={max_band}|big={big_band}"
+
+    def _bucket_for_balanced_strategy(sample: dict[str, Any]) -> str:
+        if derivation_strategy == "balanced_score_gap":
+            return _score_gap_bucket(sample)
+        if derivation_strategy == "balanced_legal_moves":
+            return _legal_moves_bucket(sample)
+        if derivation_strategy == "rare_seed_profiles":
+            return _rare_seed_profile_bucket(sample)
+        return "default"
+
+    def _build_bucket_quotas(
+        bucket_counts: dict[str, int],
+        *,
+        requested_total: int,
+        rare_weighted: bool,
+    ) -> dict[str, int]:
+        positive_counts = {bucket: int(count) for bucket, count in bucket_counts.items() if int(count) > 0}
+        if not positive_counts:
+            return {}
+        total_candidates = int(sum(positive_counts.values()))
+        if requested_total <= 0:
+            return dict(positive_counts)
+        target_total = min(int(requested_total), total_candidates)
+
+        if rare_weighted:
+            weights = {bucket: (1.0 / math.sqrt(float(count))) for bucket, count in positive_counts.items()}
+        else:
+            weights = {bucket: 1.0 for bucket in positive_counts}
+        weight_sum = float(sum(weights.values()))
+        if weight_sum <= 0.0:
+            weights = {bucket: 1.0 for bucket in positive_counts}
+            weight_sum = float(len(weights))
+
+        quotas = {
+            bucket: min(
+                int(positive_counts[bucket]),
+                int(math.floor((float(target_total) * float(weights[bucket])) / weight_sum)),
+            )
+            for bucket in positive_counts
+        }
+        assigned = int(sum(quotas.values()))
+        remaining = max(0, int(target_total) - assigned)
+        adjustable = [bucket for bucket in positive_counts if quotas[bucket] < positive_counts[bucket]]
+        while remaining > 0 and adjustable:
+            per_bucket = max(1, remaining // max(1, len(adjustable)))
+            still_adjustable: list[str] = []
+            for bucket in adjustable:
+                slack = int(positive_counts[bucket]) - int(quotas[bucket])
+                if slack <= 0:
+                    continue
+                add = min(slack, per_bucket, remaining)
+                quotas[bucket] = int(quotas[bucket]) + int(add)
+                remaining -= int(add)
+                if quotas[bucket] < positive_counts[bucket]:
+                    still_adjustable.append(bucket)
+                if remaining <= 0:
+                    break
+            if not still_adjustable and remaining > 0:
+                break
+            adjustable = still_adjustable
+
+        return quotas
 
     def _keep_sample(sample: dict[str, Any]) -> bool:
         nonlocal selected_samples
@@ -2114,13 +2284,57 @@ def _derive_existing_dataset_source(
             return len(sample.get("legal_moves", [])) >= high_branching_min_legal_moves
         return False
 
-    for source_sampled_file in sorted(source_sampled_dir.rglob("*.jsonl")):
+    source_sampled_files = sorted(source_sampled_dir.rglob("*.jsonl"))
+
+    bucket_counts: dict[str, int] = {}
+    selected_by_bucket: dict[str, int] = {}
+    bucket_quotas: dict[str, int] = {}
+    first_pass_scanned_files = 0
+    first_pass_scanned_samples = 0
+
+    if derivation_strategy in {"balanced_score_gap", "balanced_legal_moves", "rare_seed_profiles"}:
+        for source_sampled_file in source_sampled_files:
+            first_pass_scanned_files += 1
+            for sample in _iter_jsonl(source_sampled_file):
+                first_pass_scanned_samples += 1
+                bucket = _bucket_for_balanced_strategy(sample)
+                bucket_counts[bucket] = int(bucket_counts.get(bucket, 0)) + 1
+        bucket_quotas = _build_bucket_quotas(
+            bucket_counts,
+            requested_total=int(target_samples),
+            rare_weighted=(derivation_strategy == "rare_seed_profiles"),
+        )
+
+    for source_sampled_file in source_sampled_files:
         scanned_files += 1
         relative_path = source_sampled_file.relative_to(source_sampled_dir)
         kept_samples: list[dict[str, Any]] = []
         for sample in _iter_jsonl(source_sampled_file):
             scanned_samples += 1
-            if _keep_sample(sample):
+            keep = False
+            if derivation_strategy in {"balanced_score_gap", "balanced_legal_moves", "rare_seed_profiles"}:
+                if target_samples > 0 and selected_samples >= target_samples:
+                    keep = False
+                else:
+                    bucket = _bucket_for_balanced_strategy(sample)
+                    remaining_quota = int(bucket_quotas.get(bucket, 0))
+                    if remaining_quota > 0:
+                        if balanced_dedupe_positions:
+                            signature = _sample_position_signature(sample)
+                            if signature in seen_signatures:
+                                keep = False
+                            else:
+                                seen_signatures.add(signature)
+                                keep = True
+                        else:
+                            keep = True
+                        if keep:
+                            bucket_quotas[bucket] = remaining_quota - 1
+                            selected_by_bucket[bucket] = int(selected_by_bucket.get(bucket, 0)) + 1
+            else:
+                keep = _keep_sample(sample)
+
+            if keep:
                 kept_samples.append(sample)
                 selected_samples += 1
                 if target_samples > 0 and selected_samples >= target_samples:
@@ -2151,6 +2365,16 @@ def _derive_existing_dataset_source(
         "selected_files": selected_files,
         "selected_samples": selected_samples,
         "copied_raw_files": copied_raw_files,
+        "first_pass_scanned_files": first_pass_scanned_files,
+        "first_pass_scanned_samples": first_pass_scanned_samples,
+        "bucket_counts": bucket_counts,
+        "selected_by_bucket": selected_by_bucket,
+        "remaining_bucket_quotas": bucket_quotas,
+        "derivation_params_effective": {
+            "balanced_dedupe_positions": balanced_dedupe_positions,
+            "score_gap_boundaries": score_gap_boundaries,
+            "legal_moves_boundaries": legal_moves_boundaries,
+        },
     }
 
 
