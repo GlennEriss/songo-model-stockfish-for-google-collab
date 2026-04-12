@@ -3098,6 +3098,7 @@ cells = [
         sys.path.insert(0, f"{WORKTREE}/src")
         from songo_model_stockfish.benchmark.model_agent import ModelAgent
         from songo_model_stockfish.benchmark.play_match import play_match
+        from songo_model_stockfish.ops.model_registry import load_registry, save_registry, promote_best_model
 
         TOURNAMENT_GAMES_PER_PAIR = 8   # total games par paire
         TOURNAMENT_MAX_MOVES = 300
@@ -3108,9 +3109,13 @@ cells = [
         TOURNAMENT_MODEL_SEARCH_TOP_K = 4
         TOURNAMENT_MODEL_SEARCH_POLICY_WEIGHT = 0.35
         TOURNAMENT_MODEL_SEARCH_VALUE_WEIGHT = 1.0
+        TOURNAMENT_AUTO_PRUNE_ENABLED = True
+        TOURNAMENT_AUTO_PRUNE_COUNT = 3
+        TOURNAMENT_MIN_MODELS_TO_KEEP = 3
+        TOURNAMENT_AUTO_PROMOTE_WINNER = True
 
         models_root = Path(DRIVE_ROOT) / 'models'
-        registry_path = models_root / 'registry.json'
+        registry_path = models_root / 'model_registry.json'
         final_dir = models_root / 'final'
 
         registry = json.loads(registry_path.read_text(encoding='utf-8')) if registry_path.exists() else {'models': []}
@@ -3250,6 +3255,146 @@ cells = [
                 f\"{idx:>2} | {row['model_id']:<40} | {row['points']:>4} | {row['points']:>4}/{row['max_points']:<4} | {row['wins']:>4} | {row['draws']:>4} | {row['losses']:>4} | {row['played']:>4}\"
             )
 
+        winner_model_id = str(ranking[0]['model_id']).strip()
+        print('\\n=== Actions Automatiques Tournoi ===')
+        print('winner_model_id =', winner_model_id)
+
+        def _safe_unlink(path: Path) -> bool:
+            try:
+                if path.exists():
+                    path.unlink()
+                    return True
+            except Exception:
+                return False
+            return False
+
+        def _remove_model_artifacts(model_id: str) -> dict:
+            removed = []
+            checkpoints_dir = models_root / 'checkpoints'
+            lineage_dir = models_root / 'lineage'
+            candidates = [
+                final_dir / f'{model_id}.pt',
+                final_dir / f'{model_id}.model_card.json',
+                lineage_dir / f'{model_id}_parent_snapshot.pt',
+            ]
+            if checkpoints_dir.exists():
+                candidates.extend(sorted(checkpoints_dir.glob(f'{model_id}*.pt')))
+            for path in candidates:
+                if _safe_unlink(path):
+                    removed.append(str(path))
+            return {'model_id': model_id, 'removed_paths': removed, 'removed_count': len(removed)}
+
+        prune_ids = []
+        prune_details = []
+        if TOURNAMENT_AUTO_PRUNE_ENABLED and len(ranking) > TOURNAMENT_MIN_MODELS_TO_KEEP:
+            prune_count = min(
+                int(TOURNAMENT_AUTO_PRUNE_COUNT),
+                max(0, len(ranking) - int(TOURNAMENT_MIN_MODELS_TO_KEEP)),
+            )
+            if prune_count > 0:
+                prune_ids = [str(row.get('model_id', '')).strip() for row in ranking[-prune_count:]]
+                print('auto_prune            = enabled')
+                print('prune_count           =', prune_count)
+                print('pruned_models         =', prune_ids)
+                for model_id in prune_ids:
+                    details = _remove_model_artifacts(model_id)
+                    prune_details.append(details)
+                    print(f" - removed {model_id}: files={details['removed_count']}")
+            else:
+                print('auto_prune            = enabled but nothing to prune')
+        else:
+            print(
+                f'auto_prune            = skipped '
+                f'(models={len(ranking)} <= keep_threshold={TOURNAMENT_MIN_MODELS_TO_KEEP})'
+            )
+
+        # Synchroniser model_registry.json avec le resultat du tournoi:
+        # winner en tete, puis le reste, sans les modeles prunes.
+        live_registry = load_registry(models_root)
+        live_records = list(live_registry.get('models', [])) if isinstance(live_registry, dict) else []
+        record_map = {}
+        for item in live_records:
+            if not isinstance(item, dict):
+                continue
+            model_id = str(item.get('model_id', '')).strip()
+            if model_id:
+                record_map[model_id] = dict(item)
+
+        # Completer entries manquantes avec les checkpoints detectes en tournoi.
+        for model in models:
+            model_id = str(model.get('model_id', '')).strip()
+            if not model_id or model_id in prune_ids:
+                continue
+            checkpoint_path = Path(str(model.get('checkpoint_path', '')).strip())
+            if model_id not in record_map:
+                sort_ts = float(checkpoint_path.stat().st_mtime) if checkpoint_path.exists() else time.time()
+                record_map[model_id] = {
+                    'model_id': model_id,
+                    'checkpoint_path': str(checkpoint_path),
+                    'sort_ts': sort_ts,
+                    'best_validation_metric': -1.0,
+                    'evaluation_top1': -1.0,
+                    'benchmark_score': -1.0,
+                }
+            else:
+                rec = record_map[model_id]
+                if checkpoint_path.exists():
+                    rec['checkpoint_path'] = str(checkpoint_path)
+                rec.setdefault('sort_ts', time.time())
+                record_map[model_id] = rec
+
+        # Supprimer pruned du registre.
+        for model_id in prune_ids:
+            record_map.pop(model_id, None)
+
+        if winner_model_id not in record_map:
+            winner_ckpt = final_dir / f'{winner_model_id}.pt'
+            if not winner_ckpt.exists():
+                raise FileNotFoundError(
+                    f'Winner checkpoint introuvable pour promotion: {winner_ckpt}'
+                )
+            record_map[winner_model_id] = {
+                'model_id': winner_model_id,
+                'checkpoint_path': str(winner_ckpt),
+                'sort_ts': float(winner_ckpt.stat().st_mtime),
+                'best_validation_metric': -1.0,
+                'evaluation_top1': -1.0,
+                'benchmark_score': -1.0,
+            }
+
+        # Ordonnancement: winner d'abord, puis le reste du classement tournoi.
+        ranked_ids = [str(row.get('model_id', '')).strip() for row in ranking]
+        ordered_ids = [winner_model_id]
+        for model_id in ranked_ids:
+            if not model_id or model_id == winner_model_id or model_id in prune_ids:
+                continue
+            if model_id in record_map:
+                ordered_ids.append(model_id)
+        # Ajouter d'eventuels modeles hors tournoi encore presents dans le registre.
+        for model_id in sorted(record_map.keys()):
+            if model_id not in ordered_ids:
+                ordered_ids.append(model_id)
+
+        new_models = []
+        for idx, model_id in enumerate(ordered_ids, start=1):
+            rec = dict(record_map.get(model_id, {}))
+            if not rec:
+                continue
+            rec['rank'] = idx
+            new_models.append(rec)
+
+        save_registry(models_root, {'models': new_models})
+        print('registry_sync         = ok | models_kept =', len(new_models))
+
+        promoted_meta = None
+        if TOURNAMENT_AUTO_PROMOTE_WINNER:
+            promoted_meta = promote_best_model(models_root)
+            print('auto_promote_winner   = enabled')
+            print('promoted_model_id     =', promoted_meta.get('model_id', '<none>') if isinstance(promoted_meta, dict) else '<none>')
+            print('promoted_checkpoint   =', promoted_meta.get('promoted_checkpoint_path', '<none>') if isinstance(promoted_meta, dict) else '<none>')
+        else:
+            print('auto_promote_winner   = disabled')
+
         if TOURNAMENT_WRITE_REPORT:
             out_dir = Path(DRIVE_ROOT) / 'reports' / 'benchmarks' / 'model_tournaments'
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -3265,6 +3410,16 @@ cells = [
                 'models': [m['model_id'] for m in models],
                 'pairs': pair_summaries,
                 'ranking': ranking,
+                'auto_actions': {
+                    'winner_model_id': winner_model_id,
+                    'auto_prune_enabled': bool(TOURNAMENT_AUTO_PRUNE_ENABLED),
+                    'auto_prune_count': int(TOURNAMENT_AUTO_PRUNE_COUNT),
+                    'min_models_to_keep': int(TOURNAMENT_MIN_MODELS_TO_KEEP),
+                    'pruned_model_ids': prune_ids,
+                    'prune_details': prune_details,
+                    'auto_promote_winner': bool(TOURNAMENT_AUTO_PROMOTE_WINNER),
+                    'promoted_metadata': promoted_meta if isinstance(promoted_meta, dict) else {},
+                },
             }
             stamp = datetime.now(UTC).strftime('%Y%m%d_%H%M%S')
             out_path = out_dir / f'model_tournament_{stamp}.json'
