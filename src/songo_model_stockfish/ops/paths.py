@@ -23,9 +23,17 @@ def build_project_paths(config: dict) -> ProjectPaths:
         repo_root = default_repo_root
 
     configured_drive_root = storage.get("drive_root")
-    drive_root = Path(configured_drive_root) if configured_drive_root else (repo_root / "outputs")
-    if str(drive_root).startswith("/content/") and not drive_root.exists():
-        drive_root = repo_root / "outputs"
+    drive_root = Path(str(configured_drive_root or "").strip())
+    if not str(drive_root):
+        raise RuntimeError(
+            "Configuration invalide: `storage.drive_root` est requis. "
+            "Exemple attendu: /content/drive/MyDrive/songo-stockfish"
+        )
+    if not drive_root.exists():
+        raise RuntimeError(
+            "Drive root introuvable. Monte Google Drive puis relance. "
+            f"Chemin configure: {drive_root}"
+        )
     return ProjectPaths(
         repo_root=repo_root,
         drive_root=drive_root,

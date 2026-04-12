@@ -9,6 +9,18 @@ from songo_model_stockfish.ops.job import create_job_context
 from songo_model_stockfish.ops.paths import build_project_paths
 
 
+_COLAB_DRIVE_JOBS_ROOT = Path("/content/drive/MyDrive/songo-stockfish/jobs")
+
+
+def _resolve_strict_jobs_root() -> Path:
+    if _COLAB_DRIVE_JOBS_ROOT.exists():
+        return _COLAB_DRIVE_JOBS_ROOT
+    raise FileNotFoundError(
+        "Jobs root introuvable. Monte Google Drive puis relance. "
+        f"Chemin attendu: {_COLAB_DRIVE_JOBS_ROOT}"
+    )
+
+
 def _apply_dataset_generate_overrides(config: dict[str, object], args: argparse.Namespace) -> dict[str, object]:
     dataset_cfg = dict(config.get("dataset_generation", {}))
     derivation_params = dict(dataset_cfg.get("derivation_params", {}))
@@ -103,9 +115,7 @@ def _execute_job(config_path: str, handler, *, override_job_id: str | None, dry_
 
 
 def _resume_job(job_id: str) -> int:
-    jobs_root = Path("/content/drive/MyDrive/songo-stockfish/jobs")
-    if not jobs_root.exists():
-        jobs_root = Path(__file__).resolve().parents[4] / "outputs" / "jobs"
+    jobs_root = _resolve_strict_jobs_root()
     job_dir = jobs_root / job_id
     config_path = job_dir / "config.yaml"
     if not config_path.exists():
@@ -142,9 +152,7 @@ def _resume_job(job_id: str) -> int:
 
 
 def _status(job_id: str) -> int:
-    jobs_root = Path("/content/drive/MyDrive/songo-stockfish/jobs")
-    if not jobs_root.exists():
-        jobs_root = Path(__file__).resolve().parents[4] / "outputs" / "jobs"
+    jobs_root = _resolve_strict_jobs_root()
     job_dir = jobs_root / job_id
     status_path = job_dir / "run_status.json"
     if not status_path.exists():
@@ -155,7 +163,10 @@ def _status(job_id: str) -> int:
 
 def _dataset_list(config_path: str | None, *, kind: str, output_json: bool) -> int:
     config = load_yaml_config(config_path) if config_path else {}
-    paths = build_project_paths({"storage": config.get("storage", {})})
+    storage = dict(config.get("storage", {})) if isinstance(config.get("storage", {}), dict) else {}
+    storage.setdefault("drive_root", "/content/drive/MyDrive/songo-stockfish")
+    storage.setdefault("repo_root", str(Path(__file__).resolve().parents[3]))
+    paths = build_project_paths({"storage": storage})
     paths.data_root.mkdir(parents=True, exist_ok=True)
     registry_path = paths.data_root / "dataset_registry.json"
     registry = (
