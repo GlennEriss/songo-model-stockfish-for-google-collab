@@ -3153,6 +3153,93 @@ cells = [
         print('Cellule A: train continue + evaluate')
         print('train config =', TRAIN_CONTINUE_CONFIG_ACTIVE)
 
+        # Robustesse runtime: si le kernel a ete redemarre et que la cellule utilitaire n'a
+        # pas ete relancee, on reinjecte au moins le helper minimal manquant.
+        if '_resolve_train_artifacts' not in globals():
+            import json
+            from pathlib import Path
+
+            def _load_json_dict(path: Path, default=None):
+                fallback = {} if default is None else default
+                if not path.exists():
+                    return fallback
+                try:
+                    payload = json.loads(path.read_text(encoding='utf-8'))
+                except Exception:
+                    return fallback
+                return payload if isinstance(payload, dict) else fallback
+
+            def _job_prefix_for_rollover(job_id: str) -> str:
+                text = str(job_id).strip()
+                if not text:
+                    return text
+                parts = text.rsplit('_', 1)
+                if len(parts) == 2 and parts[1].isdigit():
+                    return parts[0]
+                return text
+
+            def _latest_job_dir_for_job_id(job_id: str) -> Path | None:
+                jobs_root = Path(DRIVE_ROOT) / 'jobs'
+                if not jobs_root.exists():
+                    return None
+                requested = str(job_id).strip()
+                if not requested:
+                    return None
+                prefix = _job_prefix_for_rollover(requested)
+                candidates = []
+                for path in jobs_root.iterdir():
+                    if not path.is_dir():
+                        continue
+                    name = path.name
+                    if name == requested or name == prefix or (prefix and name.startswith(prefix + '_')):
+                        candidates.append(path)
+                if not candidates:
+                    return None
+                return sorted(candidates, key=lambda p: p.stat().st_mtime)[-1]
+
+            def _read_job_summary(job_id: str, filename: str) -> tuple[dict, Path | None]:
+                job_dir = _latest_job_dir_for_job_id(job_id)
+                if job_dir is None:
+                    return {}, None
+                payload = _load_json_dict(job_dir / filename, default={})
+                return payload, job_dir
+
+            def _resolve_train_artifacts(job_id: str) -> tuple[str, str, str]:
+                train_summary, train_job_dir = _read_job_summary(job_id, 'training_summary.json')
+                dataset_id = str(train_summary.get('dataset_id', '')).strip()
+                model_id = str(train_summary.get('model_id', '')).strip()
+                checkpoint_path = str(train_summary.get('final_model_path', '')).strip()
+                checkpoint = Path(checkpoint_path) if checkpoint_path else None
+                if (checkpoint is None or not checkpoint.exists()) and model_id:
+                    fallback = Path(DRIVE_ROOT) / 'models' / 'final' / f'{model_id}.pt'
+                    if fallback.exists():
+                        checkpoint = fallback
+                if not dataset_id:
+                    raise ValueError(
+                        f'dataset_id absent dans training_summary pour job_id={job_id} (job_dir={train_job_dir})'
+                    )
+                if not model_id:
+                    raise ValueError(
+                        f'model_id absent dans training_summary pour job_id={job_id} (job_dir={train_job_dir})'
+                    )
+                if checkpoint is None or not checkpoint.exists():
+                    raise FileNotFoundError(
+                        f'checkpoint introuvable pour job_id={job_id} | model_id={model_id} | '
+                        f'checkpoint(train_summary)={checkpoint_path}'
+                    )
+                return dataset_id, model_id, str(checkpoint)
+
+        missing_helpers = [
+            name for name in ['_prepare_eval_runtime_config', '_print_post_train_eval_report']
+            if name not in globals()
+        ]
+        if missing_helpers:
+            raise RuntimeError(
+                'Helpers notebook manquants: '
+                + ', '.join(missing_helpers)
+                + ". Relance la cellule '## 7. Entrainement + Evaluation Automatique' (utilitaire commun)."
+            )
+
         train_cmd = (
             f'cd {shlex.quote(WORKTREE)} && '
             f'PYTHONPATH={shlex.quote(f"{WORKTREE}/src")} '
@@ -3192,6 +3279,93 @@ cells = [
         # Cellule B: train from scratch (modele de 0) puis evaluation automatique
         print('Cellule B: train scratch + evaluate')
         print('train config =', TRAIN_SCRATCH_CONFIG_ACTIVE)
+
+        # Robustesse runtime: si le kernel a ete redemarre et que la cellule utilitaire n'a
+        # pas ete relancee, on reinjecte au moins le helper minimal manquant.
+        if '_resolve_train_artifacts' not in globals():
+            import json
+            from pathlib import Path
+
+            def _load_json_dict(path: Path, default=None):
+                fallback = {} if default is None else default
+                if not path.exists():
+                    return fallback
+                try:
+                    payload = json.loads(path.read_text(encoding='utf-8'))
+                except Exception:
+                    return fallback
+                return payload if isinstance(payload, dict) else fallback
+
+            def _job_prefix_for_rollover(job_id: str) -> str:
+                text = str(job_id).strip()
+                if not text:
+                    return text
+                parts = text.rsplit('_', 1)
+                if len(parts) == 2 and parts[1].isdigit():
+                    return parts[0]
+                return text
+
+            def _latest_job_dir_for_job_id(job_id: str) -> Path | None:
+                jobs_root = Path(DRIVE_ROOT) / 'jobs'
+                if not jobs_root.exists():
+                    return None
+                requested = str(job_id).strip()
+                if not requested:
+                    return None
+                prefix = _job_prefix_for_rollover(requested)
+                candidates = []
+                for path in jobs_root.iterdir():
+                    if not path.is_dir():
+                        continue
+                    name = path.name
+                    if name == requested or name == prefix or (prefix and name.startswith(prefix + '_')):
+                        candidates.append(path)
+                if not candidates:
+                    return None
+                return sorted(candidates, key=lambda p: p.stat().st_mtime)[-1]
+
+            def _read_job_summary(job_id: str, filename: str) -> tuple[dict, Path | None]:
+                job_dir = _latest_job_dir_for_job_id(job_id)
+                if job_dir is None:
+                    return {}, None
+                payload = _load_json_dict(job_dir / filename, default={})
+                return payload, job_dir
+
+            def _resolve_train_artifacts(job_id: str) -> tuple[str, str, str]:
+                train_summary, train_job_dir = _read_job_summary(job_id, 'training_summary.json')
+                dataset_id = str(train_summary.get('dataset_id', '')).strip()
+                model_id = str(train_summary.get('model_id', '')).strip()
+                checkpoint_path = str(train_summary.get('final_model_path', '')).strip()
+                checkpoint = Path(checkpoint_path) if checkpoint_path else None
+                if (checkpoint is None or not checkpoint.exists()) and model_id:
+                    fallback = Path(DRIVE_ROOT) / 'models' / 'final' / f'{model_id}.pt'
+                    if fallback.exists():
+                        checkpoint = fallback
+                if not dataset_id:
+                    raise ValueError(
+                        f'dataset_id absent dans training_summary pour job_id={job_id} (job_dir={train_job_dir})'
+                    )
+                if not model_id:
+                    raise ValueError(
+                        f'model_id absent dans training_summary pour job_id={job_id} (job_dir={train_job_dir})'
+                    )
+                if checkpoint is None or not checkpoint.exists():
+                    raise FileNotFoundError(
+                        f'checkpoint introuvable pour job_id={job_id} | model_id={model_id} | '
+                        f'checkpoint(train_summary)={checkpoint_path}'
+                    )
+                return dataset_id, model_id, str(checkpoint)
+
+        missing_helpers = [
+            name for name in ['_prepare_eval_runtime_config', '_print_post_train_eval_report']
+            if name not in globals()
+        ]
+        if missing_helpers:
+            raise RuntimeError(
+                'Helpers notebook manquants: '
+                + ', '.join(missing_helpers)
+                + ". Relance la cellule '## 7. Entrainement + Evaluation Automatique' (utilitaire commun)."
+            )
 
         train_cmd = (
             f'cd {shlex.quote(WORKTREE)} && '
