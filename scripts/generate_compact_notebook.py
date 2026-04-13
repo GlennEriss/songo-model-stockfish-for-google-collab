@@ -3773,6 +3773,13 @@ cells = [
         )
         tournament_live_latest_path = tournament_live_dir / 'tournament_progress.latest.json'
         tournament_live_jsonl_path = tournament_live_dir / f'{tournament_run_id}.progress.jsonl'
+        cpu_count = max(1, int(os.cpu_count() or 1))
+        requested_parallel_workers = max(1, int(TOURNAMENT_MAX_PARALLEL_PAIRS))
+        hard_cap = max(1, int(TOURNAMENT_MAX_PARALLEL_PAIRS_HARD_CAP))
+        requested_parallel_workers = min(requested_parallel_workers, hard_cap)
+        if bool(TOURNAMENT_AUTO_CAP_PARALLEL_BY_CPU):
+            requested_parallel_workers = min(requested_parallel_workers, cpu_count)
+        effective_parallel_workers = min(requested_parallel_workers, max(1, len(fixtures)))
         progress_state = {
             'completed_pairs': 0,
             'failed_pairs': 0,
@@ -3861,13 +3868,6 @@ cells = [
             auto_actions_allowed = True
             print('auto_actions_guard_override = forced | reason=require_auto_actions')
 
-        cpu_count = max(1, int(os.cpu_count() or 1))
-        requested_parallel_workers = max(1, int(TOURNAMENT_MAX_PARALLEL_PAIRS))
-        hard_cap = max(1, int(TOURNAMENT_MAX_PARALLEL_PAIRS_HARD_CAP))
-        requested_parallel_workers = min(requested_parallel_workers, hard_cap)
-        if bool(TOURNAMENT_AUTO_CAP_PARALLEL_BY_CPU):
-            requested_parallel_workers = min(requested_parallel_workers, cpu_count)
-        effective_parallel_workers = min(requested_parallel_workers, max(1, len(fixtures)))
         print(
             'Parallelisme tournoi =',
             (
