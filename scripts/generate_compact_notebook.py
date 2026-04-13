@@ -274,6 +274,7 @@ cells = [
         RUNTIME_HYBRID_BACKUP_ENABLED = True
         RUNTIME_HYBRID_BACKUP_JOBS_ROOT = f'{DRIVE_ROOT}/runtime_backup/jobs'
         RUNTIME_HYBRID_BACKUP_MIN_INTERVAL_SECONDS = 30.0
+        RUNTIME_HYBRID_BACKUP_FORCE_INTERVAL_SECONDS = 180.0
         if LOW_QUOTA_PROFILE:
             GLOBAL_BUDGET_ENFORCEMENT_MODE = 'batched'
             GLOBAL_PROGRESS_FLUSH_EVERY_N_GAMES = int(LOW_QUOTA_GLOBAL_PROGRESS_FLUSH_EVERY_N_GAMES)
@@ -884,6 +885,7 @@ cells = [
         print('RUNTIME_HYBRID_BACKUP_ENABLED =', RUNTIME_HYBRID_BACKUP_ENABLED)
         print('RUNTIME_HYBRID_BACKUP_JOBS_ROOT =', RUNTIME_HYBRID_BACKUP_JOBS_ROOT)
         print('RUNTIME_HYBRID_BACKUP_MIN_INTERVAL_SECONDS =', RUNTIME_HYBRID_BACKUP_MIN_INTERVAL_SECONDS)
+        print('RUNTIME_HYBRID_BACKUP_FORCE_INTERVAL_SECONDS =', RUNTIME_HYBRID_BACKUP_FORCE_INTERVAL_SECONDS)
         print('TARGET_SAMPLES          =', TARGET_SAMPLES)
         print('TARGET_LABELED_SAMPLES  =', TARGET_LABELED_SAMPLES)
         print('DATASET_GENERATE_SOURCE_MODE =', DATASET_GENERATE_SOURCE_MODE)
@@ -960,174 +962,79 @@ cells = [
         # Migration one-shot: Drive/jobs + Drive/logs/pipeline -> runtime local.
         # Objectif: vider les artefacts volatils du Drive sans perdre d'etat.
         import json
-        import shutil
+        import sys
         from pathlib import Path
+
+        sys.path.insert(0, f'{WORKTREE}/src')
+        from songo_model_stockfish.ops.runtime_migration import (
+            load_manifest_prefer_local,
+            run_drive_to_local_runtime_migration,
+        )
 
         MIGRATE_DRIVE_RUNTIME_TO_LOCAL = True
         MIGRATE_PURGE_DRIVE_AFTER_VERIFY = True
         MIGRATE_SKIP_ACTIVE_JOB_DIRS = True
+        MIGRATE_ACTIVE_UPDATED_MAX_AGE_SECONDS = 300.0
+        MIGRATE_HASH_CHUNK_SIZE = 1024 * 1024
         MIGRATE_VERBOSE = True
+        MIGRATE_LOCK_DIR = Path(DRIVE_ROOT) / 'runtime_migration' / 'locks' / 'drive_to_local'
+        MIGRATE_LOCK_TIMEOUT_SECONDS = 60.0
 
         drive_jobs_root = Path(DRIVE_ROOT) / 'jobs'
         drive_pipeline_logs_root = Path(DRIVE_ROOT) / 'logs' / 'pipeline'
         local_jobs_root = Path(JOBS_ROOT)
         local_pipeline_logs_root = Path(PIPELINE_LOGS_DIR)
-
-        def _read_json_safe(path: Path, default=None):
-            fallback = {} if default is None else default
-            if not path.exists():
-                return fallback
-            try:
-                payload = json.loads(path.read_text(encoding='utf-8'))
-            except Exception:
-                return fallback
-            return payload if isinstance(payload, dict) else fallback
-
-        def _index_files(root: Path) -> dict[str, int]:
-            index: dict[str, int] = {}
-            if not root.exists():
-                return index
-            for file_path in root.rglob('*'):
-                if file_path.is_file():
-                    rel = str(file_path.relative_to(root))
-                    try:
-                        index[rel] = int(file_path.stat().st_size)
-                    except Exception:
-                        index[rel] = -1
-            return index
-
-        def _sync_tree(src: Path, dst: Path) -> dict:
-            copied = 0
-            updated = 0
-            bytes_copied = 0
-            dst.mkdir(parents=True, exist_ok=True)
-            for src_file in src.rglob('*'):
-                if not src_file.is_file():
-                    continue
-                rel = src_file.relative_to(src)
-                dst_file = dst / rel
-                dst_file.parent.mkdir(parents=True, exist_ok=True)
-                existed_before = dst_file.exists()
-                copy_required = True
-                if existed_before:
-                    try:
-                        copy_required = int(dst_file.stat().st_size) != int(src_file.stat().st_size)
-                    except Exception:
-                        copy_required = True
-                if copy_required:
-                    shutil.copy2(src_file, dst_file)
-                    bytes_copied += int(src_file.stat().st_size)
-                    if existed_before:
-                        updated += 1
-                    else:
-                        copied += 1
-            src_idx = _index_files(src)
-            dst_idx = _index_files(dst)
-            mismatches = [rel for rel, size in src_idx.items() if dst_idx.get(rel) != size]
-            return {
-                'copied': int(copied),
-                'updated': int(updated),
-                'bytes_copied': int(bytes_copied),
-                'src_files': int(len(src_idx)),
-                'dst_files': int(len(dst_idx)),
-                'verified': len(mismatches) == 0,
-                'mismatches_preview': mismatches[:10],
-                'mismatches_count': int(len(mismatches)),
-            }
-
-        def _job_is_active(job_dir: Path) -> bool:
-            status_payload = _read_json_safe(job_dir / 'run_status.json', default={})
-            status_text = str(status_payload.get('status', '')).strip().lower()
-            return status_text in {'running', 'pending', 'starting'}
+        local_manifest_path = Path(DRIVE_ROOT) / PIPELINE_MANIFEST_PATH
+        firestore_manifest = {}
+        try:
+            firestore_manifest = _load_pipeline_manifest_payload(WORKER_TAG)
+        except Exception:
+            firestore_manifest = {}
+        manifest_payload, manifest_source = load_manifest_prefer_local(
+            local_manifest_path,
+            firestore_manifest=firestore_manifest,
+        )
 
         print('Runtime migration config:')
         print('  mode                       =', RUNTIME_STATE_MODE)
         print('  migrate_enabled            =', MIGRATE_DRIVE_RUNTIME_TO_LOCAL)
         print('  purge_drive_after_verify   =', MIGRATE_PURGE_DRIVE_AFTER_VERIFY)
         print('  skip_active_job_dirs       =', MIGRATE_SKIP_ACTIVE_JOB_DIRS)
+        print('  active_updated_max_age_s   =', MIGRATE_ACTIVE_UPDATED_MAX_AGE_SECONDS)
+        print('  hash_chunk_size            =', MIGRATE_HASH_CHUNK_SIZE)
+        print('  lock_dir                   =', MIGRATE_LOCK_DIR)
+        print('  lock_timeout_seconds       =', MIGRATE_LOCK_TIMEOUT_SECONDS)
         print('  drive_jobs_root            =', drive_jobs_root)
         print('  drive_pipeline_logs_root   =', drive_pipeline_logs_root)
         print('  local_jobs_root            =', local_jobs_root)
         print('  local_pipeline_logs_root   =', local_pipeline_logs_root)
+        print('  manifest_source            =', manifest_source)
+        print('  manifest_job_ids           =', {
+            'generate_job_id': str(manifest_payload.get('generate_job_id', '<none>')),
+            'build_job_id': str(manifest_payload.get('build_job_id', '<none>')),
+        })
 
         if str(RUNTIME_STATE_MODE).strip().lower() != 'local':
             print('Migration ignoree: RUNTIME_STATE_MODE != local')
         elif not MIGRATE_DRIVE_RUNTIME_TO_LOCAL:
             print('Migration desactivee par config.')
         else:
-            local_jobs_root.mkdir(parents=True, exist_ok=True)
-            local_pipeline_logs_root.mkdir(parents=True, exist_ok=True)
-
-            summary = {
-                'jobs': {'migrated': 0, 'skipped_active': 0, 'purged': 0, 'failed': 0},
-                'pipeline_logs': {'migrated': 0, 'purged': 0, 'failed': 0},
-            }
-
-            if drive_jobs_root.exists():
-                for src_job_dir in sorted([p for p in drive_jobs_root.iterdir() if p.is_dir()]):
-                    job_id = src_job_dir.name
-                    if MIGRATE_SKIP_ACTIVE_JOB_DIRS and _job_is_active(src_job_dir):
-                        summary['jobs']['skipped_active'] += 1
-                        if MIGRATE_VERBOSE:
-                            print(f'[SKIP active] job={job_id} path={src_job_dir}')
-                        continue
-                    dst_job_dir = local_jobs_root / job_id
-                    try:
-                        result = _sync_tree(src_job_dir, dst_job_dir)
-                        if not bool(result.get('verified', False)):
-                            summary['jobs']['failed'] += 1
-                            print(
-                                f"[VERIFY failed] job={job_id} mismatches={result.get('mismatches_count', 0)} "
-                                f"preview={result.get('mismatches_preview', [])}"
-                            )
-                            continue
-                        summary['jobs']['migrated'] += 1
-                        if MIGRATE_VERBOSE:
-                            print(
-                                f"[OK migrate] job={job_id} files={result.get('src_files', 0)} "
-                                f"bytes={result.get('bytes_copied', 0)}"
-                            )
-                        if MIGRATE_PURGE_DRIVE_AFTER_VERIFY:
-                            shutil.rmtree(src_job_dir, ignore_errors=True)
-                            summary['jobs']['purged'] += 1
-                            if MIGRATE_VERBOSE:
-                                print(f'[PURGED] {src_job_dir}')
-                    except Exception as exc:
-                        summary['jobs']['failed'] += 1
-                        print(f'[ERROR] job={job_id} cause={type(exc).__name__}: {exc}')
-            else:
-                print('Drive jobs root absent:', drive_jobs_root)
-
-            if drive_pipeline_logs_root.exists():
-                try:
-                    result = _sync_tree(drive_pipeline_logs_root, local_pipeline_logs_root)
-                    if bool(result.get('verified', False)):
-                        summary['pipeline_logs']['migrated'] = 1
-                        print(
-                            f"[OK migrate] pipeline_logs files={result.get('src_files', 0)} "
-                            f"bytes={result.get('bytes_copied', 0)}"
-                        )
-                        if MIGRATE_PURGE_DRIVE_AFTER_VERIFY:
-                            shutil.rmtree(drive_pipeline_logs_root, ignore_errors=True)
-                            summary['pipeline_logs']['purged'] = 1
-                            print(f'[PURGED] {drive_pipeline_logs_root}')
-                    else:
-                        summary['pipeline_logs']['failed'] = 1
-                        print(
-                            f"[VERIFY failed] pipeline_logs mismatches={result.get('mismatches_count', 0)} "
-                            f"preview={result.get('mismatches_preview', [])}"
-                        )
-                except Exception as exc:
-                    summary['pipeline_logs']['failed'] = 1
-                    print(f'[ERROR] pipeline_logs cause={type(exc).__name__}: {exc}')
-            else:
-                print('Drive pipeline logs root absent:', drive_pipeline_logs_root)
-
-            # Re-cree la structure vide cote Drive pour eviter des surprises visuelles.
-            if MIGRATE_PURGE_DRIVE_AFTER_VERIFY:
-                drive_jobs_root.mkdir(parents=True, exist_ok=True)
-                drive_pipeline_logs_root.mkdir(parents=True, exist_ok=True)
-
+            summary = run_drive_to_local_runtime_migration(
+                drive_jobs_root=drive_jobs_root,
+                drive_pipeline_logs_root=drive_pipeline_logs_root,
+                local_jobs_root=local_jobs_root,
+                local_pipeline_logs_root=local_pipeline_logs_root,
+                manifest=manifest_payload,
+                purge_after_verify=bool(MIGRATE_PURGE_DRIVE_AFTER_VERIFY),
+                skip_active_job_dirs=bool(MIGRATE_SKIP_ACTIVE_JOB_DIRS),
+                active_updated_max_age_seconds=float(MIGRATE_ACTIVE_UPDATED_MAX_AGE_SECONDS),
+                verbose=bool(MIGRATE_VERBOSE),
+                lock_dir=MIGRATE_LOCK_DIR,
+                lock_timeout_seconds=float(MIGRATE_LOCK_TIMEOUT_SECONDS),
+                hash_chunk_size=int(MIGRATE_HASH_CHUNK_SIZE),
+            )
+            summary['manifest_source'] = str(manifest_source)
+            summary['local_manifest_path'] = str(local_manifest_path)
             print('Migration summary:')
             print(json.dumps(summary, indent=2, ensure_ascii=True))
         """
@@ -1206,6 +1113,7 @@ cells = [
             storage_cfg['runtime_state_backup_enabled'] = bool(RUNTIME_HYBRID_BACKUP_ENABLED)
             storage_cfg['jobs_backup_root'] = str(RUNTIME_HYBRID_BACKUP_JOBS_ROOT)
             storage_cfg['runtime_state_backup_min_interval_seconds'] = float(RUNTIME_HYBRID_BACKUP_MIN_INTERVAL_SECONDS)
+            storage_cfg['runtime_state_backup_force_interval_seconds'] = float(RUNTIME_HYBRID_BACKUP_FORCE_INTERVAL_SECONDS)
             cfg['storage'] = storage_cfg
             return cfg
 

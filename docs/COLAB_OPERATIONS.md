@@ -51,6 +51,8 @@ MyDrive/songo-stockfish/
         config.yaml
         run_status.json
         state.json
+        events.jsonl
+        metrics.jsonl
 ```
 
 ## 4. Ce qui doit etre stocke dans Drive
@@ -76,7 +78,18 @@ MyDrive/songo-stockfish/
 - activer `runtime_state_backup_enabled=true`
 - pointer `jobs_backup_root` vers `MyDrive/songo-stockfish/runtime_backup/jobs`
 - garder un intervalle de sync raisonnable (ex: `runtime_state_backup_min_interval_seconds=30`)
+- definir aussi un filet de securite `runtime_state_backup_force_interval_seconds` (ex: 180)
 - a la reprise, restaurer le runtime local depuis ce backup avant relance
+
+### 4.1.2 Migration Drive -> runtime local (cellule 3bis)
+
+- utiliser un lock de migration partage pour eviter les courses
+- verifier la copie avec hash SHA256 (pas seulement la taille)
+- ne jamais purger un job detecte actif:
+  - `run_status` actif
+  - `updated_at` recent
+  - PID encore vivant via manifest
+- purge en deux temps: rename en quarantaine puis recheck actif avant suppression
 
 ## 4.2 Ce qui doit etre stocke dans Firestore
 

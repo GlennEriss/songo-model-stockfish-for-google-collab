@@ -229,6 +229,8 @@ class JobContext:
     _firestore_sync_stats: dict[str, int] | None = None
     _last_runtime_backup_state_write_ts: float = 0.0
     _last_runtime_backup_state_signature: str = ""
+    _last_runtime_backup_state_change_ts: float = 0.0
+    _runtime_backup_state_dirty: bool = False
 
     def read_status(self) -> dict[str, Any]:
         payload = read_json_dict(self.status_path, default={})
@@ -241,8 +243,19 @@ class JobContext:
         if backup_payload:
             try:
                 write_json_atomic(self.status_path, backup_payload, ensure_ascii=True, indent=2)
+                self._emit_runtime_restore_note(
+                    kind="run_status",
+                    source_path=backup_path,
+                    target_path=self.status_path,
+                    restored=True,
+                )
             except Exception:
-                pass
+                self._emit_runtime_restore_note(
+                    kind="run_status",
+                    source_path=backup_path,
+                    target_path=self.status_path,
+                    restored=False,
+                )
         return backup_payload
 
     def read_state(self) -> dict[str, Any]:
@@ -256,8 +269,19 @@ class JobContext:
         if backup_payload:
             try:
                 write_json_atomic(self.state_path, backup_payload, ensure_ascii=True, indent=2)
+                self._emit_runtime_restore_note(
+                    kind="state",
+                    source_path=backup_path,
+                    target_path=self.state_path,
+                    restored=True,
+                )
             except Exception:
-                pass
+                self._emit_runtime_restore_note(
+                    kind="state",
+                    source_path=backup_path,
+                    target_path=self.state_path,
+                    restored=False,
+                )
         return backup_payload
 
     def _backup_path_for(self, relative_name: str) -> Path | None:
@@ -270,6 +294,10 @@ class JobContext:
         storage_cfg = self.config.get("storage", {}) if isinstance(self.config.get("storage"), dict) else {}
         return max(0.0, _as_float(storage_cfg.get("runtime_state_backup_min_interval_seconds", 30.0), 30.0))
 
+    def _runtime_backup_force_interval_seconds(self) -> float:
+        storage_cfg = self.config.get("storage", {}) if isinstance(self.config.get("storage"), dict) else {}
+        return max(0.0, _as_float(storage_cfg.get("runtime_state_backup_force_interval_seconds", 300.0), 300.0))
+
     def _write_backup_json(self, relative_name: str, payload: dict[str, Any]) -> None:
         backup_path = self._backup_path_for(relative_name)
         if backup_path is None:
@@ -277,6 +305,22 @@ class JobContext:
         try:
             backup_path.parent.mkdir(parents=True, exist_ok=True)
             write_json_atomic(backup_path, payload, ensure_ascii=True, indent=2)
+        except Exception as exc:
+            self.logger.warning(
+                "runtime backup write failed | job_id=%s | file=%s | error=%s",
+                self.job_id,
+                str(backup_path),
+                f"{type(exc).__name__}: {exc}",
+            )
+
+    def _append_backup_jsonl(self, relative_name: str, payload: dict[str, Any]) -> None:
+        backup_path = self._backup_path_for(relative_name)
+        if backup_path is None:
+            return
+        try:
+            backup_path.parent.mkdir(parents=True, exist_ok=True)
+            with backup_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, ensure_ascii=True, default=str) + "\n")
         except Exception as exc:
             self.logger.warning(
                 "runtime backup write failed | job_id=%s | file=%s | error=%s",
@@ -300,6 +344,39 @@ class JobContext:
                 f"{type(exc).__name__}: {exc}",
             )
 
+    def _emit_runtime_restore_note(self, *, kind: str, source_path: Path, target_path: Path, restored: bool) -> None:
+        message = "runtime_backup_restored" if restored else "runtime_backup_restore_copy_failed"
+        self.logger.info(
+            "%s | job_id=%s | kind=%s | source=%s | target=%s",
+            message,
+            self.job_id,
+            kind,
+            str(source_path),
+            str(target_path),
+        )
+        try:
+            self.write_event(
+                message,
+                kind=str(kind),
+                source_path=str(source_path),
+                target_path=str(target_path),
+                restored=bool(restored),
+            )
+        except Exception:
+            pass
+        try:
+            self.write_metric(
+                {
+                    "metric_type": message,
+                    "kind": str(kind),
+                    "source_path": str(source_path),
+                    "target_path": str(target_path),
+                    "restored": bool(restored),
+                }
+            )
+        except Exception:
+            pass
+
     def write_event(self, message: str, **extra: Any) -> None:
         payload = {
             "timestamp": utc_now_iso(),
@@ -310,6 +387,7 @@ class JobContext:
             **extra,
         }
         self.events.write(payload)
+        self._append_backup_jsonl("events.jsonl", payload)
 
     def write_metric(self, metric: dict[str, Any]) -> None:
         payload = {
@@ -318,6 +396,7 @@ class JobContext:
             **metric,
         }
         self.metrics.write(payload)
+        self._append_backup_jsonl("metrics.jsonl", payload)
 
     def write_status(self, status: str, *, phase: str = "initializing", extra: dict[str, Any] | None = None) -> None:
         previous = self.read_status()
@@ -353,13 +432,23 @@ class JobContext:
         state_signature = json.dumps(payload, sort_keys=True, ensure_ascii=True, default=str)
         now_ts = time.time()
         min_interval = self._runtime_backup_min_interval_seconds()
-        should_backup = state_signature != self._last_runtime_backup_state_signature
-        if min_interval > 0.0:
-            should_backup = should_backup and (now_ts - float(self._last_runtime_backup_state_write_ts)) >= min_interval
+        force_interval = self._runtime_backup_force_interval_seconds()
+        if state_signature != self._last_runtime_backup_state_signature:
+            self._runtime_backup_state_dirty = True
+            self._last_runtime_backup_state_change_ts = now_ts
+
+        elapsed_since_backup = now_ts - float(self._last_runtime_backup_state_write_ts)
+        should_backup = bool(self._runtime_backup_state_dirty)
+        if should_backup and min_interval > 0.0 and elapsed_since_backup < min_interval:
+            should_backup = False
+        if bool(self._runtime_backup_state_dirty) and not should_backup and force_interval > 0.0:
+            should_backup = elapsed_since_backup >= force_interval
+
         if should_backup:
             self._write_backup_json("state.json", payload)
             self._last_runtime_backup_state_signature = state_signature
             self._last_runtime_backup_state_write_ts = now_ts
+            self._runtime_backup_state_dirty = False
         self._write_worker_checkpoint_firestore(status_payload=None, state_payload=payload, force=False)
 
     def set_phase(self, phase: str) -> None:
@@ -540,14 +629,16 @@ def create_job_context(config: dict[str, Any], *, override_job_id: str | None = 
         backup_job_dir = paths.jobs_backup_root / job_id
         backup_job_dir.mkdir(parents=True, exist_ok=True)
 
+    restored_from_backup: list[str] = []
     if backup_job_dir is not None:
-        for relative_name in ["config.yaml", "run_status.json", "state.json"]:
+        for relative_name in ["config.yaml", "run_status.json", "state.json", "events.jsonl", "metrics.jsonl"]:
             local_path = job_dir / relative_name
             backup_path = backup_job_dir / relative_name
             if local_path.exists() or not backup_path.exists():
                 continue
             try:
                 write_text_atomic(local_path, backup_path.read_text(encoding="utf-8"), encoding="utf-8")
+                restored_from_backup.append(relative_name)
             except Exception:
                 pass
 
@@ -595,6 +686,24 @@ def create_job_context(config: dict[str, Any], *, override_job_id: str | None = 
         checkpoint_min_interval_seconds=float(sync_diag.get("checkpoint_min_interval_seconds", 0.0)),
         checkpoint_state_only_on_change=bool(sync_diag.get("checkpoint_state_only_on_change", True)),
     )
+    if restored_from_backup:
+        context.logger.info(
+            "runtime backup restored at startup | job_id=%s | files=%s | backup_root=%s",
+            context.job_id,
+            ",".join(restored_from_backup),
+            str(backup_job_dir) if backup_job_dir is not None else "<none>",
+        )
+        context.write_event(
+            "runtime_backup_restored_startup",
+            files=list(restored_from_backup),
+            backup_root=str(backup_job_dir) if backup_job_dir is not None else "",
+        )
+        context.write_metric(
+            {
+                "metric_type": "runtime_backup_restored_startup",
+                "files_count": int(len(restored_from_backup)),
+            }
+        )
 
     write_text_atomic(job_dir / "config.yaml", _dump_yaml_like(config), encoding="utf-8")
     context._write_backup_text("config.yaml", _dump_yaml_like(config))
