@@ -269,6 +269,8 @@ cells = [
         MONITOR_REFRESH_SECONDS = 15
         MONITOR_MAX_LOOPS = 40
         PIPELINE_MANIFEST_FIRESTORE_WRITE_ENABLED = True
+        RUNTIME_STATE_MODE = 'local'  # 'local' (recommande) | 'drive'
+        RUNTIME_LOCAL_ROOT = '/content/songo-stockfish-runtime'
         if LOW_QUOTA_PROFILE:
             GLOBAL_BUDGET_ENFORCEMENT_MODE = 'batched'
             GLOBAL_PROGRESS_FLUSH_EVERY_N_GAMES = int(LOW_QUOTA_GLOBAL_PROGRESS_FLUSH_EVERY_N_GAMES)
@@ -282,6 +284,23 @@ cells = [
             WORKER_CHECKPOINTS_MIN_INTERVAL_SECONDS = max(60.0, float(WORKER_CHECKPOINTS_MIN_INTERVAL_SECONDS))
         if str(GLOBAL_PROGRESS_BACKEND).strip().lower() != 'firestore':
             raise ValueError("GLOBAL_PROGRESS_BACKEND doit rester 'firestore' (fallback fichier desactive).")
+
+        runtime_mode = str(RUNTIME_STATE_MODE).strip().lower()
+        if runtime_mode not in {'local', 'drive'}:
+            raise ValueError(f'RUNTIME_STATE_MODE non supporte: {RUNTIME_STATE_MODE}')
+        if runtime_mode == 'local':
+            RUNTIME_STATE_ROOT = str(Path(RUNTIME_LOCAL_ROOT))
+        else:
+            RUNTIME_STATE_ROOT = str(Path(DRIVE_ROOT))
+        JOBS_ROOT = str(Path(RUNTIME_STATE_ROOT) / 'jobs')
+        LOGS_ROOT = str(Path(RUNTIME_STATE_ROOT) / 'logs')
+        PIPELINE_LOGS_DIR = str(Path(LOGS_ROOT) / 'pipeline')
+        Path(JOBS_ROOT).mkdir(parents=True, exist_ok=True)
+        Path(LOGS_ROOT).mkdir(parents=True, exist_ok=True)
+        Path(PIPELINE_LOGS_DIR).mkdir(parents=True, exist_ok=True)
+        os.environ['SONGO_JOBS_ROOT'] = str(JOBS_ROOT)
+        os.environ['SONGO_LOGS_ROOT'] = str(LOGS_ROOT)
+
         DATASET_GENERATE_WORKERS = 16
         DATASET_GENERATE_MAX_PENDING_FUTURES = 32
         DATASET_BUILD_WORKERS = 16
@@ -819,7 +838,7 @@ cells = [
             DATASET_SOURCE_ID = DATASET_SOURCE_ID_PASS_A
             DATASET_BUILD_ID = DATASET_BUILD_ID_PASS_A
 
-        PIPELINE_MANIFEST_PATH = f'logs/pipeline/latest_dataset_pipeline_{WORKER_TAG}.json'
+        PIPELINE_MANIFEST_PATH = str(Path(PIPELINE_LOGS_DIR) / f'latest_dataset_pipeline_{WORKER_TAG}.json')
 
         def _auto_dataset_generate_job_id(dataset_source_id: str, target_samples: int) -> str:
             safe_source = dataset_source_id.replace('-', '_')
@@ -851,6 +870,11 @@ cells = [
         print('active_worker_tags_before_assign =', sorted(active_worker_tags))
         print('RESUMED_FROM_CHECKPOINT =', RESUMED_FROM_CHECKPOINT)
         print('PIPELINE_MANIFEST_PATH  =', PIPELINE_MANIFEST_PATH)
+        print('RUNTIME_STATE_MODE      =', RUNTIME_STATE_MODE)
+        print('RUNTIME_STATE_ROOT      =', RUNTIME_STATE_ROOT)
+        print('JOBS_ROOT               =', JOBS_ROOT)
+        print('LOGS_ROOT               =', LOGS_ROOT)
+        print('PIPELINE_LOGS_DIR       =', PIPELINE_LOGS_DIR)
         print('TARGET_SAMPLES          =', TARGET_SAMPLES)
         print('TARGET_LABELED_SAMPLES  =', TARGET_LABELED_SAMPLES)
         print('DATASET_GENERATE_SOURCE_MODE =', DATASET_GENERATE_SOURCE_MODE)
@@ -988,10 +1012,18 @@ cells = [
             cfg['runtime'] = runtime_cfg
             return cfg
 
+        def _apply_runtime_storage_cfg(cfg: dict) -> dict:
+            storage_cfg = dict(cfg.get('storage', {}) or {})
+            storage_cfg['jobs_root'] = str(JOBS_ROOT)
+            storage_cfg['logs_root'] = str(LOGS_ROOT)
+            cfg['storage'] = storage_cfg
+            return cfg
+
         def _write_yaml(payload: dict, target_path_str: str) -> str:
             target_path = Path(target_path_str)
             target_path.parent.mkdir(parents=True, exist_ok=True)
-            target_path.write_text(yaml.safe_dump(payload, sort_keys=False, allow_unicode=True), encoding='utf-8')
+            normalized_payload = _apply_runtime_storage_cfg(dict(payload or {}))
+            target_path.write_text(yaml.safe_dump(normalized_payload, sort_keys=False, allow_unicode=True), encoding='utf-8')
             return str(target_path)
 
         def _resolve_cfg_path(path_like: str) -> Path:
@@ -1132,6 +1164,7 @@ cells = [
                 train_payload = dict(cfg_payload.get('train', {}) or {})
                 train_payload['batch_size'] = int(tuned_batch_size)
                 cfg_payload['train'] = train_payload
+                cfg_payload = _apply_runtime_storage_cfg(cfg_payload)
                 current_path.write_text(yaml.safe_dump(cfg_payload, sort_keys=False, allow_unicode=True), encoding='utf-8')
 
             eval_path = _resolve_cfg_path(str(EVALUATION_CONFIG_ACTIVE))
@@ -1147,6 +1180,7 @@ cells = [
             eval_runtime_payload['prefetch_factor'] = int(max(2, CPU_SAFE_PREFETCH_FACTOR)) if eval_runtime_payload['num_workers'] > 0 else 0
             eval_runtime_payload['pin_memory'] = bool(eval_runtime_payload.get('device', 'cpu') == 'cuda')
             eval_cfg_payload['runtime'] = eval_runtime_payload
+            eval_cfg_payload = _apply_runtime_storage_cfg(eval_cfg_payload)
             eval_path.write_text(yaml.safe_dump(eval_cfg_payload, sort_keys=False, allow_unicode=True), encoding='utf-8')
 
         model_registry_path = Path(DRIVE_ROOT) / 'models' / 'model_registry.json'
@@ -1568,6 +1602,7 @@ cells = [
         benchmark_block['parallel_backend'] = str(BENCHMARK_PARALLEL_BACKEND).strip().lower() or 'thread'
         benchmark_block['parallel_workers'] = int(max(1, BENCHMARK_PARALLEL_WORKERS))
         benchmark_cfg['benchmark'] = benchmark_block
+        benchmark_cfg = _apply_runtime_storage_cfg(benchmark_cfg)
         Path(BENCHMARK_CONFIG_ACTIVE).write_text(
             yaml.safe_dump(benchmark_cfg, sort_keys=False, allow_unicode=True),
             encoding='utf-8',
@@ -1646,9 +1681,9 @@ cells = [
         from datetime import UTC, datetime
         from pathlib import Path
 
-        logs_dir = Path(DRIVE_ROOT) / 'logs' / 'pipeline'
+        logs_dir = Path(PIPELINE_LOGS_DIR)
         logs_dir.mkdir(parents=True, exist_ok=True)
-        jobs_dir = Path(DRIVE_ROOT) / 'jobs'
+        jobs_dir = Path(JOBS_ROOT)
         jobs_dir.mkdir(parents=True, exist_ok=True)
         (jobs_dir / DATASET_GENERATE_JOB_ID).mkdir(parents=True, exist_ok=True)
         (jobs_dir / DATASET_BUILD_JOB_ID).mkdir(parents=True, exist_ok=True)
@@ -1738,7 +1773,7 @@ cells = [
                 'dataset-build': build_proc,
             },
         }
-        latest_path = Path(DRIVE_ROOT) / PIPELINE_MANIFEST_PATH
+        latest_path = Path(PIPELINE_MANIFEST_PATH)
         latest_path.parent.mkdir(parents=True, exist_ok=True)
         latest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=True), encoding='utf-8')
         firestore_manifest_written = False
@@ -1774,22 +1809,22 @@ cells = [
     md(
         """
         Vue par source:
-        - `5bis.A` = Manifest pipeline (Drive prioritaire, Firestore fallback)
+        - `5bis.A` = Manifest pipeline (runtime local prioritaire, Firestore fallback)
         - `5bis.A2` = Suivi live des processus (refresh `ps`)
-        - `5bis.B` = Drive local worker (etat local des jobs)
+        - `5bis.B` = Runtime local worker (etat local des jobs)
         - `5bis.C` = Redis cache (et ecart vs Firestore)
-        - `5bis.D` = Logs worker (fichiers Drive)
+        - `5bis.D` = Logs worker (fichiers runtime)
         - `5bis.E` = Metriques checkpoint sync Firestore (events/metrics de run)
         """
     ),
-    md("### 5bis.A Suivi Manifest Pipeline (Drive prioritaire, Firestore fallback)"),
+    md("### 5bis.A Suivi Manifest Pipeline (runtime local prioritaire, Firestore fallback)"),
     code(
         """
         import json
         import subprocess
         from pathlib import Path
 
-        local_manifest_path = Path(DRIVE_ROOT) / PIPELINE_MANIFEST_PATH
+        local_manifest_path = Path(PIPELINE_MANIFEST_PATH)
 
         def _load_manifest() -> tuple[dict, str]:
             manifest = {}
@@ -1858,7 +1893,7 @@ cells = [
 
         manifest, manifest_source = _load_manifest()
         if not manifest:
-            print('Manifest introuvable (Drive + Firestore)')
+            print('Manifest introuvable (runtime local + Firestore)')
             print('  drive_path =', local_manifest_path)
             print('  firestore  =', f'{FIRESTORE_PIPELINE_MANIFESTS_COLLECTION}/{WORKER_TAG}')
         else:
@@ -1890,7 +1925,7 @@ cells = [
         LIVE_REFRESH_SECONDS = float(globals().get('PROCESS_MONITOR_REFRESH_SECONDS', 5.0))
         LIVE_MAX_LOOPS = int(globals().get('PROCESS_MONITOR_MAX_LOOPS', 120))
 
-        local_manifest_path = Path(DRIVE_ROOT) / PIPELINE_MANIFEST_PATH
+        local_manifest_path = Path(PIPELINE_MANIFEST_PATH)
 
         def _load_manifest_live() -> tuple[dict, str]:
             manifest = {}
@@ -2077,7 +2112,7 @@ cells = [
     ),
     code(
         """
-        # KPI live (Firestore dataset_registry + Drive job summary)
+        # KPI live (Firestore dataset_registry + runtime job summary)
         import json
         import time
         from pathlib import Path
@@ -2085,7 +2120,7 @@ cells = [
         REFRESH_SECONDS = float(MONITOR_REFRESH_SECONDS)
         MAX_LOOPS = int(MONITOR_MAX_LOOPS)
 
-        jobs_root = Path(DRIVE_ROOT) / 'jobs'
+        jobs_root = Path(JOBS_ROOT)
         progress_watch: dict[str, dict[str, object]] = {
             'source': {'signature': None, 'last_change_epoch': time.time()},
             'build': {'signature': None, 'last_change_epoch': time.time()},
@@ -2188,7 +2223,7 @@ cells = [
                 f'| source_status={source_status} | unchanged_s={source_unchanged_seconds}'
             )
             print(
-                f'[{ts}] [DRIVE summary + FIRESTORE build] played_games={played_games} '
+                f'[{ts}] [RUNTIME summary + FIRESTORE build] played_games={played_games} '
                 f'| build_samples={build_samples}/{build_target} ({_safe_pct(build_samples, build_target):.2f}%) '
                 f'| build_status={build_status} | unchanged_s={build_unchanged_seconds}'
             )
@@ -2324,7 +2359,7 @@ cells = [
         HEARTBEAT_ACTIVE_SECONDS = 600
         HEARTBEAT_STALE_SECONDS = 1800
         PROGRESS_STALL_SECONDS = 900
-        snapshot_path = Path(DRIVE_ROOT) / 'logs' / 'pipeline' / f'workers_status_snapshot_{GLOBAL_TARGET_ID}_{WORKER_TAG}.json'
+        snapshot_path = Path(PIPELINE_LOGS_DIR) / f'workers_status_snapshot_{GLOBAL_TARGET_ID}_{WORKER_TAG}.json'
 
         def _load_json_retry(path: Path, retries: int = 6, wait_seconds: float = 0.25, default=None):
             fallback = {} if default is None else default
@@ -2562,7 +2597,7 @@ cells = [
         from pathlib import Path
 
         ACTIVE_THRESHOLD_SECONDS = 600
-        health_state_path = Path(DRIVE_ROOT) / 'logs' / 'pipeline' / f'health_snapshot_{GLOBAL_TARGET_ID}_{WORKER_TAG}.json'
+        health_state_path = Path(PIPELINE_LOGS_DIR) / f'health_snapshot_{GLOBAL_TARGET_ID}_{WORKER_TAG}.json'
 
         def _load_json_retry(path: Path, retries: int = 6, wait_seconds: float = 0.25, default=None):
             fallback = {} if default is None else default
@@ -2735,17 +2770,17 @@ cells = [
             print(f'INACTIVE | +{len(inactive_rows) - 3} autres workers inactifs')
         """
     ),
-    md("### 5bis.B Suivi Drive (fichiers worker locaux)"),
+    md("### 5bis.B Suivi Runtime (fichiers worker locaux)"),
     code(
         """
-        # Vue Drive: progression locale du worker (fichiers jobs/*)
+        # Vue runtime local: progression locale du worker (fichiers jobs/*)
         import json
         import time
         from pathlib import Path
 
         REFRESH_SECONDS = float(MONITOR_REFRESH_SECONDS)
         MAX_LOOPS = int(MONITOR_MAX_LOOPS)
-        jobs_root = Path(DRIVE_ROOT) / 'jobs'
+        jobs_root = Path(JOBS_ROOT)
         progress_watch: dict[str, dict[str, object]] = {
             'generate': {'signature': None, 'last_change_epoch': time.time()},
             'build': {'signature': None, 'last_change_epoch': time.time()},
@@ -2828,13 +2863,13 @@ cells = [
 
             ts = time.strftime('%Y-%m-%d %H:%M:%S')
             print(
-                f'[{ts}] [DRIVE generate] dir={generate_dir} | status={generate_status.get("status", "<none>")} '
+                f'[{ts}] [RUNTIME generate] dir={generate_dir} | status={generate_status.get("status", "<none>")} '
                 f'| phase={generate_status.get("phase", "<none>")} | sample_count={generate_state.get("sample_count", "<none>")} '
                 f'| total_samples_summary={generate_summary.get("total_samples", "<none>")} | added_games_summary={generate_summary.get("added_games", "<none>")} '
                 f'| unchanged_s={generate_unchanged_seconds}'
             )
             print(
-                f'[{ts}] [DRIVE build] dir={build_dir} | status={build_status.get("status", "<none>")} '
+                f'[{ts}] [RUNTIME build] dir={build_dir} | status={build_status.get("status", "<none>")} '
                 f'| phase={build_status.get("phase", "<none>")} | labeled_samples_state={build_state.get("labeled_samples", "<none>")} '
                 f'| processed_files_state={build_state.get("processed_files", "<none>")} | labeled_samples_summary={build_summary.get("labeled_samples", "<none>")} '
                 f'| unchanged_s={build_unchanged_seconds}'
@@ -2939,15 +2974,15 @@ cells = [
                 print('Lecture Redis impossible:', f'{type(exc).__name__}: {exc}')
         """
     ),
-    md("### 5bis.D Logs worker (Drive)"),
+    md("### 5bis.D Logs worker (runtime local)"),
     code(
         """
         import json
         from pathlib import Path
 
         LOG_TAIL_LINES = 40
-        logs_dir = Path(DRIVE_ROOT) / 'logs' / 'pipeline'
-        local_manifest_path = Path(DRIVE_ROOT) / PIPELINE_MANIFEST_PATH
+        logs_dir = Path(PIPELINE_LOGS_DIR)
+        local_manifest_path = Path(PIPELINE_MANIFEST_PATH)
         manifest = {}
         manifest_source = 'none'
 
@@ -2989,10 +3024,10 @@ cells = [
         import json
         from pathlib import Path
 
-        logs_dir = Path(DRIVE_ROOT) / 'logs' / 'pipeline'
+        logs_dir = Path(PIPELINE_LOGS_DIR)
         fallback_path = logs_dir / f'{DATASET_BUILD_JOB_ID}.log'
 
-        local_manifest_path = Path(DRIVE_ROOT) / PIPELINE_MANIFEST_PATH
+        local_manifest_path = Path(PIPELINE_MANIFEST_PATH)
         manifest = {}
         if local_manifest_path.exists():
             try:
@@ -3025,7 +3060,7 @@ cells = [
         import json
         from pathlib import Path
 
-        jobs_root = Path(DRIVE_ROOT) / 'jobs'
+        jobs_root = Path(JOBS_ROOT)
 
         def _latest_job_dir(job_id: str) -> Path | None:
             if not jobs_root.exists():
@@ -3582,7 +3617,7 @@ cells = [
             return text
 
         def _latest_job_dir_for_job_id(job_id: str) -> Path | None:
-            jobs_root = Path(DRIVE_ROOT) / 'jobs'
+            jobs_root = Path(JOBS_ROOT)
             if not jobs_root.exists():
                 return None
             requested = str(job_id).strip()
@@ -3760,7 +3795,7 @@ cells = [
                 return text
 
             def _latest_job_dir_for_job_id(job_id: str) -> Path | None:
-                jobs_root = Path(DRIVE_ROOT) / 'jobs'
+                jobs_root = Path(JOBS_ROOT)
                 if not jobs_root.exists():
                     return None
                 requested = str(job_id).strip()
@@ -3887,7 +3922,7 @@ cells = [
                 return text
 
             def _latest_job_dir_for_job_id(job_id: str) -> Path | None:
-                jobs_root = Path(DRIVE_ROOT) / 'jobs'
+                jobs_root = Path(JOBS_ROOT)
                 if not jobs_root.exists():
                     return None
                 requested = str(job_id).strip()

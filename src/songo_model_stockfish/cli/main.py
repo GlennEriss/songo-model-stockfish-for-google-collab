@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 from songo_model_stockfish.ops.config import load_yaml_config
@@ -10,14 +11,25 @@ from songo_model_stockfish.ops.paths import build_project_paths
 
 
 _COLAB_DRIVE_JOBS_ROOT = Path("/content/drive/MyDrive/songo-stockfish/jobs")
+_COLAB_LOCAL_JOBS_ROOT = Path("/content/songo-stockfish-runtime/jobs")
 
 
 def _resolve_strict_jobs_root() -> Path:
+    env_jobs_root = Path(str(os.environ.get("SONGO_JOBS_ROOT", "")).strip()) if os.environ.get("SONGO_JOBS_ROOT") else None
+    if env_jobs_root is not None and str(env_jobs_root):
+        if env_jobs_root.exists():
+            return env_jobs_root
+        raise FileNotFoundError(
+            "Jobs root introuvable depuis SONGO_JOBS_ROOT. "
+            f"Chemin configure: {env_jobs_root}"
+        )
+    if _COLAB_LOCAL_JOBS_ROOT.exists():
+        return _COLAB_LOCAL_JOBS_ROOT
     if _COLAB_DRIVE_JOBS_ROOT.exists():
         return _COLAB_DRIVE_JOBS_ROOT
     raise FileNotFoundError(
         "Jobs root introuvable. Monte Google Drive puis relance. "
-        f"Chemin attendu: {_COLAB_DRIVE_JOBS_ROOT}"
+        f"Chemins testes: {_COLAB_LOCAL_JOBS_ROOT}, {_COLAB_DRIVE_JOBS_ROOT}"
     )
 
 

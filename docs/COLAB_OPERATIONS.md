@@ -8,13 +8,17 @@ Definir les operations standard pour executer le projet dans Google Colab de man
 
 Le code vit sur GitHub.
 
-Les artefacts vivent sur Google Drive.
+Les artefacts persistants vivent sur Google Drive.
+
+Les artefacts runtime volatils (jobs/logs live) vivent en local Colab.
 
 Cette separation ne doit jamais etre rompue.
 
 L'etat vivant multi-Colab utilise Redis (temps reel) + Firestore (durable).
 
-## 3. Arborescence Drive recommandee
+## 3. Arborescence recommandee
+
+### 3.1 Drive (persistant)
 
 ```text
 MyDrive/songo-stockfish/
@@ -23,24 +27,38 @@ MyDrive/songo-stockfish/
     raw/
     processed/
     datasets/
-  jobs/
   models/
-  logs/
   reports/
   exports/
+```
+
+### 3.2 Runtime local Colab (volatile, recommande)
+
+```text
+/content/songo-stockfish-runtime/
+  jobs/
+  logs/
+    pipeline/
 ```
 
 ## 4. Ce qui doit etre stocke dans Drive
 
 - datasets
 - checkpoints
-- logs
-- manifests de jobs
 - rapports benchmark
 - rapports evaluation
 - model cards
 
-## 4.1 Ce qui doit etre stocke dans Firestore
+## 4.1 Ce qui doit etre stocke en runtime local Colab
+
+- `jobs/<job_id>/state.json`
+- `jobs/<job_id>/run_status.json`
+- `jobs/<job_id>/*_summary.json`
+- `logs/pipeline/*.log`
+- `logs/pipeline/latest_dataset_pipeline_<worker_tag>.json`
+- snapshots monitoring (`workers_status_snapshot_*.json`, `health_snapshot_*.json`)
+
+## 4.2 Ce qui doit etre stocke dans Firestore
 
 - `global_generation_progress/{global_target_id}`
 - `dataset_registry/primary`
@@ -53,7 +71,7 @@ Important:
 - Firestore Python (`google-cloud-firestore`) doit etre utilise avec un service account (`FIRESTORE_CREDENTIALS_PATH`)
 - le mode API key seul n'est pas supporte pour ce client serveur
 
-## 4.2 Ce qui doit etre stocke dans Redis
+## 4.3 Ce qui doit etre stocke dans Redis
 
 - compteurs frequents globaux (`samples`, `games`)
 - heartbeat workers (TTL)
@@ -74,7 +92,7 @@ Important:
 1. monter Google Drive
 2. cloner ou mettre a jour le repo GitHub
 3. installer les dependances
-4. definir les chemins Drive + `FIRESTORE_CREDENTIALS_PATH`
+4. definir `DRIVE_ROOT`, `RUNTIME_STATE_MODE`, `RUNTIME_LOCAL_ROOT` et `FIRESTORE_CREDENTIALS_PATH`
 5. activer Redis pour le temps reel + Firestore pour le durable
 6. lancer le pipeline (`dataset-generate` + `dataset-build`) avec `job_id` dedie worker
 7. activer le mode quota economique (`LOW_QUOTA_PROFILE=True`) en multi-Colab
@@ -87,7 +105,7 @@ Pour chaque worker:
 
 1. reserver un matchup libre via lease
 2. executer un bloc de `200..500` games pour ce matchup
-3. ecrire les fichiers worker-local sur Drive (pas de melange direct)
+3. ecrire les fichiers worker-local dans le runtime local (pas de melange direct)
 4. publier progression globale en micro-batch (N games ou intervalle)
 5. a la fin du bloc, merger le mini-dataset worker vers le dataset principal
 6. marquer le bloc comme `merged`

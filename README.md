@@ -42,7 +42,7 @@ La ligne technique retenue est:
 - reseau neuronal custom from scratch
 - architecture cible `policy + value`
 - pas de fine-tuning d'un modele generaliste comme base principale
-- jobs resumables et artefacts persistants sur Drive
+- jobs resumables en runtime local + artefacts persistants sur Drive
 - coordination multi-Colab via Redis (temps reel) + Firestore (durable)
 
 ## Contenu initial
@@ -241,8 +241,10 @@ Principe recommande:
 
 - code de travail dans `/content/songo-model-stockfish-for-google-collab`
 - artefacts persistants dans `/content/drive/MyDrive/songo-stockfish`
+- etat runtime volatil dans `/content/songo-stockfish-runtime` (recommande)
 - mise a jour Git sur le worktree uniquement
-- datasets, checkpoints, jobs, rapports et logs uniquement sur Drive
+- datasets, checkpoints et rapports sur Drive
+- `jobs/`, `logs/pipeline/*`, manifests live et snapshots monitoring en local runtime (sync Firestore/Redis pour coordination)
 
 Commande utile pour voir rapidement ce qui existe deja:
 
