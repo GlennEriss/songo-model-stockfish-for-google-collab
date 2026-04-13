@@ -2784,14 +2784,22 @@ def _iter_jsonl(path: Path):
 
 
 def _count_jsonl_lines(path: Path) -> int:
-    with path.open("r", encoding="utf-8") as handle:
-        return sum(1 for _ in handle)
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            return sum(1 for _ in handle)
+    except FileNotFoundError:
+        # Fichier supprime/renomme entre le listing et l'ouverture (race multi-worker).
+        return 0
 
 
 def _count_total_jsonl_lines(root: Path) -> int:
     total = 0
     for path in sorted(root.rglob("*.jsonl")):
-        total += _count_jsonl_lines(path)
+        try:
+            total += _count_jsonl_lines(path)
+        except FileNotFoundError:
+            # Defensive fallback for highly concurrent Drive/FUSE environments.
+            continue
     return total
 
 

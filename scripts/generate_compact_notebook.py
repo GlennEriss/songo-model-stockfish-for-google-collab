@@ -2646,7 +2646,7 @@ cells = [
 
             snapshot_path.parent.mkdir(parents=True, exist_ok=True)
             snapshot_payload = {
-                'updated_at': datetime.utcnow().isoformat() + 'Z',
+                'updated_at': datetime.now(UTC).isoformat().replace('+00:00', 'Z'),
                 'workers': next_workers_snapshot,
             }
             snapshot_path.write_text(json.dumps(snapshot_payload, indent=2, ensure_ascii=True), encoding='utf-8')
@@ -3231,6 +3231,84 @@ cells = [
                 print('  timestamp =', last_failed.get('timestamp', '<none>'))
                 print('  error     =', last_failed.get('error', '<none>'))
                 print('  hint      =', last_failed.get('hint', '<none>'))
+        """
+    ),
+    md("### 5bis.F Sanity Taille Doc Firestore (worker_checkpoints)"),
+    code(
+        """
+        # Verifie que worker_checkpoints/<job_id> reste sous la limite Firestore (1 MiB).
+        import json
+
+        MAX_DOC_BYTES = 1_048_576
+        WARN_DOC_BYTES = int(MAX_DOC_BYTES * 0.80)
+
+        def _latest_job_dir(job_id: str):
+            from pathlib import Path
+            jobs_root = Path(JOBS_ROOT)
+            if not jobs_root.exists():
+                return None
+            requested = str(job_id).strip()
+            if not requested:
+                return None
+            parts = requested.rsplit('_', 1)
+            prefix = parts[0] if len(parts) == 2 and parts[1].isdigit() else requested
+            candidates = []
+            for p in jobs_root.iterdir():
+                if not p.is_dir():
+                    continue
+                n = p.name
+                if n == requested or n == prefix or (prefix and n.startswith(prefix + '_')):
+                    candidates.append(p)
+            return sorted(candidates, key=lambda p: p.stat().st_mtime)[-1] if candidates else None
+
+        def _doc_size_bytes(payload: dict) -> int:
+            return len(json.dumps(payload, ensure_ascii=True, separators=(',', ':')).encode('utf-8'))
+
+        def _safe_pct(value: int, total: int) -> float:
+            if int(total) <= 0:
+                return 0.0
+            return (100.0 * float(value)) / float(total)
+
+        build_dir = _latest_job_dir(DATASET_BUILD_JOB_ID)
+        generate_dir = _latest_job_dir(DATASET_GENERATE_JOB_ID)
+        job_dir = build_dir or generate_dir
+        if job_dir is None:
+            print('Aucun job_dir local trouve.')
+        else:
+            job_id = job_dir.name
+            print('job_dir =', job_dir)
+            print('job_id  =', job_id)
+            doc = _read_firestore_doc(
+                FIRESTORE_WORKER_CHECKPOINTS_COLLECTION,
+                job_id,
+                default={},
+            )
+            if not isinstance(doc, dict) or not doc:
+                print('Firestore doc vide/introuvable pour ce job.')
+            else:
+                size_bytes = _doc_size_bytes(doc)
+                size_pct = _safe_pct(size_bytes, MAX_DOC_BYTES)
+                state_summary = doc.get('state_summary', {})
+                state_full = doc.get('state', None)
+                print('collection/document =', f'{FIRESTORE_WORKER_CHECKPOINTS_COLLECTION}/{job_id}')
+                print('doc_size_bytes      =', size_bytes, f'({size_pct:.2f}% of max)')
+                print('max_doc_bytes       =', MAX_DOC_BYTES)
+                print('status              =', doc.get('status', {}).get('status', '<none>'))
+                print('phase               =', doc.get('phase', '<none>'))
+                print('updated_at          =', doc.get('updated_at', '<none>'))
+                print('has_state_summary   =', isinstance(state_summary, dict))
+                print('has_state_full      =', state_full is not None)
+                if isinstance(state_summary, dict):
+                    print('state_summary_keys  =', len(state_summary))
+                    print('state_compacted     =', state_summary.get('_state_compacted', False))
+                    print('state_keys_total    =', state_summary.get('_state_keys_total', '<none>'))
+                    print('state_keys_dropped  =', state_summary.get('_state_keys_dropped', '<none>'))
+                if size_bytes >= MAX_DOC_BYTES:
+                    print('ALERT: doc depasse la limite Firestore.')
+                elif size_bytes >= WARN_DOC_BYTES:
+                    print('WARN: doc proche de la limite (>80%).')
+                else:
+                    print('OK: taille doc saine.')
         """
     ),
     md("## 6. Lister les datasets"),

@@ -41,6 +41,71 @@ def _as_float(value: Any, default: float) -> float:
         return float(default)
 
 
+def _truncate_text(value: Any, *, max_len: int = 256) -> str:
+    text = str(value)
+    if len(text) <= max_len:
+        return text
+    return text[: max(0, int(max_len) - 3)] + "..."
+
+
+def _compact_firestore_state_payload(state_payload: dict[str, Any] | None) -> dict[str, Any]:
+    source = state_payload if isinstance(state_payload, dict) else {}
+    if not source:
+        return {}
+
+    preferred_keys = [
+        "phase",
+        "last_completed_phase",
+        "sample_count",
+        "sampled_files",
+        "sampled_positions",
+        "labeled_samples",
+        "processed_files",
+        "total_samples",
+        "total_games",
+        "target_samples",
+        "target_labeled_samples",
+        "dataset_source_id",
+        "dataset_id",
+        "job_id",
+        "run_type",
+        "updated_at",
+    ]
+    summary: dict[str, Any] = {}
+    included_keys: list[str] = []
+
+    for key in preferred_keys:
+        if key not in source:
+            continue
+        value = source.get(key)
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            summary[key] = value
+        else:
+            summary[key] = _truncate_text(value, max_len=128)
+        included_keys.append(key)
+
+    # Include additional scalar counters/flags (bounded) for observability.
+    if len(summary) < 32:
+        for key in sorted(source.keys()):
+            if key in summary:
+                continue
+            value = source.get(key)
+            if isinstance(value, (int, float, bool)):
+                summary[key] = value
+                included_keys.append(key)
+            elif isinstance(value, str) and len(value) <= 128:
+                summary[key] = value
+                included_keys.append(key)
+            if len(summary) >= 32:
+                break
+
+    summary["_state_keys_total"] = int(len(source))
+    summary["_state_keys_included"] = int(len(included_keys))
+    summary["_state_keys_dropped"] = int(max(0, len(source) - len(included_keys)))
+    summary["_state_compacted"] = True
+    return summary
+
+
 def _resolve_firestore_sync_config(config: dict[str, Any]) -> dict[str, Any]:
     firestore_cfg = config.get("firestore", {}) if isinstance(config.get("firestore"), dict) else {}
     dataset_gen_cfg = config.get("dataset_generation", {}) if isinstance(config.get("dataset_generation"), dict) else {}
@@ -480,7 +545,8 @@ class JobContext:
         min_interval_seconds = max(0.0, _as_float(sync.get("checkpoint_min_interval_seconds", 30.0), 30.0))
         state_only_on_change = _as_bool(sync.get("checkpoint_state_only_on_change", True), default=True)
         status_signature = json.dumps(status_payload, sort_keys=True, ensure_ascii=True, default=str) if status_payload is not None else ""
-        state_signature = json.dumps(state_payload, sort_keys=True, ensure_ascii=True, default=str) if state_payload is not None else ""
+        compact_state_payload = _compact_firestore_state_payload(state_payload)
+        state_signature = json.dumps(compact_state_payload, sort_keys=True, ensure_ascii=True, default=str) if state_payload is not None else ""
         now_ts = time.time()
         if not force:
             if state_payload is not None and state_only_on_change and state_signature == self._last_firestore_state_signature:
@@ -506,7 +572,7 @@ class JobContext:
                 payload["status"] = dict(status_payload)
                 payload["phase"] = str(status_payload.get("phase", ""))
             if state_payload is not None:
-                payload["state"] = dict(state_payload)
+                payload["state_summary"] = dict(compact_state_payload)
             doc_ref.set(payload, merge=True)
             self._last_firestore_checkpoint_write_ts = now_ts
             if status_payload is not None:
