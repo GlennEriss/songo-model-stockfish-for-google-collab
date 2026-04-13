@@ -1952,8 +1952,10 @@ cells = [
             return out if out else 'processus non trouve'
 
         print('Suivi live processus | refresh_s =', LIVE_REFRESH_SECONDS, '| max_loops =', LIVE_MAX_LOOPS)
+        status_watch: dict[str, dict[str, object]] = {}
         for loop_idx in range(max(1, LIVE_MAX_LOOPS)):
             now = time.strftime('%Y-%m-%d %H:%M:%S')
+            now_epoch = time.time()
             manifest, source = _load_manifest_live()
             print(f'\\n[{now}] loop={loop_idx + 1}/{max(1, LIVE_MAX_LOOPS)} | source={source}')
             if not manifest:
@@ -1968,7 +1970,16 @@ cells = [
                 is_running = status not in ('pid absent', 'processus non trouve')
                 if is_running:
                     running += 1
-                print(f' - {label:<16} | pid={pid:<8} | running={\"yes\" if is_running else \"no\"}')
+                signature = f'{pid}|{status}'
+                watched = status_watch.get(label, {})
+                if signature != str(watched.get('signature', '')):
+                    watched = {'signature': signature, 'last_change_epoch': float(now_epoch)}
+                    status_watch[label] = watched
+                unchanged_seconds = max(0.0, float(now_epoch) - float(watched.get('last_change_epoch', now_epoch)))
+                print(
+                    f' - {label:<16} | pid={pid:<8} | running={\"yes\" if is_running else \"no\"} '
+                    f'| unchanged_s={int(unchanged_seconds)}'
+                )
                 print('   ps  =', status)
                 cmd = str(row.get('command', '')).strip()
                 if cmd:
@@ -1984,6 +1995,24 @@ cells = [
     code(
         """
         # Snapshot Firestore: global progress + dataset_registry (worker courant)
+        import time
+        from datetime import datetime
+
+        def _parse_iso_to_epoch(value: object) -> float:
+            text = str(value or '').strip()
+            if not text:
+                return 0.0
+            try:
+                return float(datetime.fromisoformat(text.replace('Z', '+00:00')).timestamp())
+            except Exception:
+                return 0.0
+
+        def _age_seconds_display(value: object) -> str:
+            ts = _parse_iso_to_epoch(value)
+            if ts <= 0:
+                return 'inf'
+            return str(int(max(0.0, time.time() - ts)))
+
         try:
             global_payload = _read_firestore_doc(
                 FIRESTORE_COLLECTION,
@@ -2016,6 +2045,7 @@ cells = [
         print('  total_games         =', int(global_payload.get('total_games', 0)))
         print('  workers             =', len(workers_payload))
         print('  updated_at          =', global_payload.get('updated_at', '<none>'))
+        print('  updated_age_s       =', _age_seconds_display(global_payload.get('updated_at', '<none>')))
 
         source = next((item for item in registry.get('dataset_sources', []) if item.get('dataset_source_id') == DATASET_SOURCE_ID), None)
         built = next((item for item in registry.get('built_datasets', []) if item.get('dataset_id') == DATASET_BUILD_ID), None)
@@ -2030,6 +2060,7 @@ cells = [
             print('  sampled_positions =', source.get('sampled_positions'))
             print('  sampled_files     =', source.get('sampled_files'))
             print('  updated_at        =', source.get('updated_at'))
+            print('  updated_age_s     =', _age_seconds_display(source.get('updated_at', '<none>')))
 
         print('\\nDataset final courant (Firestore dataset_registry):')
         if built is None:
@@ -2041,6 +2072,7 @@ cells = [
             print('  target_samples    =', built.get('target_labeled_samples'))
             print('  output_dir        =', built.get('output_dir'))
             print('  updated_at        =', built.get('updated_at'))
+            print('  updated_age_s     =', _age_seconds_display(built.get('updated_at', '<none>')))
         """
     ),
     code(
@@ -2054,6 +2086,10 @@ cells = [
         MAX_LOOPS = int(MONITOR_MAX_LOOPS)
 
         jobs_root = Path(DRIVE_ROOT) / 'jobs'
+        progress_watch: dict[str, dict[str, object]] = {
+            'source': {'signature': None, 'last_change_epoch': time.time()},
+            'build': {'signature': None, 'last_change_epoch': time.time()},
+        }
 
         def _load_json_retry(path: Path, retries: int = 6, wait_seconds: float = 0.25, default=None):
             fallback = {} if default is None else default
@@ -2076,6 +2112,17 @@ cells = [
             if target <= 0:
                 return 0.0
             return (100.0 * float(value)) / float(target)
+
+        def _format_duration(seconds: float) -> str:
+            total = max(0, int(seconds))
+            hours = total // 3600
+            minutes = (total % 3600) // 60
+            secs = total % 60
+            if hours > 0:
+                return f'{hours}h {minutes:02d}m {secs:02d}s'
+            if minutes > 0:
+                return f'{minutes}m {secs:02d}s'
+            return f'{secs}s'
 
         def _latest_job_dir(job_id: str) -> Path | None:
             if not jobs_root.exists():
@@ -2106,9 +2153,45 @@ cells = [
                     summary = _load_json_retry(summary_path)
                     played_games = int(summary.get('added_games', 0))
 
+            now_epoch = time.time()
+            source_signature = json.dumps(
+                {
+                    'source_samples': source_samples,
+                    'source_files': source_files,
+                    'source_status': source_status,
+                },
+                sort_keys=True,
+                ensure_ascii=True,
+            )
+            build_signature = json.dumps(
+                {
+                    'build_samples': build_samples,
+                    'build_status': build_status,
+                    'played_games': played_games,
+                },
+                sort_keys=True,
+                ensure_ascii=True,
+            )
+            for key, signature in [('source', source_signature), ('build', build_signature)]:
+                watched = progress_watch.get(key, {'signature': None, 'last_change_epoch': now_epoch})
+                if signature != watched.get('signature'):
+                    watched = {'signature': signature, 'last_change_epoch': now_epoch}
+                progress_watch[key] = watched
+
+            source_unchanged_seconds = int(max(0.0, now_epoch - float(progress_watch['source']['last_change_epoch'])))
+            build_unchanged_seconds = int(max(0.0, now_epoch - float(progress_watch['build']['last_change_epoch'])))
+
             ts = time.strftime('%Y-%m-%d %H:%M:%S')
-            print(f'[{ts}] [FIRESTORE dataset_registry] source_samples={source_samples}/{TARGET_SAMPLES} ({_safe_pct(source_samples, int(TARGET_SAMPLES)):.2f}%) | source_files={source_files} | source_status={source_status}')
-            print(f'[{ts}] [DRIVE summary + FIRESTORE build] played_games={played_games} | build_samples={build_samples}/{build_target} ({_safe_pct(build_samples, build_target):.2f}%) | build_status={build_status}')
+            print(
+                f'[{ts}] [FIRESTORE dataset_registry] source_samples={source_samples}/{TARGET_SAMPLES} '
+                f'({_safe_pct(source_samples, int(TARGET_SAMPLES)):.2f}%) | source_files={source_files} '
+                f'| source_status={source_status} | unchanged_s={source_unchanged_seconds}'
+            )
+            print(
+                f'[{ts}] [DRIVE summary + FIRESTORE build] played_games={played_games} '
+                f'| build_samples={build_samples}/{build_target} ({_safe_pct(build_samples, build_target):.2f}%) '
+                f'| build_status={build_status} | unchanged_s={build_unchanged_seconds}'
+            )
             print('-' * 120)
 
             if loop_idx >= (MAX_LOOPS - 1):
@@ -2125,6 +2208,10 @@ cells = [
 
         REFRESH_SECONDS = float(MONITOR_REFRESH_SECONDS)
         MAX_LOOPS = int(MONITOR_MAX_LOOPS)
+        progress_watch: dict[str, dict[str, object]] = {
+            'global': {'signature': None, 'last_change_epoch': time.time()},
+            'build': {'signature': None, 'last_change_epoch': time.time()},
+        }
 
         def _load_json_retry(path: Path, retries: int = 6, wait_seconds: float = 0.25, default=None):
             fallback = {} if default is None else default
@@ -2181,14 +2268,44 @@ cells = [
                     built_total_samples += int(item.get('labeled_samples', 0))
                     built_worker_datasets += 1
 
+            now_epoch = time.time()
+            global_signature = json.dumps(
+                {
+                    'global_total_samples': global_total_samples,
+                    'global_total_games': global_total_games,
+                    'global_workers': global_workers,
+                },
+                sort_keys=True,
+                ensure_ascii=True,
+            )
+            build_signature = json.dumps(
+                {
+                    'built_total_samples': built_total_samples,
+                    'built_worker_datasets': built_worker_datasets,
+                },
+                sort_keys=True,
+                ensure_ascii=True,
+            )
+            for key, signature in [('global', global_signature), ('build', build_signature)]:
+                watched = progress_watch.get(key, {'signature': None, 'last_change_epoch': now_epoch})
+                if signature != watched.get('signature'):
+                    watched = {'signature': signature, 'last_change_epoch': now_epoch}
+                progress_watch[key] = watched
+
+            global_unchanged_seconds = int(max(0.0, now_epoch - float(progress_watch['global']['last_change_epoch'])))
+            build_unchanged_seconds = int(max(0.0, now_epoch - float(progress_watch['build']['last_change_epoch'])))
+
             ts = time.strftime('%Y-%m-%d %H:%M:%S')
             print(
                 f'[{ts}] [FIRESTORE global] generate_samples={global_total_samples}/{global_target_samples} '
                 f'({_safe_pct(global_total_samples, global_target_samples):.2f}%) | '
                 f'global_games={global_total_games} | workers={global_workers} | '
-                f'updated_at={global_payload.get("updated_at", "<none>")}'
+                f'updated_at={global_payload.get("updated_at", "<none>")} | unchanged_s={global_unchanged_seconds}'
             )
-            print(f'[{ts}] [FIRESTORE registry] build_labeled_samples_sum={built_total_samples} | build_worker_datasets={built_worker_datasets}')
+            print(
+                f'[{ts}] [FIRESTORE registry] build_labeled_samples_sum={built_total_samples} '
+                f'| build_worker_datasets={built_worker_datasets} | unchanged_s={build_unchanged_seconds}'
+            )
             print('-' * 120)
 
             if loop_idx >= (MAX_LOOPS - 1):
@@ -2406,6 +2523,15 @@ cells = [
             or delta_build_total < 0
         )
 
+        previous_last_global_change_ts = float(previous.get('last_global_change_ts', prev_ts or current['ts']) or (prev_ts or current['ts']))
+        previous_last_build_change_ts = float(previous.get('last_build_change_ts', prev_ts or current['ts']) or (prev_ts or current['ts']))
+        global_progressed = (delta_global_samples > 0) or (delta_global_games > 0)
+        build_progressed = (delta_build_total > 0)
+        current['last_global_change_ts'] = float(current['ts']) if global_progressed else float(previous_last_global_change_ts)
+        current['last_build_change_ts'] = float(current['ts']) if build_progressed else float(previous_last_build_change_ts)
+        unchanged_global_seconds = int(max(0.0, float(current['ts']) - float(current['last_global_change_ts'])))
+        unchanged_build_seconds = int(max(0.0, float(current['ts']) - float(current['last_build_change_ts'])))
+
         health_state_path.parent.mkdir(parents=True, exist_ok=True)
         health_state_path.write_text(json.dumps(current, indent=2, ensure_ascii=True), encoding='utf-8')
 
@@ -2425,7 +2551,12 @@ cells = [
         print(
             f"HEALTH={health.upper()} | global={current['global_samples']}/{target} ({_safe_pct(current['global_samples'], target):.2f}%) "
             f"| games={current['global_games']} | build_sum={current['build_total']} | workers_active={len(active_rows)} "
-            f"| workers_inactive={len(inactive_rows)} | global_age_s={global_age_display}"
+            f"| workers_inactive={len(inactive_rows)} | global_age_s={global_age_display} "
+            f"| unchanged_global_s={unchanged_global_seconds} | unchanged_build_s={unchanged_build_seconds}"
+        )
+        print(
+            f"HEALTH_TIMERS | global_unchanged_for={_format_duration(unchanged_global_seconds)} "
+            f"| build_unchanged_for={_format_duration(unchanged_build_seconds)}"
         )
         if elapsed > 0:
             print(
@@ -2468,6 +2599,10 @@ cells = [
         REFRESH_SECONDS = float(MONITOR_REFRESH_SECONDS)
         MAX_LOOPS = int(MONITOR_MAX_LOOPS)
         jobs_root = Path(DRIVE_ROOT) / 'jobs'
+        progress_watch: dict[str, dict[str, object]] = {
+            'generate': {'signature': None, 'last_change_epoch': time.time()},
+            'build': {'signature': None, 'last_change_epoch': time.time()},
+        }
 
         def _load_json_retry(path: Path, retries: int = 4, wait_seconds: float = 0.2, default=None):
             fallback = {} if default is None else default
@@ -2511,16 +2646,51 @@ cells = [
             build_state = _load_json_retry(build_dir / 'state.json', default={}) if build_dir else {}
             build_summary = _load_json_retry(build_dir / 'dataset_build' / 'dataset_build_summary.json', default={}) if build_dir else {}
 
+            now_epoch = time.time()
+            generate_signature = json.dumps(
+                {
+                    'status': generate_status.get('status', '<none>'),
+                    'phase': generate_status.get('phase', '<none>'),
+                    'sample_count': generate_state.get('sample_count', '<none>'),
+                    'total_samples_summary': generate_summary.get('total_samples', '<none>'),
+                    'added_games_summary': generate_summary.get('added_games', '<none>'),
+                },
+                sort_keys=True,
+                ensure_ascii=True,
+            )
+            build_signature = json.dumps(
+                {
+                    'status': build_status.get('status', '<none>'),
+                    'phase': build_status.get('phase', '<none>'),
+                    'labeled_samples_state': build_state.get('labeled_samples', '<none>'),
+                    'processed_files_state': build_state.get('processed_files', '<none>'),
+                    'labeled_samples_summary': build_summary.get('labeled_samples', '<none>'),
+                },
+                sort_keys=True,
+                ensure_ascii=True,
+            )
+
+            for key, signature in [('generate', generate_signature), ('build', build_signature)]:
+                watched = progress_watch.get(key, {'signature': None, 'last_change_epoch': now_epoch})
+                if signature != watched.get('signature'):
+                    watched = {'signature': signature, 'last_change_epoch': now_epoch}
+                progress_watch[key] = watched
+
+            generate_unchanged_seconds = int(max(0.0, now_epoch - float(progress_watch['generate']['last_change_epoch'])))
+            build_unchanged_seconds = int(max(0.0, now_epoch - float(progress_watch['build']['last_change_epoch'])))
+
             ts = time.strftime('%Y-%m-%d %H:%M:%S')
             print(
                 f'[{ts}] [DRIVE generate] dir={generate_dir} | status={generate_status.get("status", "<none>")} '
                 f'| phase={generate_status.get("phase", "<none>")} | sample_count={generate_state.get("sample_count", "<none>")} '
-                f'| total_samples_summary={generate_summary.get("total_samples", "<none>")} | added_games_summary={generate_summary.get("added_games", "<none>")}'
+                f'| total_samples_summary={generate_summary.get("total_samples", "<none>")} | added_games_summary={generate_summary.get("added_games", "<none>")} '
+                f'| unchanged_s={generate_unchanged_seconds}'
             )
             print(
                 f'[{ts}] [DRIVE build] dir={build_dir} | status={build_status.get("status", "<none>")} '
                 f'| phase={build_status.get("phase", "<none>")} | labeled_samples_state={build_state.get("labeled_samples", "<none>")} '
-                f'| processed_files_state={build_state.get("processed_files", "<none>")} | labeled_samples_summary={build_summary.get("labeled_samples", "<none>")}'
+                f'| processed_files_state={build_state.get("processed_files", "<none>")} | labeled_samples_summary={build_summary.get("labeled_samples", "<none>")} '
+                f'| unchanged_s={build_unchanged_seconds}'
             )
             print('-' * 120)
 
@@ -2534,6 +2704,23 @@ cells = [
         """
         # Vue Redis cache: snapshot + ecart vs Firestore
         import json
+        import time
+        from datetime import datetime
+
+        def _parse_iso_to_epoch(value: object) -> float:
+            text = str(value or '').strip()
+            if not text:
+                return 0.0
+            try:
+                return float(datetime.fromisoformat(text.replace('Z', '+00:00')).timestamp())
+            except Exception:
+                return 0.0
+
+        def _age_seconds_display(value: object) -> str:
+            ts = _parse_iso_to_epoch(value)
+            if ts <= 0:
+                return 'inf'
+            return str(int(max(0.0, time.time() - ts)))
 
         redis_key = f'{GLOBAL_PROGRESS_REDIS_KEY_PREFIX}:global_progress'
         print('Redis enabled =', bool(GLOBAL_PROGRESS_REDIS_ENABLED))
@@ -2570,7 +2757,9 @@ cells = [
                     print('  target_samples =', int(cache_payload.get('target_samples', GLOBAL_TARGET_SAMPLES)))
                     print('  total_games =', int(cache_payload.get('total_games', 0)))
                     print('  updated_at =', cache_payload.get('updated_at', '<none>'))
+                    print('  updated_age_s =', _age_seconds_display(cache_payload.get('updated_at', '<none>')))
                     print('  redis_cached_at =', cache_payload.get('_redis_cached_at', '<none>'))
+                    print('  redis_cached_age_s =', _age_seconds_display(cache_payload.get('_redis_cached_at', '<none>')))
 
                     firestore_payload = _read_firestore_doc(
                         FIRESTORE_COLLECTION,
@@ -2586,9 +2775,19 @@ cells = [
                         firestore_payload = {}
                     delta_samples = int(cache_payload.get('total_samples', 0)) - int(firestore_payload.get('total_samples', 0))
                     delta_games = int(cache_payload.get('total_games', 0)) - int(firestore_payload.get('total_games', 0))
+                    redis_updated_ts = _parse_iso_to_epoch(cache_payload.get('updated_at', '<none>'))
+                    firestore_updated_ts = _parse_iso_to_epoch(firestore_payload.get('updated_at', '<none>'))
+                    freshness_gap_seconds = (
+                        int(max(0.0, firestore_updated_ts - redis_updated_ts))
+                        if redis_updated_ts > 0 and firestore_updated_ts > 0
+                        else 'n/a'
+                    )
                     print('Ecart Redis - Firestore:')
                     print('  delta_samples =', delta_samples)
                     print('  delta_games   =', delta_games)
+                    print('  firestore_updated_at =', firestore_payload.get('updated_at', '<none>'))
+                    print('  firestore_updated_age_s =', _age_seconds_display(firestore_payload.get('updated_at', '<none>')))
+                    print('  freshness_gap_s (firestore-redis) =', freshness_gap_seconds)
             except Exception as exc:
                 print('Lecture Redis impossible:', f'{type(exc).__name__}: {exc}')
         """
