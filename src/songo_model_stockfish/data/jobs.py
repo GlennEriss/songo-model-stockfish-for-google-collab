@@ -3719,7 +3719,7 @@ def _augment_matchups_with_benchmark_review(
             "summary_path": str(summary_path) if summary_path is not None else "",
         }
 
-    payload = _read_json(summary_path)
+    payload = _read_json_file(summary_path, default={})
     matchups_payload = payload.get("matchups", [])
     if not isinstance(matchups_payload, list) or not matchups_payload:
         return list(base_matchups), {
@@ -3885,7 +3885,7 @@ def _augment_matchups_with_tournament_review(
             "summary_path": str(summary_path) if summary_path is not None else "",
         }
 
-    payload = _read_json(summary_path)
+    payload = _read_json_file(summary_path, default={})
     if not isinstance(payload, dict):
         return list(base_matchups), {
             "enabled": True,
