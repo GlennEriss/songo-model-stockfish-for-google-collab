@@ -3011,15 +3011,23 @@ cells = [
     md("### 5bis.B2 Suivi Local Delta (avant sync global)"),
     code(
         """
-        # Source de verite locale (runtime jobs) avec deltas
+        # Source de verite locale (runtime jobs) avec deltas + suivi fusions progressives
         import json
         import time
+        from glob import glob
         from datetime import datetime, timezone
         from pathlib import Path
 
         REFRESH_S = 5
         LOOPS = int(MONITOR_MAX_LOOPS)
         ROOT = Path(JOBS_ROOT)
+        PIPELINE_DIR = Path(PIPELINE_LOGS_DIR)
+        GLOBAL_DATASET_ID = str(
+            globals().get(
+                'PROGRESSIVE_GLOBAL_MERGE_DATASET_ID',
+                globals().get('BASE_DATASET_BUILD_ID', globals().get('DATASET_BUILD_ID', '')),
+            )
+        ).strip()
 
         def _read_json_local(path: Path) -> dict:
             try:
@@ -3040,40 +3048,160 @@ cells = [
             except Exception:
                 return None
 
-        def _latest_job_dir_local(job_id: str) -> Path | None:
-            if not ROOT.exists():
-                return None
-            requested = str(job_id).strip()
-            if not requested:
-                return None
-            parts = requested.rsplit('_', 1)
-            prefix = parts[0] if len(parts) == 2 and parts[1].isdigit() else requested
-            candidates = []
-            for path in ROOT.iterdir():
-                if not path.is_dir():
+        def _coalesce_int(*values):
+            for value in values:
+                if value is None:
                     continue
-                name = path.name
-                if name == requested or name == prefix or (prefix and name.startswith(prefix + '_')):
-                    candidates.append(path)
+                text = str(value).strip()
+                if not text or text.lower() == 'none':
+                    continue
+                try:
+                    return int(float(text))
+                except Exception:
+                    continue
+            return None
+
+        def _fmt(v):
+            return '<none>' if v is None else str(v)
+
+        def _resolve_latest_manifest_path() -> Path | None:
+            candidates = []
+            local_manifest = Path(str(globals().get('PIPELINE_MANIFEST_PATH', '')).strip()) if str(globals().get('PIPELINE_MANIFEST_PATH', '')).strip() else None
+            if local_manifest and local_manifest.exists():
+                candidates.append(local_manifest)
+            try:
+                for path_str in glob(str(PIPELINE_DIR / 'latest_dataset_pipeline_*.json')):
+                    p = Path(path_str)
+                    if p.exists():
+                        candidates.append(p)
+            except Exception:
+                pass
             if not candidates:
                 return None
             return sorted(candidates, key=lambda p: p.stat().st_mtime)[-1]
 
-        prev = None
-        for idx in range(1, LOOPS + 1):
-            gen_dir = _latest_job_dir_local(DATASET_GENERATE_JOB_ID)
-            bld_dir = _latest_job_dir_local(DATASET_BUILD_JOB_ID)
+        def _resolve_job_ids():
+            manifest_path = _resolve_latest_manifest_path()
+            if manifest_path is not None:
+                manifest_payload = _read_json_local(manifest_path)
+                gen_id = str(manifest_payload.get('generate_job_id', '')).strip()
+                bld_id = str(manifest_payload.get('build_job_id', '')).strip()
+                if gen_id and bld_id:
+                    return gen_id, bld_id, manifest_path
+            return str(DATASET_GENERATE_JOB_ID), str(DATASET_BUILD_JOB_ID), None
 
+        def _load_dataset_registry_payload_local() -> dict:
+            if '_load_dataset_registry_payload' in globals():
+                try:
+                    payload = _load_dataset_registry_payload()
+                    if isinstance(payload, dict):
+                        payload.setdefault('dataset_sources', [])
+                        payload.setdefault('built_datasets', [])
+                        return payload
+                except Exception:
+                    pass
+            if '_read_firestore_doc' in globals():
+                try:
+                    payload = _read_firestore_doc(
+                        FIRESTORE_DATASET_REGISTRY_COLLECTION,
+                        FIRESTORE_DATASET_REGISTRY_DOCUMENT,
+                        default={'dataset_sources': [], 'built_datasets': []},
+                    )
+                    if isinstance(payload, dict):
+                        payload.setdefault('dataset_sources', [])
+                        payload.setdefault('built_datasets', [])
+                        return payload
+                except Exception:
+                    pass
+            return {'dataset_sources': [], 'built_datasets': []}
+
+        def _global_dataset_snapshot(dataset_id: str) -> dict:
+            if not dataset_id:
+                return {'labeled_samples': None, 'updated_at': None, 'build_status': None}
+            registry = _load_dataset_registry_payload_local()
+            for entry in registry.get('built_datasets', []):
+                if not isinstance(entry, dict):
+                    continue
+                if str(entry.get('dataset_id', '')).strip() != dataset_id:
+                    continue
+                return {
+                    'labeled_samples': _coalesce_int(entry.get('labeled_samples')),
+                    'updated_at': str(entry.get('updated_at', '')).strip() or None,
+                    'build_status': str(entry.get('build_status', '')).strip() or None,
+                }
+            return {'labeled_samples': None, 'updated_at': None, 'build_status': None}
+
+        def _load_merge_events(events_path: Path) -> tuple[list[dict], list[dict]]:
+            completed = []
+            failed = []
+            if not events_path.exists():
+                return completed, failed
+            try:
+                with events_path.open('r', encoding='utf-8') as handle:
+                    for line in handle:
+                        text = str(line).strip()
+                        if not text:
+                            continue
+                        try:
+                            payload = json.loads(text)
+                        except Exception:
+                            continue
+                        if not isinstance(payload, dict):
+                            continue
+                        message = str(payload.get('message', '')).strip()
+                        if message == 'dataset_build_progressive_global_merge_completed':
+                            completed.append(
+                                {
+                                    'timestamp': str(payload.get('timestamp', '')).strip() or None,
+                                    'trigger': str(payload.get('trigger', '')).strip() or None,
+                                    'target_dataset_id': str(payload.get('target_dataset_id', '')).strip() or None,
+                                    'source_dataset_count': _coalesce_int(payload.get('source_dataset_count')),
+                                    'labeled_samples_after': _coalesce_int(payload.get('labeled_samples')),
+                                }
+                            )
+                        elif message == 'dataset_build_progressive_global_merge_failed':
+                            failed.append(
+                                {
+                                    'timestamp': str(payload.get('timestamp', '')).strip() or None,
+                                    'trigger': str(payload.get('trigger', '')).strip() or None,
+                                    'error': str(payload.get('error', '')).strip() or None,
+                                }
+                            )
+            except Exception:
+                return completed, failed
+            return completed, failed
+
+        generate_job_id, build_job_id, manifest_path = _resolve_job_ids()
+        print('manifest =', str(manifest_path) if manifest_path is not None else '<none>')
+        print('generate_job_id =', generate_job_id)
+        print('build_job_id    =', build_job_id)
+        print('global_dataset_id =', GLOBAL_DATASET_ID or '<none>')
+
+        gen_dir = ROOT / generate_job_id
+        bld_dir = ROOT / build_job_id
+        if not gen_dir.exists():
+            gen_dir = None
+        if not bld_dir.exists():
+            bld_dir = None
+
+        prev = None
+        prev_global_labeled = None
+        merge_count_seen = None
+        merge_after_seen = None
+
+        for idx in range(1, LOOPS + 1):
             g_run = _read_json_local(gen_dir / 'run_status.json') if gen_dir else {}
             g_st = _read_json_local(gen_dir / 'state.json') if gen_dir else {}
+            g_sum = _read_json_local(gen_dir / 'dataset_generation' / 'dataset_generation_summary.json') if gen_dir else {}
             b_run = _read_json_local(bld_dir / 'run_status.json') if bld_dir else {}
             b_st = _read_json_local(bld_dir / 'state.json') if bld_dir else {}
+            b_sum = _read_json_local(bld_dir / 'dataset_build' / 'dataset_build_summary.json') if bld_dir else {}
 
             local = {
-                'gen_samples': g_run.get('sample_count') or g_st.get('sample_count') or g_st.get('total_samples'),
-                'gen_games': g_run.get('games_count') or g_st.get('added_games') or g_st.get('games_count'),
-                'build_labeled': b_st.get('labeled_samples') or b_run.get('labeled_samples'),
-                'build_files': b_st.get('processed_files'),
+                'gen_samples': _coalesce_int(g_run.get('sample_count'), g_st.get('sample_count'), g_st.get('total_samples'), g_sum.get('total_samples')),
+                'gen_games': _coalesce_int(g_run.get('games_count'), g_st.get('added_games'), g_st.get('games_count'), g_sum.get('added_games')),
+                'build_labeled': _coalesce_int(b_st.get('labeled_samples'), b_run.get('labeled_samples'), b_sum.get('labeled_samples')),
+                'build_files': _coalesce_int(b_st.get('processed_files')),
                 'gen_updated_age_s': _age_seconds(g_run.get('updated_at')),
                 'build_updated_age_s': _age_seconds(b_run.get('updated_at')),
             }
@@ -3087,15 +3215,76 @@ cells = [
                 delta_games = int((local['gen_games'] or 0) - (prev['gen_games'] or 0))
                 delta_build = int((local['build_labeled'] or 0) - (prev['build_labeled'] or 0))
 
+            build_rate_per_min = None
+            if delta_build is not None and REFRESH_S > 0:
+                build_rate_per_min = int(round((delta_build / float(REFRESH_S)) * 60.0))
+
+            global_snapshot = _global_dataset_snapshot(GLOBAL_DATASET_ID)
+            global_labeled = _coalesce_int(global_snapshot.get('labeled_samples'))
+            delta_global_labeled = (
+                None if prev_global_labeled is None else int((global_labeled or 0) - (prev_global_labeled or 0))
+            )
+            prev_global_labeled = global_labeled
+
+            events_path = (bld_dir / 'events.jsonl') if bld_dir else Path('')
+            merge_events, merge_failed_events = _load_merge_events(events_path) if bld_dir else ([], [])
+            merge_count = len(merge_events)
+            failed_count = len(merge_failed_events)
+
+            if merge_count_seen is None:
+                merge_count_seen = merge_count
+                if merge_events:
+                    merge_after_seen = merge_events[-1].get('labeled_samples_after')
+                else:
+                    merge_after_seen = global_labeled
+
             ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             print(
                 f'[{ts}] [{idx:03d}] '
-                f'gen_samples={local["gen_samples"]} (Δ{delta_samples}) | '
-                f'gen_games={local["gen_games"]} (Δ{delta_games}) | '
-                f'build_labeled={local["build_labeled"]} (Δ{delta_build}) | '
-                f'build_files={local["build_files"]} | '
-                f'age_gen={local["gen_updated_age_s"]}s | age_build={local["build_updated_age_s"]}s'
+                f'gen_samples={_fmt(local["gen_samples"])} (Δ{_fmt(delta_samples)}) | '
+                f'gen_games={_fmt(local["gen_games"])} (Δ{_fmt(delta_games)}) | '
+                f'build_labeled={_fmt(local["build_labeled"])} (Δ{_fmt(delta_build)}) | '
+                f'build_files={_fmt(local["build_files"])} | '
+                f'build_rate/min={_fmt(build_rate_per_min)} | '
+                f'age_gen={_fmt(local["gen_updated_age_s"])}s age_build={_fmt(local["build_updated_age_s"])}s'
             )
+            print(
+                f'      global_dataset={GLOBAL_DATASET_ID or "<none>"} | '
+                f'global_labeled={_fmt(global_labeled)} (Δ{_fmt(delta_global_labeled)}) | '
+                f'global_build_status={_fmt(global_snapshot.get("build_status"))} | '
+                f'global_updated_at={_fmt(global_snapshot.get("updated_at"))}'
+            )
+            print(
+                f'      merges_completed={merge_count} | merges_failed={failed_count} | '
+                f'events_path={str(events_path) if bld_dir else "<none>"}'
+            )
+
+            if merge_count > (merge_count_seen or 0):
+                start_index = int(merge_count_seen or 0)
+                for merge_idx in range(start_index, merge_count):
+                    event = merge_events[merge_idx]
+                    after_value = _coalesce_int(event.get('labeled_samples_after'))
+                    before_value = merge_after_seen
+                    delta_value = None
+                    if before_value is not None and after_value is not None:
+                        delta_value = int(after_value - before_value)
+                    print(
+                        f'      MERGE #{merge_idx + 1} | ts={_fmt(event.get("timestamp"))} | trigger={_fmt(event.get("trigger"))} | '
+                        f'sources={_fmt(event.get("source_dataset_count"))} | global_before={_fmt(before_value)} -> global_after={_fmt(after_value)} | '
+                        f'Δ={_fmt(delta_value)}'
+                    )
+                    if after_value is not None:
+                        merge_after_seen = after_value
+                merge_count_seen = merge_count
+
+            if merge_events:
+                last_merge = merge_events[-1]
+                before_last = merge_events[-2].get('labeled_samples_after') if len(merge_events) >= 2 else None
+                print(
+                    f'      last_merge | ts={_fmt(last_merge.get("timestamp"))} | trigger={_fmt(last_merge.get("trigger"))} | '
+                    f'global_before={_fmt(_coalesce_int(before_last))} -> global_after={_fmt(last_merge.get("labeled_samples_after"))}'
+                )
+
             prev = local
             if idx >= LOOPS:
                 break
