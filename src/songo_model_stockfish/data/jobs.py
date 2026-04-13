@@ -1778,6 +1778,32 @@ def _register_built_dataset(
         "updated_at": utc_now_iso(),
     }
     def _upsert_built(registry: dict[str, Any]) -> None:
+        existing_entry: dict[str, Any] | None = None
+        for entry in registry.get("built_datasets", []):
+            if str(entry.get("dataset_id", "")) == dataset_id:
+                existing_entry = entry if isinstance(entry, dict) else None
+                break
+        # Keep built counters monotonic across restarts/checkpoints to avoid
+        # temporary regressions in monitoring views.
+        if existing_entry is not None:
+            existing_labeled = int(existing_entry.get("labeled_samples", 0) or 0)
+            payload_labeled = int(payload.get("labeled_samples", 0) or 0)
+            if payload_labeled < existing_labeled:
+                payload["labeled_samples"] = existing_labeled
+                # If we keep older labeled count, keep its split snapshot too.
+                if isinstance(existing_entry.get("splits"), dict):
+                    payload["splits"] = existing_entry.get("splits")
+            payload["target_labeled_samples"] = max(
+                int(payload.get("target_labeled_samples", 0) or 0),
+                int(existing_entry.get("target_labeled_samples", 0) or 0),
+            )
+            payload["duplicate_samples_removed"] = max(
+                int(payload.get("duplicate_samples_removed", 0) or 0),
+                int(existing_entry.get("duplicate_samples_removed", 0) or 0),
+            )
+            # Never downgrade a completed build back to partial.
+            if str(existing_entry.get("build_status", "")).strip() == "completed":
+                payload["build_status"] = "completed"
         _upsert_registry_entry(
             registry["built_datasets"],
             key="dataset_id",

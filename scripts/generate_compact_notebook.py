@@ -3824,10 +3824,38 @@ cells = [
             model_id = str(train_summary.get('model_id', '')).strip()
             checkpoint_path = str(train_summary.get('final_model_path', '')).strip()
             checkpoint = Path(checkpoint_path) if checkpoint_path else None
+            if (not dataset_id or not model_id) and train_job_dir is not None:
+                run_status = _load_json_dict(train_job_dir / 'run_status.json', default={})
+                if not dataset_id:
+                    dataset_id = str(run_status.get('dataset_id', '')).strip()
+                if not model_id:
+                    model_id = str(run_status.get('model_id', '')).strip()
+                if (checkpoint is None or not checkpoint.exists()) and not checkpoint_path:
+                    alt_checkpoint_path = str(run_status.get('checkpoint_path', '')).strip()
+                    checkpoint = Path(alt_checkpoint_path) if alt_checkpoint_path else None
             if (checkpoint is None or not checkpoint.exists()) and model_id:
                 fallback = Path(DRIVE_ROOT) / 'models' / 'final' / f'{model_id}.pt'
                 if fallback.exists():
                     checkpoint = fallback
+            if not dataset_id:
+                datasets_registry = _load_json_dict(
+                    Path(DRIVE_ROOT) / 'data' / 'datasets' / 'dataset_registry.json',
+                    default={},
+                )
+                built_entries = datasets_registry.get('built_datasets', []) if isinstance(datasets_registry, dict) else []
+                best_entry = {}
+                if isinstance(built_entries, list) and built_entries:
+                    def _samples(entry: dict) -> int:
+                        try:
+                            return int(entry.get('labeled_samples') or entry.get('sample_count') or 0)
+                        except Exception:
+                            return 0
+                    best_entry = max(
+                        [entry for entry in built_entries if isinstance(entry, dict)],
+                        key=_samples,
+                        default={},
+                    )
+                dataset_id = str(best_entry.get('dataset_id', '')).strip()
             if not dataset_id:
                 raise ValueError(
                     f'dataset_id absent dans training_summary pour job_id={job_id} (job_dir={train_job_dir})'
@@ -4002,10 +4030,38 @@ cells = [
                 model_id = str(train_summary.get('model_id', '')).strip()
                 checkpoint_path = str(train_summary.get('final_model_path', '')).strip()
                 checkpoint = Path(checkpoint_path) if checkpoint_path else None
+                if (not dataset_id or not model_id) and train_job_dir is not None:
+                    run_status = _load_json_dict(train_job_dir / 'run_status.json', default={})
+                    if not dataset_id:
+                        dataset_id = str(run_status.get('dataset_id', '')).strip()
+                    if not model_id:
+                        model_id = str(run_status.get('model_id', '')).strip()
+                    if (checkpoint is None or not checkpoint.exists()) and not checkpoint_path:
+                        alt_checkpoint_path = str(run_status.get('checkpoint_path', '')).strip()
+                        checkpoint = Path(alt_checkpoint_path) if alt_checkpoint_path else None
                 if (checkpoint is None or not checkpoint.exists()) and model_id:
                     fallback = Path(DRIVE_ROOT) / 'models' / 'final' / f'{model_id}.pt'
                     if fallback.exists():
                         checkpoint = fallback
+                if not dataset_id:
+                    datasets_registry = _load_json_dict(
+                        Path(DRIVE_ROOT) / 'data' / 'datasets' / 'dataset_registry.json',
+                        default={},
+                    )
+                    built_entries = datasets_registry.get('built_datasets', []) if isinstance(datasets_registry, dict) else []
+                    best_entry = {}
+                    if isinstance(built_entries, list) and built_entries:
+                        def _samples(entry: dict) -> int:
+                            try:
+                                return int(entry.get('labeled_samples') or entry.get('sample_count') or 0)
+                            except Exception:
+                                return 0
+                        best_entry = max(
+                            [entry for entry in built_entries if isinstance(entry, dict)],
+                            key=_samples,
+                            default={},
+                        )
+                    dataset_id = str(best_entry.get('dataset_id', '')).strip()
                 if not dataset_id:
                     raise ValueError(
                         f'dataset_id absent dans training_summary pour job_id={job_id} (job_dir={train_job_dir})'
@@ -4129,10 +4185,38 @@ cells = [
                 model_id = str(train_summary.get('model_id', '')).strip()
                 checkpoint_path = str(train_summary.get('final_model_path', '')).strip()
                 checkpoint = Path(checkpoint_path) if checkpoint_path else None
+                if (not dataset_id or not model_id) and train_job_dir is not None:
+                    run_status = _load_json_dict(train_job_dir / 'run_status.json', default={})
+                    if not dataset_id:
+                        dataset_id = str(run_status.get('dataset_id', '')).strip()
+                    if not model_id:
+                        model_id = str(run_status.get('model_id', '')).strip()
+                    if (checkpoint is None or not checkpoint.exists()) and not checkpoint_path:
+                        alt_checkpoint_path = str(run_status.get('checkpoint_path', '')).strip()
+                        checkpoint = Path(alt_checkpoint_path) if alt_checkpoint_path else None
                 if (checkpoint is None or not checkpoint.exists()) and model_id:
                     fallback = Path(DRIVE_ROOT) / 'models' / 'final' / f'{model_id}.pt'
                     if fallback.exists():
                         checkpoint = fallback
+                if not dataset_id:
+                    datasets_registry = _load_json_dict(
+                        Path(DRIVE_ROOT) / 'data' / 'datasets' / 'dataset_registry.json',
+                        default={},
+                    )
+                    built_entries = datasets_registry.get('built_datasets', []) if isinstance(datasets_registry, dict) else []
+                    best_entry = {}
+                    if isinstance(built_entries, list) and built_entries:
+                        def _samples(entry: dict) -> int:
+                            try:
+                                return int(entry.get('labeled_samples') or entry.get('sample_count') or 0)
+                            except Exception:
+                                return 0
+                        best_entry = max(
+                            [entry for entry in built_entries if isinstance(entry, dict)],
+                            key=_samples,
+                            default={},
+                        )
+                    dataset_id = str(best_entry.get('dataset_id', '')).strip()
                 if not dataset_id:
                     raise ValueError(
                         f'dataset_id absent dans training_summary pour job_id={job_id} (job_dir={train_job_dir})'
