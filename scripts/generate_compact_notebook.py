@@ -2979,6 +2979,100 @@ cells = [
             time.sleep(REFRESH_SECONDS)
         """
     ),
+    md("### 5bis.B2 Suivi Local Delta (avant sync global)"),
+    code(
+        """
+        # Source de verite locale (runtime jobs) avec deltas
+        import json
+        import time
+        from datetime import datetime, timezone
+        from pathlib import Path
+
+        REFRESH_S = 5
+        LOOPS = int(MONITOR_MAX_LOOPS)
+        ROOT = Path(JOBS_ROOT)
+
+        def _read_json_local(path: Path) -> dict:
+            try:
+                if not path.exists():
+                    return {}
+                payload = json.loads(path.read_text(encoding='utf-8'))
+                return payload if isinstance(payload, dict) else {}
+            except Exception:
+                return {}
+
+        def _age_seconds(ts: object):
+            text = str(ts or '').strip()
+            if not text:
+                return None
+            try:
+                dt = datetime.fromisoformat(text.replace('Z', '+00:00'))
+                return int((datetime.now(timezone.utc) - dt).total_seconds())
+            except Exception:
+                return None
+
+        def _latest_job_dir_local(job_id: str) -> Path | None:
+            if not ROOT.exists():
+                return None
+            requested = str(job_id).strip()
+            if not requested:
+                return None
+            parts = requested.rsplit('_', 1)
+            prefix = parts[0] if len(parts) == 2 and parts[1].isdigit() else requested
+            candidates = []
+            for path in ROOT.iterdir():
+                if not path.is_dir():
+                    continue
+                name = path.name
+                if name == requested or name == prefix or (prefix and name.startswith(prefix + '_')):
+                    candidates.append(path)
+            if not candidates:
+                return None
+            return sorted(candidates, key=lambda p: p.stat().st_mtime)[-1]
+
+        prev = None
+        for idx in range(1, LOOPS + 1):
+            gen_dir = _latest_job_dir_local(DATASET_GENERATE_JOB_ID)
+            bld_dir = _latest_job_dir_local(DATASET_BUILD_JOB_ID)
+
+            g_run = _read_json_local(gen_dir / 'run_status.json') if gen_dir else {}
+            g_st = _read_json_local(gen_dir / 'state.json') if gen_dir else {}
+            b_run = _read_json_local(bld_dir / 'run_status.json') if bld_dir else {}
+            b_st = _read_json_local(bld_dir / 'state.json') if bld_dir else {}
+
+            local = {
+                'gen_samples': g_run.get('sample_count') or g_st.get('sample_count') or g_st.get('total_samples'),
+                'gen_games': g_run.get('games_count') or g_st.get('added_games') or g_st.get('games_count'),
+                'build_labeled': b_st.get('labeled_samples') or b_run.get('labeled_samples'),
+                'build_files': b_st.get('processed_files'),
+                'gen_updated_age_s': _age_seconds(g_run.get('updated_at')),
+                'build_updated_age_s': _age_seconds(b_run.get('updated_at')),
+            }
+
+            if prev is None:
+                delta_samples = None
+                delta_games = None
+                delta_build = None
+            else:
+                delta_samples = int((local['gen_samples'] or 0) - (prev['gen_samples'] or 0))
+                delta_games = int((local['gen_games'] or 0) - (prev['gen_games'] or 0))
+                delta_build = int((local['build_labeled'] or 0) - (prev['build_labeled'] or 0))
+
+            ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            print(
+                f'[{ts}] [{idx:03d}] '
+                f'gen_samples={local["gen_samples"]} (Δ{delta_samples}) | '
+                f'gen_games={local["gen_games"]} (Δ{delta_games}) | '
+                f'build_labeled={local["build_labeled"]} (Δ{delta_build}) | '
+                f'build_files={local["build_files"]} | '
+                f'age_gen={local["gen_updated_age_s"]}s | age_build={local["build_updated_age_s"]}s'
+            )
+            prev = local
+            if idx >= LOOPS:
+                break
+            time.sleep(REFRESH_S)
+        """
+    ),
     md("### 5bis.C Suivi Redis (cache de progression globale)"),
     code(
         """
