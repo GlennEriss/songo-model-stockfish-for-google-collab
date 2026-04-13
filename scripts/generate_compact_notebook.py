@@ -2315,13 +2315,16 @@ cells = [
     ),
     code(
         """
-        # Workers status (Firestore direct): actif/inactif (vision globale multi-Colab)
+        # Workers status (Firestore direct): heartbeat + progression reelle (vision globale multi-Colab)
         import json
         import time
         from datetime import datetime
         from pathlib import Path
 
-        ACTIVE_THRESHOLD_SECONDS = 600
+        HEARTBEAT_ACTIVE_SECONDS = 600
+        HEARTBEAT_STALE_SECONDS = 1800
+        PROGRESS_STALL_SECONDS = 900
+        snapshot_path = Path(DRIVE_ROOT) / 'logs' / 'pipeline' / f'workers_status_snapshot_{GLOBAL_TARGET_ID}_{WORKER_TAG}.json'
 
         def _load_json_retry(path: Path, retries: int = 6, wait_seconds: float = 0.25, default=None):
             fallback = {} if default is None else default
@@ -2349,6 +2352,17 @@ cells = [
             except Exception:
                 return 0.0
 
+        def _format_duration(seconds: float) -> str:
+            total = max(0, int(seconds))
+            hours = total // 3600
+            minutes = (total % 3600) // 60
+            secs = total % 60
+            if hours > 0:
+                return f'{hours}h {minutes:02d}m {secs:02d}s'
+            if minutes > 0:
+                return f'{minutes}m {secs:02d}s'
+            return f'{secs}s'
+
         payload = _read_firestore_doc(
             FIRESTORE_COLLECTION,
             FIRESTORE_DOCUMENT,
@@ -2367,42 +2381,175 @@ cells = [
         if not isinstance(workers, dict) or not workers:
             print('Aucun worker global enregistre')
         else:
+            prev_snapshot = _load_json_retry(snapshot_path, default={'workers': {}})
+            if not isinstance(prev_snapshot, dict):
+                prev_snapshot = {'workers': {}}
+            prev_workers = prev_snapshot.get('workers', {})
+            if not isinstance(prev_workers, dict):
+                prev_workers = {}
+
+            registry = _load_dataset_registry_payload()
+            source_entries = {}
+            for item in registry.get('dataset_sources', []):
+                if not isinstance(item, dict):
+                    continue
+                source_id = str(item.get('dataset_source_id', '')).strip()
+                if not source_id:
+                    continue
+                current_updated_ts = _parse_iso_to_epoch(item.get('updated_at', ''))
+                existing = source_entries.get(source_id)
+                if existing is None:
+                    source_entries[source_id] = item
+                else:
+                    existing_ts = _parse_iso_to_epoch(existing.get('updated_at', ''))
+                    if current_updated_ts >= existing_ts:
+                        source_entries[source_id] = item
+
             now_ts = time.time()
             rows = []
+            next_workers_snapshot = {}
+
+            source_prefix = f'{BASE_DATASET_SOURCE_ID}_'
             for worker_job_id, info in workers.items():
                 if not isinstance(info, dict):
                     continue
                 updated_at = str(info.get('updated_at', ''))
                 updated_ts = _parse_iso_to_epoch(updated_at)
                 age_seconds = (now_ts - updated_ts) if updated_ts > 0 else float('inf')
-                status = 'active' if age_seconds <= ACTIVE_THRESHOLD_SECONDS else 'inactive'
+                source_id = str(info.get('dataset_source_id', '')).strip()
+                source_entry = source_entries.get(source_id, {})
+                source_samples = int(source_entry.get('sampled_positions', 0)) if isinstance(source_entry, dict) else 0
+                source_status = str(source_entry.get('source_status', '<none>')) if isinstance(source_entry, dict) else '<none>'
+                source_updated_at = str(source_entry.get('updated_at', '<none>')) if isinstance(source_entry, dict) else '<none>'
+                source_updated_ts = _parse_iso_to_epoch(source_updated_at)
+                source_age_seconds = (now_ts - source_updated_ts) if source_updated_ts > 0 else float('inf')
+
+                prev = prev_workers.get(worker_job_id, {})
+                if not isinstance(prev, dict):
+                    prev = {}
+                prev_samples = int(prev.get('contributed_samples', info.get('contributed_samples', 0)) or 0)
+                prev_games = int(prev.get('contributed_games', info.get('contributed_games', 0)) or 0)
+                prev_source_samples = int(prev.get('source_samples', source_samples) or source_samples)
+                current_samples = int(info.get('contributed_samples', 0))
+                current_games = int(info.get('contributed_games', 0))
+                delta_samples = int(current_samples - prev_samples)
+                delta_games = int(current_games - prev_games)
+                delta_source_samples = int(source_samples - prev_source_samples)
+                has_prev = bool(prev)
+
+                progressed = (
+                    (delta_samples > 0)
+                    or (delta_games > 0)
+                    or (delta_source_samples > 0)
+                )
+                default_progress_ts = float(updated_ts if updated_ts > 0 else now_ts)
+                last_progress_ts = float(prev.get('last_progress_ts', default_progress_ts) or default_progress_ts)
+                if progressed:
+                    last_progress_ts = now_ts
+                no_progress_seconds = max(0.0, now_ts - last_progress_ts)
+
+                if age_seconds == float('inf'):
+                    status = 'unknown'
+                elif age_seconds <= HEARTBEAT_ACTIVE_SECONDS:
+                    if no_progress_seconds > PROGRESS_STALL_SECONDS:
+                        status = 'stalled'
+                    elif progressed:
+                        status = 'active_progress'
+                    else:
+                        status = 'active_no_progress'
+                elif age_seconds <= HEARTBEAT_STALE_SECONDS:
+                    status = 'stale'
+                else:
+                    status = 'inactive'
+
+                worker_tag_guess = ''
+                if source_id.startswith(source_prefix):
+                    worker_tag_guess = source_id[len(source_prefix):].strip()
+
                 rows.append(
                     {
                         'status': status,
                         'age_seconds': age_seconds,
+                        'no_progress_seconds': no_progress_seconds,
                         'worker_job_id': worker_job_id,
-                        'dataset_source_id': str(info.get('dataset_source_id', '')),
-                        'contributed_samples': int(info.get('contributed_samples', 0)),
-                        'contributed_games': int(info.get('contributed_games', 0)),
+                        'dataset_source_id': source_id,
+                        'worker_tag_guess': worker_tag_guess or '<unknown>',
+                        'contributed_samples': current_samples,
+                        'contributed_games': current_games,
+                        'delta_samples': delta_samples,
+                        'delta_games': delta_games,
+                        'delta_source_samples': delta_source_samples,
+                        'source_samples': source_samples,
+                        'source_status': source_status,
+                        'source_age_seconds': source_age_seconds,
                         'updated_at': updated_at or '<none>',
+                        'source_updated_at': source_updated_at or '<none>',
+                        'has_prev': has_prev,
                     }
                 )
+                next_workers_snapshot[worker_job_id] = {
+                    'contributed_samples': current_samples,
+                    'contributed_games': current_games,
+                    'source_samples': int(source_samples),
+                    'last_progress_ts': float(last_progress_ts),
+                    'last_seen_ts': float(now_ts),
+                    'updated_at': updated_at or '<none>',
+                }
 
-            rows.sort(key=lambda row: (0 if row['status'] == 'active' else 1, row['age_seconds']))
+            priority = {
+                'active_progress': 0,
+                'active_no_progress': 1,
+                'stalled': 2,
+                'stale': 3,
+                'inactive': 4,
+                'unknown': 5,
+            }
+            rows.sort(key=lambda row: (priority.get(str(row.get('status')), 9), row['age_seconds']))
 
-            active_count = sum(1 for row in rows if row['status'] == 'active')
-            inactive_count = len(rows) - active_count
+            status_counts = {name: 0 for name in ['active_progress', 'active_no_progress', 'stalled', 'stale', 'inactive', 'unknown']}
+            for row in rows:
+                key = str(row.get('status', 'unknown'))
+                status_counts[key] = int(status_counts.get(key, 0)) + 1
+
+            snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+            snapshot_payload = {
+                'updated_at': datetime.utcnow().isoformat() + 'Z',
+                'workers': next_workers_snapshot,
+            }
+            snapshot_path.write_text(json.dumps(snapshot_payload, indent=2, ensure_ascii=True), encoding='utf-8')
+
+            print('Workers status strategy = heartbeat + delta progress + dataset_registry cross-check')
             print(
-                f'[FIRESTORE global] Workers: total={len(rows)} | active={active_count} | inactive={inactive_count} '
-                f'| active_threshold_seconds={ACTIVE_THRESHOLD_SECONDS}'
+                f"[FIRESTORE global] Workers: total={len(rows)} "
+                f"| active_progress={status_counts.get('active_progress', 0)} "
+                f"| active_no_progress={status_counts.get('active_no_progress', 0)} "
+                f"| stalled={status_counts.get('stalled', 0)} "
+                f"| stale={status_counts.get('stale', 0)} "
+                f"| inactive={status_counts.get('inactive', 0)} "
+                f"| unknown={status_counts.get('unknown', 0)}"
+            )
+            print(
+                f'thresholds: heartbeat_active_s={HEARTBEAT_ACTIVE_SECONDS} '
+                f'| heartbeat_stale_s={HEARTBEAT_STALE_SECONDS} | progress_stall_s={PROGRESS_STALL_SECONDS}'
             )
             for row in rows:
                 age_display = 'inf' if row['age_seconds'] == float('inf') else str(int(row['age_seconds']))
+                source_age_display = 'inf' if row['source_age_seconds'] == float('inf') else str(int(row['source_age_seconds']))
+                delta_samples_display = str(row['delta_samples']) if row.get('has_prev') else 'n/a'
+                delta_games_display = str(row['delta_games']) if row.get('has_prev') else 'n/a'
+                delta_source_display = str(row['delta_source_samples']) if row.get('has_prev') else 'n/a'
                 print(
-                    f"- status={row['status']:8s} | age_s={age_display:>5s} | "
-                    f"job={row['worker_job_id']} | source={row['dataset_source_id']} | "
+                    f"- status={row['status']:17s} | worker={row['worker_tag_guess']:>12s} | "
+                    f"heartbeat_age={_format_duration(row['age_seconds']) if row['age_seconds'] != float('inf') else 'inf'} "
+                    f"({age_display}s) | no_progress_for={_format_duration(row['no_progress_seconds'])} "
+                    f"| d_samples={delta_samples_display:>6s} | d_games={delta_games_display:>6s} "
+                    f"| d_source={delta_source_display:>6s}"
+                )
+                print(
+                    f"  job={row['worker_job_id']} | source={row['dataset_source_id']} | "
                     f"samples={row['contributed_samples']} | games={row['contributed_games']} | "
-                    f"updated_at={row['updated_at']}"
+                    f"source_samples={row['source_samples']} | source_status={row['source_status']} "
+                    f"| source_age_s={source_age_display} | updated_at={row['updated_at']} | source_updated_at={row['source_updated_at']}"
                 )
         """
     ),
