@@ -557,6 +557,8 @@ class JobContext:
                 return
         self._firestore_sync_stats["attempted"] = int(self._firestore_sync_stats.get("attempted", 0)) + 1
         try:
+            from google.cloud import firestore
+
             client = _build_firestore_job_client(
                 project_id=str(sync.get("project_id", "")).strip(),
                 credentials_path=str(sync.get("credentials_path", "")).strip(),
