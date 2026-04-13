@@ -271,6 +271,9 @@ cells = [
         PIPELINE_MANIFEST_FIRESTORE_WRITE_ENABLED = True
         RUNTIME_STATE_MODE = 'local'  # 'local' (recommande) | 'drive'
         RUNTIME_LOCAL_ROOT = '/content/songo-stockfish-runtime'
+        RUNTIME_HYBRID_BACKUP_ENABLED = True
+        RUNTIME_HYBRID_BACKUP_JOBS_ROOT = f'{DRIVE_ROOT}/runtime_backup/jobs'
+        RUNTIME_HYBRID_BACKUP_MIN_INTERVAL_SECONDS = 30.0
         if LOW_QUOTA_PROFILE:
             GLOBAL_BUDGET_ENFORCEMENT_MODE = 'batched'
             GLOBAL_PROGRESS_FLUSH_EVERY_N_GAMES = int(LOW_QUOTA_GLOBAL_PROGRESS_FLUSH_EVERY_N_GAMES)
@@ -298,8 +301,11 @@ cells = [
         Path(JOBS_ROOT).mkdir(parents=True, exist_ok=True)
         Path(LOGS_ROOT).mkdir(parents=True, exist_ok=True)
         Path(PIPELINE_LOGS_DIR).mkdir(parents=True, exist_ok=True)
+        if RUNTIME_HYBRID_BACKUP_ENABLED:
+            Path(RUNTIME_HYBRID_BACKUP_JOBS_ROOT).mkdir(parents=True, exist_ok=True)
         os.environ['SONGO_JOBS_ROOT'] = str(JOBS_ROOT)
         os.environ['SONGO_LOGS_ROOT'] = str(LOGS_ROOT)
+        os.environ['SONGO_JOBS_BACKUP_ROOT'] = str(RUNTIME_HYBRID_BACKUP_JOBS_ROOT) if RUNTIME_HYBRID_BACKUP_ENABLED else ''
 
         DATASET_GENERATE_WORKERS = 16
         DATASET_GENERATE_MAX_PENDING_FUTURES = 32
@@ -875,6 +881,9 @@ cells = [
         print('JOBS_ROOT               =', JOBS_ROOT)
         print('LOGS_ROOT               =', LOGS_ROOT)
         print('PIPELINE_LOGS_DIR       =', PIPELINE_LOGS_DIR)
+        print('RUNTIME_HYBRID_BACKUP_ENABLED =', RUNTIME_HYBRID_BACKUP_ENABLED)
+        print('RUNTIME_HYBRID_BACKUP_JOBS_ROOT =', RUNTIME_HYBRID_BACKUP_JOBS_ROOT)
+        print('RUNTIME_HYBRID_BACKUP_MIN_INTERVAL_SECONDS =', RUNTIME_HYBRID_BACKUP_MIN_INTERVAL_SECONDS)
         print('TARGET_SAMPLES          =', TARGET_SAMPLES)
         print('TARGET_LABELED_SAMPLES  =', TARGET_LABELED_SAMPLES)
         print('DATASET_GENERATE_SOURCE_MODE =', DATASET_GENERATE_SOURCE_MODE)
@@ -943,6 +952,184 @@ cells = [
         print('TRAIN_SCRATCH_JOB_ID    =', TRAIN_SCRATCH_JOB_ID)
         print('EVALUATION_JOB_ID       =', EVALUATION_JOB_ID)
         print('BENCHMARK_JOB_ID        =', BENCHMARK_JOB_ID)
+        """
+    ),
+    md("## 3bis. Migration Runtime Drive Vers Local"),
+    code(
+        """
+        # Migration one-shot: Drive/jobs + Drive/logs/pipeline -> runtime local.
+        # Objectif: vider les artefacts volatils du Drive sans perdre d'etat.
+        import json
+        import shutil
+        from pathlib import Path
+
+        MIGRATE_DRIVE_RUNTIME_TO_LOCAL = True
+        MIGRATE_PURGE_DRIVE_AFTER_VERIFY = True
+        MIGRATE_SKIP_ACTIVE_JOB_DIRS = True
+        MIGRATE_VERBOSE = True
+
+        drive_jobs_root = Path(DRIVE_ROOT) / 'jobs'
+        drive_pipeline_logs_root = Path(DRIVE_ROOT) / 'logs' / 'pipeline'
+        local_jobs_root = Path(JOBS_ROOT)
+        local_pipeline_logs_root = Path(PIPELINE_LOGS_DIR)
+
+        def _read_json_safe(path: Path, default=None):
+            fallback = {} if default is None else default
+            if not path.exists():
+                return fallback
+            try:
+                payload = json.loads(path.read_text(encoding='utf-8'))
+            except Exception:
+                return fallback
+            return payload if isinstance(payload, dict) else fallback
+
+        def _index_files(root: Path) -> dict[str, int]:
+            index: dict[str, int] = {}
+            if not root.exists():
+                return index
+            for file_path in root.rglob('*'):
+                if file_path.is_file():
+                    rel = str(file_path.relative_to(root))
+                    try:
+                        index[rel] = int(file_path.stat().st_size)
+                    except Exception:
+                        index[rel] = -1
+            return index
+
+        def _sync_tree(src: Path, dst: Path) -> dict:
+            copied = 0
+            updated = 0
+            bytes_copied = 0
+            dst.mkdir(parents=True, exist_ok=True)
+            for src_file in src.rglob('*'):
+                if not src_file.is_file():
+                    continue
+                rel = src_file.relative_to(src)
+                dst_file = dst / rel
+                dst_file.parent.mkdir(parents=True, exist_ok=True)
+                existed_before = dst_file.exists()
+                copy_required = True
+                if existed_before:
+                    try:
+                        copy_required = int(dst_file.stat().st_size) != int(src_file.stat().st_size)
+                    except Exception:
+                        copy_required = True
+                if copy_required:
+                    shutil.copy2(src_file, dst_file)
+                    bytes_copied += int(src_file.stat().st_size)
+                    if existed_before:
+                        updated += 1
+                    else:
+                        copied += 1
+            src_idx = _index_files(src)
+            dst_idx = _index_files(dst)
+            mismatches = [rel for rel, size in src_idx.items() if dst_idx.get(rel) != size]
+            return {
+                'copied': int(copied),
+                'updated': int(updated),
+                'bytes_copied': int(bytes_copied),
+                'src_files': int(len(src_idx)),
+                'dst_files': int(len(dst_idx)),
+                'verified': len(mismatches) == 0,
+                'mismatches_preview': mismatches[:10],
+                'mismatches_count': int(len(mismatches)),
+            }
+
+        def _job_is_active(job_dir: Path) -> bool:
+            status_payload = _read_json_safe(job_dir / 'run_status.json', default={})
+            status_text = str(status_payload.get('status', '')).strip().lower()
+            return status_text in {'running', 'pending', 'starting'}
+
+        print('Runtime migration config:')
+        print('  mode                       =', RUNTIME_STATE_MODE)
+        print('  migrate_enabled            =', MIGRATE_DRIVE_RUNTIME_TO_LOCAL)
+        print('  purge_drive_after_verify   =', MIGRATE_PURGE_DRIVE_AFTER_VERIFY)
+        print('  skip_active_job_dirs       =', MIGRATE_SKIP_ACTIVE_JOB_DIRS)
+        print('  drive_jobs_root            =', drive_jobs_root)
+        print('  drive_pipeline_logs_root   =', drive_pipeline_logs_root)
+        print('  local_jobs_root            =', local_jobs_root)
+        print('  local_pipeline_logs_root   =', local_pipeline_logs_root)
+
+        if str(RUNTIME_STATE_MODE).strip().lower() != 'local':
+            print('Migration ignoree: RUNTIME_STATE_MODE != local')
+        elif not MIGRATE_DRIVE_RUNTIME_TO_LOCAL:
+            print('Migration desactivee par config.')
+        else:
+            local_jobs_root.mkdir(parents=True, exist_ok=True)
+            local_pipeline_logs_root.mkdir(parents=True, exist_ok=True)
+
+            summary = {
+                'jobs': {'migrated': 0, 'skipped_active': 0, 'purged': 0, 'failed': 0},
+                'pipeline_logs': {'migrated': 0, 'purged': 0, 'failed': 0},
+            }
+
+            if drive_jobs_root.exists():
+                for src_job_dir in sorted([p for p in drive_jobs_root.iterdir() if p.is_dir()]):
+                    job_id = src_job_dir.name
+                    if MIGRATE_SKIP_ACTIVE_JOB_DIRS and _job_is_active(src_job_dir):
+                        summary['jobs']['skipped_active'] += 1
+                        if MIGRATE_VERBOSE:
+                            print(f'[SKIP active] job={job_id} path={src_job_dir}')
+                        continue
+                    dst_job_dir = local_jobs_root / job_id
+                    try:
+                        result = _sync_tree(src_job_dir, dst_job_dir)
+                        if not bool(result.get('verified', False)):
+                            summary['jobs']['failed'] += 1
+                            print(
+                                f"[VERIFY failed] job={job_id} mismatches={result.get('mismatches_count', 0)} "
+                                f"preview={result.get('mismatches_preview', [])}"
+                            )
+                            continue
+                        summary['jobs']['migrated'] += 1
+                        if MIGRATE_VERBOSE:
+                            print(
+                                f"[OK migrate] job={job_id} files={result.get('src_files', 0)} "
+                                f"bytes={result.get('bytes_copied', 0)}"
+                            )
+                        if MIGRATE_PURGE_DRIVE_AFTER_VERIFY:
+                            shutil.rmtree(src_job_dir, ignore_errors=True)
+                            summary['jobs']['purged'] += 1
+                            if MIGRATE_VERBOSE:
+                                print(f'[PURGED] {src_job_dir}')
+                    except Exception as exc:
+                        summary['jobs']['failed'] += 1
+                        print(f'[ERROR] job={job_id} cause={type(exc).__name__}: {exc}')
+            else:
+                print('Drive jobs root absent:', drive_jobs_root)
+
+            if drive_pipeline_logs_root.exists():
+                try:
+                    result = _sync_tree(drive_pipeline_logs_root, local_pipeline_logs_root)
+                    if bool(result.get('verified', False)):
+                        summary['pipeline_logs']['migrated'] = 1
+                        print(
+                            f"[OK migrate] pipeline_logs files={result.get('src_files', 0)} "
+                            f"bytes={result.get('bytes_copied', 0)}"
+                        )
+                        if MIGRATE_PURGE_DRIVE_AFTER_VERIFY:
+                            shutil.rmtree(drive_pipeline_logs_root, ignore_errors=True)
+                            summary['pipeline_logs']['purged'] = 1
+                            print(f'[PURGED] {drive_pipeline_logs_root}')
+                    else:
+                        summary['pipeline_logs']['failed'] = 1
+                        print(
+                            f"[VERIFY failed] pipeline_logs mismatches={result.get('mismatches_count', 0)} "
+                            f"preview={result.get('mismatches_preview', [])}"
+                        )
+                except Exception as exc:
+                    summary['pipeline_logs']['failed'] = 1
+                    print(f'[ERROR] pipeline_logs cause={type(exc).__name__}: {exc}')
+            else:
+                print('Drive pipeline logs root absent:', drive_pipeline_logs_root)
+
+            # Re-cree la structure vide cote Drive pour eviter des surprises visuelles.
+            if MIGRATE_PURGE_DRIVE_AFTER_VERIFY:
+                drive_jobs_root.mkdir(parents=True, exist_ok=True)
+                drive_pipeline_logs_root.mkdir(parents=True, exist_ok=True)
+
+            print('Migration summary:')
+            print(json.dumps(summary, indent=2, ensure_ascii=True))
         """
     ),
     md("## 4. Generer les configs actives"),
@@ -1016,6 +1203,9 @@ cells = [
             storage_cfg = dict(cfg.get('storage', {}) or {})
             storage_cfg['jobs_root'] = str(JOBS_ROOT)
             storage_cfg['logs_root'] = str(LOGS_ROOT)
+            storage_cfg['runtime_state_backup_enabled'] = bool(RUNTIME_HYBRID_BACKUP_ENABLED)
+            storage_cfg['jobs_backup_root'] = str(RUNTIME_HYBRID_BACKUP_JOBS_ROOT)
+            storage_cfg['runtime_state_backup_min_interval_seconds'] = float(RUNTIME_HYBRID_BACKUP_MIN_INTERVAL_SECONDS)
             cfg['storage'] = storage_cfg
             return cfg
 

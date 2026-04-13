@@ -41,6 +41,18 @@ MyDrive/songo-stockfish/
     pipeline/
 ```
 
+### 3.3 Backup hybride des etats essentiels (Drive)
+
+```text
+MyDrive/songo-stockfish/
+  runtime_backup/
+    jobs/
+      <job_id>/
+        config.yaml
+        run_status.json
+        state.json
+```
+
 ## 4. Ce qui doit etre stocke dans Drive
 
 - datasets
@@ -57,6 +69,14 @@ MyDrive/songo-stockfish/
 - `logs/pipeline/*.log`
 - `logs/pipeline/latest_dataset_pipeline_<worker_tag>.json`
 - snapshots monitoring (`workers_status_snapshot_*.json`, `health_snapshot_*.json`)
+- ces fichiers peuvent etre perdus si la VM est recreee
+
+## 4.1.1 Sauvegarde hybride recommandee (anti-perte VM)
+
+- activer `runtime_state_backup_enabled=true`
+- pointer `jobs_backup_root` vers `MyDrive/songo-stockfish/runtime_backup/jobs`
+- garder un intervalle de sync raisonnable (ex: `runtime_state_backup_min_interval_seconds=30`)
+- a la reprise, restaurer le runtime local depuis ce backup avant relance
 
 ## 4.2 Ce qui doit etre stocke dans Firestore
 

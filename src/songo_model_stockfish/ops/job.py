@@ -177,7 +177,14 @@ def make_job_id(run_type: str) -> str:
     return f"{run_type}_{stamp}_{suffix}"
 
 
-def _next_cycle_job_id(requested_job_id: str, jobs_root: Path) -> str:
+def _next_cycle_job_id(requested_job_id: str, jobs_root: Path, *, backup_jobs_root: Path | None = None) -> str:
+    def _job_id_exists(candidate_job_id: str) -> bool:
+        if (jobs_root / candidate_job_id).exists():
+            return True
+        if backup_jobs_root is not None and (backup_jobs_root / candidate_job_id).exists():
+            return True
+        return False
+
     stem = requested_job_id
     if stem.endswith("_") and len(stem) > 1:
         stem = stem[:-1]
@@ -192,13 +199,13 @@ def _next_cycle_job_id(requested_job_id: str, jobs_root: Path) -> str:
         while True:
             candidate += 1
             next_job_id = f"{prefix}{candidate:0{width}d}"
-            if not (jobs_root / next_job_id).exists():
+            if not _job_id_exists(next_job_id):
                 return next_job_id
 
     index = 2
     while True:
         next_job_id = f"{requested_job_id}_{index:03d}"
-        if not (jobs_root / next_job_id).exists():
+        if not _job_id_exists(next_job_id):
             return next_job_id
         index += 1
 
@@ -220,12 +227,78 @@ class JobContext:
     _last_firestore_status_signature: str = ""
     _last_firestore_state_signature: str = ""
     _firestore_sync_stats: dict[str, int] | None = None
+    _last_runtime_backup_state_write_ts: float = 0.0
+    _last_runtime_backup_state_signature: str = ""
 
     def read_status(self) -> dict[str, Any]:
-        return read_json_dict(self.status_path, default={})
+        payload = read_json_dict(self.status_path, default={})
+        if payload:
+            return payload
+        backup_path = self._backup_path_for("run_status.json")
+        if backup_path is None or not backup_path.exists():
+            return {}
+        backup_payload = read_json_dict(backup_path, default={})
+        if backup_payload:
+            try:
+                write_json_atomic(self.status_path, backup_payload, ensure_ascii=True, indent=2)
+            except Exception:
+                pass
+        return backup_payload
 
     def read_state(self) -> dict[str, Any]:
-        return read_json_dict(self.state_path, default={})
+        payload = read_json_dict(self.state_path, default={})
+        if payload:
+            return payload
+        backup_path = self._backup_path_for("state.json")
+        if backup_path is None or not backup_path.exists():
+            return {}
+        backup_payload = read_json_dict(backup_path, default={})
+        if backup_payload:
+            try:
+                write_json_atomic(self.state_path, backup_payload, ensure_ascii=True, indent=2)
+            except Exception:
+                pass
+        return backup_payload
+
+    def _backup_path_for(self, relative_name: str) -> Path | None:
+        backup_root = self.paths.jobs_backup_root
+        if backup_root is None:
+            return None
+        return backup_root / self.job_id / relative_name
+
+    def _runtime_backup_min_interval_seconds(self) -> float:
+        storage_cfg = self.config.get("storage", {}) if isinstance(self.config.get("storage"), dict) else {}
+        return max(0.0, _as_float(storage_cfg.get("runtime_state_backup_min_interval_seconds", 30.0), 30.0))
+
+    def _write_backup_json(self, relative_name: str, payload: dict[str, Any]) -> None:
+        backup_path = self._backup_path_for(relative_name)
+        if backup_path is None:
+            return
+        try:
+            backup_path.parent.mkdir(parents=True, exist_ok=True)
+            write_json_atomic(backup_path, payload, ensure_ascii=True, indent=2)
+        except Exception as exc:
+            self.logger.warning(
+                "runtime backup write failed | job_id=%s | file=%s | error=%s",
+                self.job_id,
+                str(backup_path),
+                f"{type(exc).__name__}: {exc}",
+            )
+
+    def _write_backup_text(self, relative_name: str, text: str) -> None:
+        backup_path = self._backup_path_for(relative_name)
+        if backup_path is None:
+            return
+        try:
+            backup_path.parent.mkdir(parents=True, exist_ok=True)
+            write_text_atomic(backup_path, text, encoding="utf-8")
+        except Exception as exc:
+            self.logger.warning(
+                "runtime backup write failed | job_id=%s | file=%s | error=%s",
+                self.job_id,
+                str(backup_path),
+                f"{type(exc).__name__}: {exc}",
+            )
 
     def write_event(self, message: str, **extra: Any) -> None:
         payload = {
@@ -260,8 +333,13 @@ class JobContext:
         if extra:
             payload.update(extra)
         write_json_atomic(self.status_path, payload, ensure_ascii=True, indent=2)
-        self._write_worker_checkpoint_firestore(status_payload=payload, state_payload=None, force=True)
+        self._write_backup_json("run_status.json", payload)
         status_normalized = str(status).strip().lower()
+        if status_normalized in {"completed", "failed", "cancelled"}:
+            current_state = read_json_dict(self.state_path, default={})
+            if current_state:
+                self._write_backup_json("state.json", current_state)
+        self._write_worker_checkpoint_firestore(status_payload=payload, state_payload=None, force=True)
         if status_normalized in {"completed", "failed", "cancelled"}:
             self._emit_firestore_sync_summary(status=status_normalized, phase=str(phase))
 
@@ -272,12 +350,23 @@ class JobContext:
             **state,
         }
         write_json_atomic(self.state_path, payload, ensure_ascii=True, indent=2)
+        state_signature = json.dumps(payload, sort_keys=True, ensure_ascii=True, default=str)
+        now_ts = time.time()
+        min_interval = self._runtime_backup_min_interval_seconds()
+        should_backup = state_signature != self._last_runtime_backup_state_signature
+        if min_interval > 0.0:
+            should_backup = should_backup and (now_ts - float(self._last_runtime_backup_state_write_ts)) >= min_interval
+        if should_backup:
+            self._write_backup_json("state.json", payload)
+            self._last_runtime_backup_state_signature = state_signature
+            self._last_runtime_backup_state_write_ts = now_ts
         self._write_worker_checkpoint_firestore(status_payload=None, state_payload=payload, force=False)
 
     def set_phase(self, phase: str) -> None:
         current = read_json_dict(self.status_path, default={})
         current.update({"phase": phase, "updated_at": utc_now_iso()})
         write_json_atomic(self.status_path, current, ensure_ascii=True, indent=2)
+        self._write_backup_json("run_status.json", current)
         self._write_worker_checkpoint_firestore(status_payload=current, state_payload=None, force=True)
 
     def _write_worker_checkpoint_firestore(
@@ -413,7 +502,10 @@ class JobContext:
 
 def create_job_context(config: dict[str, Any], *, override_job_id: str | None = None) -> JobContext:
     paths = build_project_paths(config)
-    for path in [paths.jobs_root, paths.logs_root, paths.reports_root, paths.models_root, paths.data_root]:
+    required_roots = [paths.jobs_root, paths.logs_root, paths.reports_root, paths.models_root, paths.data_root]
+    if paths.jobs_backup_root is not None:
+        required_roots.append(paths.jobs_backup_root)
+    for path in required_roots:
         path.mkdir(parents=True, exist_ok=True)
 
     job_cfg = config.get("job", {})
@@ -428,13 +520,36 @@ def create_job_context(config: dict[str, Any], *, override_job_id: str | None = 
         "dataset_generation",
         "dataset_build",
     }:
-        existing_status_path = paths.jobs_root / job_id / "run_status.json"
-        if existing_status_path.exists():
+        existing_status_paths = [paths.jobs_root / job_id / "run_status.json"]
+        if paths.jobs_backup_root is not None:
+            existing_status_paths.append(paths.jobs_backup_root / job_id / "run_status.json")
+        existing_status = {}
+        for existing_status_path in existing_status_paths:
+            if not existing_status_path.exists():
+                continue
             existing_status = read_json_dict(existing_status_path, default={})
-            if str(existing_status.get("status", "")).lower() == "completed":
-                job_id = _next_cycle_job_id(requested_job_id, paths.jobs_root)
+            if existing_status:
+                break
+        if str(existing_status.get("status", "")).lower() == "completed":
+            job_id = _next_cycle_job_id(requested_job_id, paths.jobs_root, backup_jobs_root=paths.jobs_backup_root)
     job_dir = paths.jobs_root / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
+
+    backup_job_dir: Path | None = None
+    if paths.jobs_backup_root is not None:
+        backup_job_dir = paths.jobs_backup_root / job_id
+        backup_job_dir.mkdir(parents=True, exist_ok=True)
+
+    if backup_job_dir is not None:
+        for relative_name in ["config.yaml", "run_status.json", "state.json"]:
+            local_path = job_dir / relative_name
+            backup_path = backup_job_dir / relative_name
+            if local_path.exists() or not backup_path.exists():
+                continue
+            try:
+                write_text_atomic(local_path, backup_path.read_text(encoding="utf-8"), encoding="utf-8")
+            except Exception:
+                pass
 
     logger = build_console_logger(job_id)
     events = JsonlWriter(job_dir / "events.jsonl")
@@ -482,6 +597,7 @@ def create_job_context(config: dict[str, Any], *, override_job_id: str | None = 
     )
 
     write_text_atomic(job_dir / "config.yaml", _dump_yaml_like(config), encoding="utf-8")
+    context._write_backup_text("config.yaml", _dump_yaml_like(config))
     if not status_path.exists():
         context.write_status("pending")
     if not state_path.exists():

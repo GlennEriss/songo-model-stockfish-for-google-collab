@@ -242,6 +242,7 @@ Principe recommande:
 - code de travail dans `/content/songo-model-stockfish-for-google-collab`
 - artefacts persistants dans `/content/drive/MyDrive/songo-stockfish`
 - etat runtime volatil dans `/content/songo-stockfish-runtime` (recommande)
+- backup hybride des etats essentiels jobs vers `/content/drive/MyDrive/songo-stockfish/runtime_backup/jobs`
 - mise a jour Git sur le worktree uniquement
 - datasets, checkpoints et rapports sur Drive
 - `jobs/`, `logs/pipeline/*`, manifests live et snapshots monitoring en local runtime (sync Firestore/Redis pour coordination)
