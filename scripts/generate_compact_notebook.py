@@ -994,6 +994,17 @@ cells = [
             target_path.write_text(yaml.safe_dump(payload, sort_keys=False, allow_unicode=True), encoding='utf-8')
             return str(target_path)
 
+        def _resolve_cfg_path(path_like: str) -> Path:
+            raw_path = Path(str(path_like).strip())
+            if raw_path.is_absolute():
+                return raw_path
+            worktree_path = Path(WORKTREE) / raw_path
+            if worktree_path.exists():
+                return worktree_path
+            if raw_path.exists():
+                return raw_path
+            return worktree_path
+
         def _detect_ram_gb() -> float:
             try:
                 import psutil  # type: ignore[import-not-found]
@@ -1077,6 +1088,11 @@ cells = [
         else:
             tuned_batch_size = None
 
+        TRAIN_CONTINUE_CONFIG_ACTIVE = str(_resolve_cfg_path(TRAIN_CONTINUE_CONFIG_ACTIVE))
+        TRAIN_SCRATCH_CONFIG_ACTIVE = str(_resolve_cfg_path(TRAIN_SCRATCH_CONFIG_ACTIVE))
+        EVALUATION_CONFIG_ACTIVE = str(_resolve_cfg_path(EVALUATION_CONFIG_ACTIVE))
+        BENCHMARK_CONFIG_ACTIVE = str(_resolve_cfg_path(BENCHMARK_CONFIG_ACTIVE))
+
         if RUNTIME_PROFILE == 'cpu':
             for base_relative, target_path, assign_name in [
                 (TRAIN_CONTINUE_CONFIG, TRAIN_CONTINUE_CPU_CONFIG_PATH, 'TRAIN_CONTINUE_CONFIG_ACTIVE'),
@@ -1084,7 +1100,8 @@ cells = [
                 (EVALUATION_CONFIG, EVALUATION_CPU_CONFIG_PATH, 'EVALUATION_CONFIG_ACTIVE'),
                 (BENCHMARK_CONFIG, BENCHMARK_CPU_CONFIG_PATH, 'BENCHMARK_CONFIG_ACTIVE'),
             ]:
-                base_cfg = yaml.safe_load((Path(WORKTREE) / base_relative).read_text(encoding='utf-8')) or {}
+                base_cfg_path = _resolve_cfg_path(base_relative)
+                base_cfg = yaml.safe_load(base_cfg_path.read_text(encoding='utf-8')) or {}
                 globals()[assign_name] = _write_yaml(_make_cpu_safe_runtime_cfg(base_cfg), target_path)
         elif RUNTIME_PROFILE == 'tpu':
             for base_relative, target_path, assign_name in [
@@ -1093,12 +1110,18 @@ cells = [
                 (EVALUATION_CONFIG, EVALUATION_TPU_CONFIG_PATH, 'EVALUATION_CONFIG_ACTIVE'),
                 (BENCHMARK_CONFIG, BENCHMARK_TPU_CONFIG_PATH, 'BENCHMARK_CONFIG_ACTIVE'),
             ]:
-                base_cfg = yaml.safe_load((Path(WORKTREE) / base_relative).read_text(encoding='utf-8')) or {}
+                base_cfg_path = _resolve_cfg_path(base_relative)
+                base_cfg = yaml.safe_load(base_cfg_path.read_text(encoding='utf-8')) or {}
                 globals()[assign_name] = _write_yaml(_make_tpu_runtime_cfg(base_cfg), target_path)
 
         if AUTO_TUNE_RESOURCES and tuned_batch_size is not None:
             for key_name in ['TRAIN_CONTINUE_CONFIG_ACTIVE', 'TRAIN_SCRATCH_CONFIG_ACTIVE']:
-                current_path = Path(str(globals()[key_name]))
+                current_path = _resolve_cfg_path(str(globals()[key_name]))
+                if not current_path.exists():
+                    raise FileNotFoundError(
+                        f'Config introuvable pour {key_name}: {current_path} '
+                        f'(WORKTREE={WORKTREE})'
+                    )
                 cfg_payload = yaml.safe_load(current_path.read_text(encoding='utf-8')) or {}
                 runtime_payload = dict(cfg_payload.get('runtime', {}) or {})
                 runtime_payload['num_workers'] = int(CPU_SAFE_NUM_WORKERS)
@@ -1111,7 +1134,12 @@ cells = [
                 cfg_payload['train'] = train_payload
                 current_path.write_text(yaml.safe_dump(cfg_payload, sort_keys=False, allow_unicode=True), encoding='utf-8')
 
-            eval_path = Path(str(EVALUATION_CONFIG_ACTIVE))
+            eval_path = _resolve_cfg_path(str(EVALUATION_CONFIG_ACTIVE))
+            if not eval_path.exists():
+                raise FileNotFoundError(
+                    f'Config introuvable pour EVALUATION_CONFIG_ACTIVE: {eval_path} '
+                    f'(WORKTREE={WORKTREE})'
+                )
             eval_cfg_payload = yaml.safe_load(eval_path.read_text(encoding='utf-8')) or {}
             eval_runtime_payload = dict(eval_cfg_payload.get('runtime', {}) or {})
             eval_runtime_payload['num_workers'] = int(max(1, CPU_SAFE_NUM_WORKERS))
