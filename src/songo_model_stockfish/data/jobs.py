@@ -6856,6 +6856,22 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         1.0,
         float(cfg.get("progressive_global_merge_lock_wait_seconds", 30.0)),
     )
+    progressive_global_merge_async = _as_bool(
+        cfg.get("progressive_global_merge_async", True),
+        default=True,
+    )
+    progressive_global_merge_candidates_cache_ttl_seconds = max(
+        5.0,
+        float(cfg.get("progressive_global_merge_candidates_cache_ttl_seconds", 30.0)),
+    )
+    progressive_global_merge_require_data_delta = _as_bool(
+        cfg.get("progressive_global_merge_require_data_delta", True),
+        default=True,
+    )
+    progressive_global_merge_completion_wait_seconds = max(
+        5.0,
+        float(cfg.get("progressive_global_merge_completion_wait_seconds", 600.0)),
+    )
     if progressive_global_merge_enabled and not progressive_global_merge_dataset_id:
         job.logger.warning(
             "dataset build progressive global merge disabled | reason=missing progressive_global_merge_dataset_id"
@@ -6943,6 +6959,13 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         progressive_global_merge_min_sources,
         progressive_global_merge_on_completion,
         progressive_global_merge_dedupe_sample_ids,
+    )
+    job.logger.info(
+        "dataset build progressive global merge runtime tuning | async=%s | require_data_delta=%s | candidates_cache_ttl_seconds=%.1f | completion_wait_seconds=%.1f",
+        progressive_global_merge_async,
+        progressive_global_merge_require_data_delta,
+        progressive_global_merge_candidates_cache_ttl_seconds,
+        progressive_global_merge_completion_wait_seconds,
     )
 
     dataset_dir = job.job_dir / "dataset_build"
@@ -7150,8 +7173,34 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
     last_logged_progress_count = -1
     build_started_monotonic = time.monotonic()
     last_partial_export_processed = 0
-    progressive_global_merge_exports_count = 0
+    progressive_global_merge_exports_count = max(
+        0,
+        _safe_int(state.get("progressive_global_merge_exports_count", 0), 0),
+    )
     last_progressive_global_merge_monotonic = 0.0
+    last_progressive_global_merge_signature = str(state.get("progressive_global_merge_last_signature", "")).strip()
+    last_progressive_global_merge_source_labeled_samples = max(
+        0,
+        _safe_int(state.get("progressive_global_merge_last_source_labeled_samples", 0), 0),
+    )
+    last_progressive_global_merge_last_export_labeled_samples = max(
+        0,
+        _safe_int(state.get("progressive_global_merge_last_export_labeled_samples", labeled_samples_total), labeled_samples_total),
+    )
+    progressive_global_merge_executor: concurrent.futures.ThreadPoolExecutor | None = None
+    progressive_global_merge_future: concurrent.futures.Future[dict[str, Any]] | None = None
+    progressive_global_merge_future_context: dict[str, Any] | None = None
+    if progressive_global_merge_enabled and progressive_global_merge_async:
+        progressive_global_merge_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="dataset-build-merge",
+        )
+    progressive_global_merge_candidates_cache_initialized = False
+    progressive_global_merge_candidates_cache_next_refresh_monotonic = 0.0
+    progressive_global_merge_candidates_cache_registry_signature = ""
+    progressive_global_merge_candidates_cache_source_signature = ""
+    progressive_global_merge_candidates_cache_source_labeled_total = 0
+    progressive_global_merge_candidates_cache_source_ids: list[str] = []
     last_completed_file_name = sampled_relative_names[contiguous_completed_prefix - 1] if contiguous_completed_prefix > 0 else ""
 
     def _estimate_remaining_seconds() -> float | None:
@@ -7188,16 +7237,79 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
                 "follow_source_updates": follow_source_updates,
                 "source_poll_interval_seconds": current_poll_interval_seconds,
                 "last_completed_file": last_completed_file_name,
+                "progressive_global_merge_last_signature": last_progressive_global_merge_signature,
+                "progressive_global_merge_last_source_labeled_samples": last_progressive_global_merge_source_labeled_samples,
+                "progressive_global_merge_exports_count": progressive_global_merge_exports_count,
+                "progressive_global_merge_last_export_labeled_samples": last_progressive_global_merge_last_export_labeled_samples,
             }
         )
 
-    def _collect_progressive_global_merge_source_dataset_ids() -> list[str]:
+    def _hash_progressive_global_merge_payload(payload: Any) -> str:
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str)
+        return hashlib.sha1(encoded.encode("utf-8")).hexdigest()
+
+    def _collect_progressive_global_merge_source_dataset_snapshot(
+        *,
+        force_refresh: bool = False,
+    ) -> tuple[list[str], str, int]:
+        nonlocal progressive_global_merge_candidates_cache_initialized
+        nonlocal progressive_global_merge_candidates_cache_next_refresh_monotonic
+        nonlocal progressive_global_merge_candidates_cache_registry_signature
+        nonlocal progressive_global_merge_candidates_cache_source_signature
+        nonlocal progressive_global_merge_candidates_cache_source_labeled_total
+        nonlocal progressive_global_merge_candidates_cache_source_ids
         if not progressive_global_merge_enabled:
-            return []
+            return [], "", 0
+        now_monotonic = time.monotonic()
+        if (
+            progressive_global_merge_candidates_cache_initialized
+            and not force_refresh
+            and now_monotonic < progressive_global_merge_candidates_cache_next_refresh_monotonic
+        ):
+            return (
+                list(progressive_global_merge_candidates_cache_source_ids),
+                str(progressive_global_merge_candidates_cache_source_signature),
+                int(progressive_global_merge_candidates_cache_source_labeled_total),
+            )
         registry = _read_dataset_registry(job)
+        built_entries = registry.get("built_datasets", [])
+        if not isinstance(built_entries, list):
+            built_entries = []
+        registry_signature_items: list[tuple[str, int, str, str]] = []
+        for entry in built_entries:
+            if not isinstance(entry, dict):
+                continue
+            candidate_id = str(entry.get("dataset_id", "")).strip()
+            if not candidate_id:
+                continue
+            registry_signature_items.append(
+                (
+                    candidate_id,
+                    max(0, _safe_int(entry.get("labeled_samples", 0), 0)),
+                    str(entry.get("build_status", "")).strip().lower(),
+                    str(entry.get("output_dir", "")).strip(),
+                )
+            )
+        registry_signature_items.sort(key=lambda item: item[0])
+        registry_signature = _hash_progressive_global_merge_payload(registry_signature_items)
+        if (
+            progressive_global_merge_candidates_cache_initialized
+            and registry_signature == progressive_global_merge_candidates_cache_registry_signature
+        ):
+            progressive_global_merge_candidates_cache_next_refresh_monotonic = (
+                now_monotonic + progressive_global_merge_candidates_cache_ttl_seconds
+            )
+            return (
+                list(progressive_global_merge_candidates_cache_source_ids),
+                str(progressive_global_merge_candidates_cache_source_signature),
+                int(progressive_global_merge_candidates_cache_source_labeled_total),
+            )
+
         candidates: list[str] = []
         seen: set[str] = set()
-        for entry in registry.get("built_datasets", []):
+        source_signature_items: list[tuple[str, int, str]] = []
+        source_labeled_total = 0
+        for entry in built_entries:
             if not isinstance(entry, dict):
                 continue
             candidate_id = str(entry.get("dataset_id", "")).strip()
@@ -7223,14 +7335,154 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
                 and (output_dir / "test.npz").exists()
             ):
                 continue
+            labeled_samples = max(0, _safe_int(entry.get("labeled_samples", 0), 0))
             seen.add(candidate_id)
             candidates.append(candidate_id)
-        return candidates
+            source_labeled_total += labeled_samples
+            source_signature_items.append((candidate_id, labeled_samples, build_status))
+
+        source_signature_items.sort(key=lambda item: item[0])
+        source_signature = _hash_progressive_global_merge_payload(source_signature_items)
+        progressive_global_merge_candidates_cache_initialized = True
+        progressive_global_merge_candidates_cache_registry_signature = registry_signature
+        progressive_global_merge_candidates_cache_source_ids = list(candidates)
+        progressive_global_merge_candidates_cache_source_signature = source_signature
+        progressive_global_merge_candidates_cache_source_labeled_total = int(source_labeled_total)
+        progressive_global_merge_candidates_cache_next_refresh_monotonic = (
+            now_monotonic + progressive_global_merge_candidates_cache_ttl_seconds
+        )
+        return candidates, source_signature, source_labeled_total
+
+    def _run_progressive_global_merge_once(
+        *,
+        merge_cfg: dict[str, Any],
+        trigger: str,
+        source_dataset_ids_for_merge: list[str],
+        source_signature: str,
+        source_labeled_total: int,
+    ) -> dict[str, Any]:
+        started_monotonic = time.monotonic()
+        merge_summary = run_dataset_merge_final(job, cfg_override=merge_cfg)
+        return {
+            "trigger": trigger,
+            "target_dataset_id": progressive_global_merge_dataset_id,
+            "source_dataset_count": len(source_dataset_ids_for_merge),
+            "source_signature": source_signature,
+            "source_labeled_total": int(source_labeled_total),
+            "merge_summary": merge_summary if isinstance(merge_summary, dict) else {},
+            "duration_seconds": max(0.0, time.monotonic() - started_monotonic),
+        }
+
+    def _emit_progressive_global_merge_completed(result: dict[str, Any], *, async_mode: bool) -> None:
+        nonlocal last_progressive_global_merge_monotonic
+        nonlocal last_progressive_global_merge_signature
+        nonlocal last_progressive_global_merge_source_labeled_samples
+        merged_summary = result.get("merge_summary", {}) if isinstance(result, dict) else {}
+        merged_labeled_samples = _safe_int(
+            merged_summary.get("labeled_samples", 0) if isinstance(merged_summary, dict) else 0,
+            0,
+        )
+        last_progressive_global_merge_monotonic = time.monotonic()
+        last_progressive_global_merge_signature = str(result.get("source_signature", "")).strip()
+        last_progressive_global_merge_source_labeled_samples = max(
+            0,
+            _safe_int(result.get("source_labeled_total", 0), 0),
+        )
+        job.logger.info(
+            "dataset build progressive global merge completed | trigger=%s | target_dataset_id=%s | source_datasets=%s | source_labeled_total=%s | labeled_samples=%s | async=%s | duration_seconds=%.2f",
+            str(result.get("trigger", "<none>")),
+            str(result.get("target_dataset_id", progressive_global_merge_dataset_id)),
+            _safe_int(result.get("source_dataset_count", 0), 0),
+            _safe_int(result.get("source_labeled_total", 0), 0),
+            merged_labeled_samples,
+            async_mode,
+            float(result.get("duration_seconds", 0.0) or 0.0),
+        )
+        job.write_event(
+            "dataset_build_progressive_global_merge_completed",
+            trigger=str(result.get("trigger", "")),
+            target_dataset_id=str(result.get("target_dataset_id", progressive_global_merge_dataset_id)),
+            source_dataset_count=_safe_int(result.get("source_dataset_count", 0), 0),
+            source_labeled_total=_safe_int(result.get("source_labeled_total", 0), 0),
+            source_signature=str(result.get("source_signature", "")),
+            labeled_samples=merged_labeled_samples,
+            async_mode=bool(async_mode),
+            duration_seconds=float(result.get("duration_seconds", 0.0) or 0.0),
+        )
+        _write_build_state()
+
+    def _emit_progressive_global_merge_failed(
+        *,
+        trigger: str,
+        source_dataset_count: int,
+        source_labeled_total: int,
+        source_signature: str,
+        exc: Exception,
+        async_mode: bool,
+    ) -> None:
+        job.logger.warning(
+            "dataset build progressive global merge failed | trigger=%s | target_dataset_id=%s | source_datasets=%s | source_labeled_total=%s | async=%s | error=%s",
+            trigger,
+            progressive_global_merge_dataset_id,
+            source_dataset_count,
+            source_labeled_total,
+            async_mode,
+            exc,
+        )
+        job.write_event(
+            "dataset_build_progressive_global_merge_failed",
+            trigger=trigger,
+            target_dataset_id=progressive_global_merge_dataset_id,
+            source_dataset_count=source_dataset_count,
+            source_labeled_total=source_labeled_total,
+            source_signature=source_signature,
+            async_mode=bool(async_mode),
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
+    def _drain_progressive_global_merge_future(
+        *,
+        block: bool = False,
+        timeout_seconds: float | None = None,
+    ) -> bool:
+        nonlocal progressive_global_merge_future, progressive_global_merge_future_context
+        if progressive_global_merge_future is None:
+            return True
+        if not block and not progressive_global_merge_future.done():
+            return False
+        try:
+            if block:
+                result = progressive_global_merge_future.result(timeout=timeout_seconds)
+            else:
+                result = progressive_global_merge_future.result()
+        except concurrent.futures.TimeoutError:
+            return False
+        except Exception as exc:
+            context = progressive_global_merge_future_context or {}
+            _emit_progressive_global_merge_failed(
+                trigger=str(context.get("trigger", "partial_snapshot")),
+                source_dataset_count=_safe_int(context.get("source_dataset_count", 0), 0),
+                source_labeled_total=_safe_int(context.get("source_labeled_total", 0), 0),
+                source_signature=str(context.get("source_signature", "")),
+                exc=exc,
+                async_mode=True,
+            )
+        else:
+            if not isinstance(result, dict):
+                result = {}
+            _emit_progressive_global_merge_completed(result, async_mode=True)
+        finally:
+            progressive_global_merge_future = None
+            progressive_global_merge_future_context = None
+        return True
 
     def _maybe_progressive_global_merge(*, force: bool = False, trigger: str = "partial_snapshot") -> None:
         nonlocal last_progressive_global_merge_monotonic
+        nonlocal progressive_global_merge_future
+        nonlocal progressive_global_merge_future_context
         if not progressive_global_merge_enabled:
             return
+        _drain_progressive_global_merge_future(block=False)
         now_monotonic = time.monotonic()
         if not force:
             if (
@@ -7243,13 +7495,25 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
                 < progressive_global_merge_min_interval_seconds
             ):
                 return
-        source_dataset_ids_for_merge = _collect_progressive_global_merge_source_dataset_ids()
+        source_dataset_ids_for_merge, source_signature, source_labeled_total = _collect_progressive_global_merge_source_dataset_snapshot()
         if len(source_dataset_ids_for_merge) < progressive_global_merge_min_sources:
             job.logger.info(
                 "dataset build progressive global merge skipped | trigger=%s | reason=insufficient_sources | sources=%s | min_sources=%s",
                 trigger,
                 len(source_dataset_ids_for_merge),
                 progressive_global_merge_min_sources,
+            )
+            return
+        if (
+            progressive_global_merge_require_data_delta
+            and source_signature
+            and source_signature == last_progressive_global_merge_signature
+        ):
+            job.logger.info(
+                "dataset build progressive global merge skipped | trigger=%s | reason=no_source_delta | source_signature=%s | source_labeled_total=%s",
+                trigger,
+                source_signature,
+                source_labeled_total,
             )
             return
         merge_cfg = {
@@ -7260,46 +7524,68 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
             "merge_lock_ttl_seconds": progressive_global_merge_lock_ttl_seconds,
             "merge_lock_wait_seconds": progressive_global_merge_lock_wait_seconds,
         }
-        previous_merge_cfg = job.config.get("dataset_merge_final")
-        try:
-            job.config["dataset_merge_final"] = merge_cfg
-            merge_summary = run_dataset_merge_final(job)
-            merged_labeled_samples = int(merge_summary.get("labeled_samples", 0)) if isinstance(merge_summary, dict) else 0
-            last_progressive_global_merge_monotonic = now_monotonic
-            job.logger.info(
-                "dataset build progressive global merge completed | trigger=%s | target_dataset_id=%s | source_datasets=%s | labeled_samples=%s",
-                trigger,
-                progressive_global_merge_dataset_id,
-                len(source_dataset_ids_for_merge),
-                merged_labeled_samples,
+        if progressive_global_merge_executor is not None and not force:
+            if progressive_global_merge_future is not None and not progressive_global_merge_future.done():
+                job.logger.info(
+                    "dataset build progressive global merge deferred | trigger=%s | reason=merge_inflight",
+                    trigger,
+                )
+                return
+            progressive_global_merge_future_context = {
+                "trigger": trigger,
+                "source_dataset_count": len(source_dataset_ids_for_merge),
+                "source_labeled_total": int(source_labeled_total),
+                "source_signature": source_signature,
+            }
+            progressive_global_merge_future = progressive_global_merge_executor.submit(
+                _run_progressive_global_merge_once,
+                merge_cfg=merge_cfg,
+                trigger=trigger,
+                source_dataset_ids_for_merge=list(source_dataset_ids_for_merge),
+                source_signature=source_signature,
+                source_labeled_total=int(source_labeled_total),
             )
             job.write_event(
-                "dataset_build_progressive_global_merge_completed",
+                "dataset_build_progressive_global_merge_queued",
                 trigger=trigger,
                 target_dataset_id=progressive_global_merge_dataset_id,
                 source_dataset_count=len(source_dataset_ids_for_merge),
-                labeled_samples=merged_labeled_samples,
+                source_labeled_total=int(source_labeled_total),
+                source_signature=source_signature,
+                async_mode=True,
+            )
+            return
+        if progressive_global_merge_executor is not None and force:
+            drained = _drain_progressive_global_merge_future(
+                block=True,
+                timeout_seconds=progressive_global_merge_completion_wait_seconds,
+            )
+            if not drained:
+                job.logger.warning(
+                    "dataset build progressive global merge skipped | trigger=%s | reason=merge_inflight_timeout | wait_seconds=%.1f",
+                    trigger,
+                    progressive_global_merge_completion_wait_seconds,
+                )
+                return
+        try:
+            result = _run_progressive_global_merge_once(
+                merge_cfg=merge_cfg,
+                trigger=trigger,
+                source_dataset_ids_for_merge=list(source_dataset_ids_for_merge),
+                source_signature=source_signature,
+                source_labeled_total=int(source_labeled_total),
             )
         except Exception as exc:
-            job.logger.warning(
-                "dataset build progressive global merge failed | trigger=%s | target_dataset_id=%s | source_datasets=%s | error=%s",
-                trigger,
-                progressive_global_merge_dataset_id,
-                len(source_dataset_ids_for_merge),
-                exc,
-            )
-            job.write_event(
-                "dataset_build_progressive_global_merge_failed",
+            _emit_progressive_global_merge_failed(
                 trigger=trigger,
-                target_dataset_id=progressive_global_merge_dataset_id,
                 source_dataset_count=len(source_dataset_ids_for_merge),
-                error=f"{type(exc).__name__}: {exc}",
+                source_labeled_total=int(source_labeled_total),
+                source_signature=source_signature,
+                exc=exc,
+                async_mode=False,
             )
-        finally:
-            if previous_merge_cfg is None:
-                job.config.pop("dataset_merge_final", None)
-            else:
-                job.config["dataset_merge_final"] = previous_merge_cfg
+            return
+        _emit_progressive_global_merge_completed(result, async_mode=False)
 
     def _log_build_progress_if_needed() -> None:
         nonlocal last_logged_progress_count
@@ -7327,6 +7613,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
 
     def _export_partial_snapshot_if_needed(*, force: bool = False) -> None:
         nonlocal last_partial_export_processed, progressive_global_merge_exports_count
+        nonlocal last_progressive_global_merge_last_export_labeled_samples
         if processed_count <= 0:
             return
         if not force and (processed_count - last_partial_export_processed) < export_partial_every_n_files:
@@ -7379,7 +7666,9 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
             dedupe_sample_ids=dedupe_sample_ids,
             input_dim=exported_input_dim,
         )
-        progressive_global_merge_exports_count += 1
+        if labeled_samples_total > last_progressive_global_merge_last_export_labeled_samples:
+            progressive_global_merge_exports_count += 1
+            last_progressive_global_merge_last_export_labeled_samples = labeled_samples_total
         _maybe_progressive_global_merge(force=False, trigger="partial_snapshot")
 
     job.logger.info(
@@ -7925,12 +8214,23 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
     )
     if progressive_global_merge_enabled and progressive_global_merge_on_completion:
         _maybe_progressive_global_merge(force=True, trigger="build_completed")
+    if progressive_global_merge_executor is not None:
+        drained = _drain_progressive_global_merge_future(
+            block=True,
+            timeout_seconds=progressive_global_merge_completion_wait_seconds,
+        )
+        if not drained:
+            job.logger.warning(
+                "dataset build progressive global merge shutdown timeout | wait_seconds=%.1f",
+                progressive_global_merge_completion_wait_seconds,
+            )
+        progressive_global_merge_executor.shutdown(wait=False)
     _write_global_progress_read_telemetry_metric()
     return summary
 
 
-def run_dataset_merge_final(job: JobContext) -> dict[str, object]:
-    cfg = job.config.get("dataset_merge_final", {})
+def run_dataset_merge_final(job: JobContext, *, cfg_override: dict[str, Any] | None = None) -> dict[str, object]:
+    cfg = cfg_override if isinstance(cfg_override, dict) else job.config.get("dataset_merge_final", {})
     dataset_id = str(cfg.get("dataset_id", "dataset_merged_final")).strip()
     if not dataset_id:
         raise ValueError("`dataset_id` est requis pour `dataset_merge_final`")

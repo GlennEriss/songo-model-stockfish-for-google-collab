@@ -272,11 +272,15 @@ cells = [
         PROGRESSIVE_GLOBAL_MERGE_INCLUDE_PARTIAL = True
         PROGRESSIVE_GLOBAL_MERGE_EVERY_N_PARTIAL_EXPORTS = 1
         PROGRESSIVE_GLOBAL_MERGE_MIN_INTERVAL_SECONDS = 180.0
-        PROGRESSIVE_GLOBAL_MERGE_MIN_SOURCES = 1
+        PROGRESSIVE_GLOBAL_MERGE_MIN_SOURCES = 2
         PROGRESSIVE_GLOBAL_MERGE_ON_COMPLETION = True
         PROGRESSIVE_GLOBAL_MERGE_DEDUPE_SAMPLE_IDS = True
         PROGRESSIVE_GLOBAL_MERGE_LOCK_WAIT_SECONDS = 30.0
         PROGRESSIVE_GLOBAL_MERGE_LOCK_TTL_SECONDS = 1800.0
+        PROGRESSIVE_GLOBAL_MERGE_ASYNC = True
+        PROGRESSIVE_GLOBAL_MERGE_CANDIDATES_CACHE_TTL_SECONDS = 30.0
+        PROGRESSIVE_GLOBAL_MERGE_REQUIRE_DATA_DELTA = True
+        PROGRESSIVE_GLOBAL_MERGE_COMPLETION_WAIT_SECONDS = 600.0
         MONITOR_REFRESH_SECONDS = 15
         MONITOR_MAX_LOOPS = 40
         PIPELINE_MANIFEST_FIRESTORE_WRITE_ENABLED = True
@@ -1601,11 +1605,19 @@ cells = [
         build_block['progressive_global_merge_include_partial'] = bool(PROGRESSIVE_GLOBAL_MERGE_INCLUDE_PARTIAL)
         build_block['progressive_global_merge_every_n_partial_exports'] = int(max(1, int(PROGRESSIVE_GLOBAL_MERGE_EVERY_N_PARTIAL_EXPORTS)))
         build_block['progressive_global_merge_min_interval_seconds'] = float(max(0.0, float(PROGRESSIVE_GLOBAL_MERGE_MIN_INTERVAL_SECONDS)))
-        build_block['progressive_global_merge_min_sources'] = int(max(1, int(PROGRESSIVE_GLOBAL_MERGE_MIN_SOURCES)))
+        build_block['progressive_global_merge_min_sources'] = int(max(2, int(PROGRESSIVE_GLOBAL_MERGE_MIN_SOURCES)))
         build_block['progressive_global_merge_on_completion'] = bool(PROGRESSIVE_GLOBAL_MERGE_ON_COMPLETION)
         build_block['progressive_global_merge_dedupe_sample_ids'] = bool(PROGRESSIVE_GLOBAL_MERGE_DEDUPE_SAMPLE_IDS)
         build_block['progressive_global_merge_lock_wait_seconds'] = float(max(1.0, float(PROGRESSIVE_GLOBAL_MERGE_LOCK_WAIT_SECONDS)))
         build_block['progressive_global_merge_lock_ttl_seconds'] = float(max(30.0, float(PROGRESSIVE_GLOBAL_MERGE_LOCK_TTL_SECONDS)))
+        build_block['progressive_global_merge_async'] = bool(PROGRESSIVE_GLOBAL_MERGE_ASYNC)
+        build_block['progressive_global_merge_candidates_cache_ttl_seconds'] = float(
+            max(5.0, float(PROGRESSIVE_GLOBAL_MERGE_CANDIDATES_CACHE_TTL_SECONDS))
+        )
+        build_block['progressive_global_merge_require_data_delta'] = bool(PROGRESSIVE_GLOBAL_MERGE_REQUIRE_DATA_DELTA)
+        build_block['progressive_global_merge_completion_wait_seconds'] = float(
+            max(5.0, float(PROGRESSIVE_GLOBAL_MERGE_COMPLETION_WAIT_SECONDS))
+        )
         build_cfg['dataset_build'] = build_block
         DATASET_BUILD_CONFIG_ACTIVE = _write_yaml(build_cfg, DATASET_BUILD_CONFIG_ACTIVE_PATH)
 
@@ -3020,6 +3032,7 @@ cells = [
 
         REFRESH_S = 5
         LOOPS = int(MONITOR_MAX_LOOPS)
+        GLOBAL_SNAPSHOT_EVERY_N_LOOPS = 6
         ROOT = Path(JOBS_ROOT)
         PIPELINE_DIR = Path(PIPELINE_LOGS_DIR)
         GLOBAL_DATASET_ID = str(
@@ -3131,15 +3144,25 @@ cells = [
                 }
             return {'labeled_samples': None, 'updated_at': None, 'build_status': None}
 
-        def _load_merge_events(events_path: Path) -> tuple[list[dict], list[dict]]:
+        def _scan_merge_events_incremental(events_path: Path, start_offset: int) -> tuple[list[dict], list[dict], int]:
             completed = []
             failed = []
             if not events_path.exists():
-                return completed, failed
+                return completed, failed, 0
+            safe_start = max(0, int(start_offset or 0))
             try:
-                with events_path.open('r', encoding='utf-8') as handle:
-                    for line in handle:
-                        text = str(line).strip()
+                file_size = int(events_path.stat().st_size)
+                if safe_start > file_size:
+                    safe_start = 0
+            except Exception:
+                safe_start = 0
+            end_offset = safe_start
+            try:
+                with events_path.open('rb') as handle:
+                    if safe_start > 0:
+                        handle.seek(safe_start)
+                    for raw_line in handle:
+                        text = raw_line.decode('utf-8', errors='ignore').strip()
                         if not text:
                             continue
                         try:
@@ -3156,7 +3179,11 @@ cells = [
                                     'trigger': str(payload.get('trigger', '')).strip() or None,
                                     'target_dataset_id': str(payload.get('target_dataset_id', '')).strip() or None,
                                     'source_dataset_count': _coalesce_int(payload.get('source_dataset_count')),
+                                    'source_labeled_total': _coalesce_int(payload.get('source_labeled_total')),
+                                    'source_signature': str(payload.get('source_signature', '')).strip() or None,
                                     'labeled_samples_after': _coalesce_int(payload.get('labeled_samples')),
+                                    'async_mode': bool(payload.get('async_mode', False)),
+                                    'duration_seconds': _coalesce_int(payload.get('duration_seconds')),
                                 }
                             )
                         elif message == 'dataset_build_progressive_global_merge_failed':
@@ -3164,12 +3191,15 @@ cells = [
                                 {
                                     'timestamp': str(payload.get('timestamp', '')).strip() or None,
                                     'trigger': str(payload.get('trigger', '')).strip() or None,
+                                    'source_dataset_count': _coalesce_int(payload.get('source_dataset_count')),
+                                    'source_labeled_total': _coalesce_int(payload.get('source_labeled_total')),
                                     'error': str(payload.get('error', '')).strip() or None,
                                 }
                             )
+                    end_offset = int(handle.tell())
             except Exception:
-                return completed, failed
-            return completed, failed
+                return completed, failed, safe_start
+            return completed, failed, end_offset
 
         generate_job_id, build_job_id, manifest_path = _resolve_job_ids()
         print('manifest =', str(manifest_path) if manifest_path is not None else '<none>')
@@ -3186,7 +3216,14 @@ cells = [
 
         prev = None
         prev_global_labeled = None
-        merge_count_seen = None
+        global_snapshot_cache = {'labeled_samples': None, 'updated_at': None, 'build_status': None}
+        global_snapshot_last_refresh_idx = 0
+        global_snapshot_refresh_count = 0
+        events_offset_by_path = {}
+        merge_completed_total = 0
+        merge_failed_total = 0
+        last_merge_event = None
+        last_failed_merge_event = None
         merge_after_seen = None
 
         for idx in range(1, LOOPS + 1):
@@ -3219,24 +3256,31 @@ cells = [
             if delta_build is not None and REFRESH_S > 0:
                 build_rate_per_min = int(round((delta_build / float(REFRESH_S)) * 60.0))
 
-            global_snapshot = _global_dataset_snapshot(GLOBAL_DATASET_ID)
+            global_snapshot_refreshed = False
+            if idx == 1 or (idx - global_snapshot_last_refresh_idx) >= GLOBAL_SNAPSHOT_EVERY_N_LOOPS:
+                global_snapshot_cache = _global_dataset_snapshot(GLOBAL_DATASET_ID)
+                global_snapshot_last_refresh_idx = idx
+                global_snapshot_refresh_count += 1
+                global_snapshot_refreshed = True
+            global_snapshot = global_snapshot_cache
             global_labeled = _coalesce_int(global_snapshot.get('labeled_samples'))
-            delta_global_labeled = (
-                None if prev_global_labeled is None else int((global_labeled or 0) - (prev_global_labeled or 0))
-            )
-            prev_global_labeled = global_labeled
+            if global_snapshot_refreshed:
+                delta_global_labeled = (
+                    None if prev_global_labeled is None else int((global_labeled or 0) - (prev_global_labeled or 0))
+                )
+                prev_global_labeled = global_labeled
+            else:
+                delta_global_labeled = 0
+            global_snapshot_age_loops = max(0, idx - global_snapshot_last_refresh_idx)
 
             events_path = (bld_dir / 'events.jsonl') if bld_dir else Path('')
-            merge_events, merge_failed_events = _load_merge_events(events_path) if bld_dir else ([], [])
-            merge_count = len(merge_events)
-            failed_count = len(merge_failed_events)
-
-            if merge_count_seen is None:
-                merge_count_seen = merge_count
-                if merge_events:
-                    merge_after_seen = merge_events[-1].get('labeled_samples_after')
-                else:
-                    merge_after_seen = global_labeled
+            events_key = str(events_path) if bld_dir else '<none>'
+            new_merge_events = []
+            new_failed_events = []
+            if bld_dir:
+                start_offset = int(events_offset_by_path.get(events_key, 0) or 0)
+                new_merge_events, new_failed_events, end_offset = _scan_merge_events_incremental(events_path, start_offset)
+                events_offset_by_path[events_key] = int(end_offset)
 
             ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             print(
@@ -3252,37 +3296,50 @@ cells = [
                 f'      global_dataset={GLOBAL_DATASET_ID or "<none>"} | '
                 f'global_labeled={_fmt(global_labeled)} (Δ{_fmt(delta_global_labeled)}) | '
                 f'global_build_status={_fmt(global_snapshot.get("build_status"))} | '
-                f'global_updated_at={_fmt(global_snapshot.get("updated_at"))}'
+                f'global_updated_at={_fmt(global_snapshot.get("updated_at"))} | '
+                f'global_snapshot_mode={"fresh" if global_snapshot_refreshed else "cached"} | '
+                f'global_snapshot_age_loops={global_snapshot_age_loops} | refresh_count={global_snapshot_refresh_count}'
             )
             print(
-                f'      merges_completed={merge_count} | merges_failed={failed_count} | '
+                f'      merges_completed={merge_completed_total} (+{len(new_merge_events)}) | '
+                f'merges_failed={merge_failed_total} (+{len(new_failed_events)}) | '
+                f'events_offset={events_offset_by_path.get(events_key, 0)} | '
                 f'events_path={str(events_path) if bld_dir else "<none>"}'
             )
 
-            if merge_count > (merge_count_seen or 0):
-                start_index = int(merge_count_seen or 0)
-                for merge_idx in range(start_index, merge_count):
-                    event = merge_events[merge_idx]
-                    after_value = _coalesce_int(event.get('labeled_samples_after'))
-                    before_value = merge_after_seen
-                    delta_value = None
-                    if before_value is not None and after_value is not None:
-                        delta_value = int(after_value - before_value)
-                    print(
-                        f'      MERGE #{merge_idx + 1} | ts={_fmt(event.get("timestamp"))} | trigger={_fmt(event.get("trigger"))} | '
-                        f'sources={_fmt(event.get("source_dataset_count"))} | global_before={_fmt(before_value)} -> global_after={_fmt(after_value)} | '
-                        f'Δ={_fmt(delta_value)}'
-                    )
-                    if after_value is not None:
-                        merge_after_seen = after_value
-                merge_count_seen = merge_count
-
-            if merge_events:
-                last_merge = merge_events[-1]
-                before_last = merge_events[-2].get('labeled_samples_after') if len(merge_events) >= 2 else None
+            for event in new_merge_events:
+                merge_completed_total += 1
+                after_value = _coalesce_int(event.get('labeled_samples_after'))
+                before_value = merge_after_seen
+                if before_value is None and global_labeled is not None:
+                    before_value = global_labeled
+                delta_value = None
+                if before_value is not None and after_value is not None:
+                    delta_value = int(after_value - before_value)
                 print(
-                    f'      last_merge | ts={_fmt(last_merge.get("timestamp"))} | trigger={_fmt(last_merge.get("trigger"))} | '
-                    f'global_before={_fmt(_coalesce_int(before_last))} -> global_after={_fmt(last_merge.get("labeled_samples_after"))}'
+                    f'      MERGE #{merge_completed_total} | ts={_fmt(event.get("timestamp"))} | trigger={_fmt(event.get("trigger"))} | '
+                    f'sources={_fmt(event.get("source_dataset_count"))} | source_labeled={_fmt(event.get("source_labeled_total"))} | '
+                    f'global_before={_fmt(before_value)} -> global_after={_fmt(after_value)} | Δ={_fmt(delta_value)} | '
+                    f'async={_fmt(event.get("async_mode"))}'
+                )
+                if after_value is not None:
+                    merge_after_seen = after_value
+                last_merge_event = event
+
+            for event in new_failed_events:
+                merge_failed_total += 1
+                last_failed_merge_event = event
+
+            if last_merge_event:
+                print(
+                    f'      last_merge | ts={_fmt(last_merge_event.get("timestamp"))} | trigger={_fmt(last_merge_event.get("trigger"))} | '
+                    f'sources={_fmt(last_merge_event.get("source_dataset_count"))} | source_labeled={_fmt(last_merge_event.get("source_labeled_total"))} | '
+                    f'global_after={_fmt(last_merge_event.get("labeled_samples_after"))}'
+                )
+            if last_failed_merge_event:
+                print(
+                    f'      last_merge_failed | ts={_fmt(last_failed_merge_event.get("timestamp"))} | '
+                    f'trigger={_fmt(last_failed_merge_event.get("trigger"))} | error={_fmt(last_failed_merge_event.get("error"))}'
                 )
 
             prev = local
