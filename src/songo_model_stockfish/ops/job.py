@@ -573,6 +573,9 @@ class JobContext:
                 payload["phase"] = str(status_payload.get("phase", ""))
             if state_payload is not None:
                 payload["state_summary"] = dict(compact_state_payload)
+            # Nettoyage defensif: retire l'ancien champ lourd `state` si present
+            # dans les documents historiques, sinon Firestore peut depasser 1 MiB.
+            payload["state"] = firestore.DELETE_FIELD
             doc_ref.set(payload, merge=True)
             self._last_firestore_checkpoint_write_ts = now_ts
             if status_payload is not None:
