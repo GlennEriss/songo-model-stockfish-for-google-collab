@@ -6822,6 +6822,45 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
     hard_examples_weight_multiplier = max(1.0, float(cfg.get("hard_examples_weight_multiplier", 2.0)))
     dedupe_sample_ids = _as_bool(cfg.get("dedupe_sample_ids", True), default=True)
     export_partial_every_n_files = max(1, int(cfg.get("export_partial_every_n_files", 250)))
+    progressive_global_merge_enabled = _as_bool(cfg.get("progressive_global_merge_enabled", False), default=False)
+    progressive_global_merge_dataset_id = str(cfg.get("progressive_global_merge_dataset_id", "")).strip()
+    progressive_global_merge_source_dataset_id_prefix = str(
+        cfg.get("progressive_global_merge_source_dataset_id_prefix", "")
+    ).strip()
+    progressive_global_merge_include_partial = _as_bool(
+        cfg.get("progressive_global_merge_include_partial", True),
+        default=True,
+    )
+    progressive_global_merge_every_n_partial_exports = max(
+        1,
+        int(cfg.get("progressive_global_merge_every_n_partial_exports", 1)),
+    )
+    progressive_global_merge_min_interval_seconds = max(
+        0.0,
+        float(cfg.get("progressive_global_merge_min_interval_seconds", 300.0)),
+    )
+    progressive_global_merge_min_sources = max(1, int(cfg.get("progressive_global_merge_min_sources", 2)))
+    progressive_global_merge_on_completion = _as_bool(
+        cfg.get("progressive_global_merge_on_completion", True),
+        default=True,
+    )
+    progressive_global_merge_dedupe_sample_ids = _as_bool(
+        cfg.get("progressive_global_merge_dedupe_sample_ids", dedupe_sample_ids),
+        default=dedupe_sample_ids,
+    )
+    progressive_global_merge_lock_ttl_seconds = max(
+        30.0,
+        float(cfg.get("progressive_global_merge_lock_ttl_seconds", 1800.0)),
+    )
+    progressive_global_merge_lock_wait_seconds = max(
+        1.0,
+        float(cfg.get("progressive_global_merge_lock_wait_seconds", 30.0)),
+    )
+    if progressive_global_merge_enabled and not progressive_global_merge_dataset_id:
+        job.logger.warning(
+            "dataset build progressive global merge disabled | reason=missing progressive_global_merge_dataset_id"
+        )
+        progressive_global_merge_enabled = False
     adaptive_source_polling = _as_bool(cfg.get("adaptive_source_polling", True), default=True)
     source_poll_interval_min_seconds = max(1.0, float(cfg.get("source_poll_interval_min_seconds", max(1.0, source_poll_interval_seconds / 2.0))))
     source_poll_interval_max_seconds = max(source_poll_interval_min_seconds, float(cfg.get("source_poll_interval_max_seconds", max(source_poll_interval_seconds * 4.0, source_poll_interval_min_seconds))))
@@ -6892,6 +6931,18 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         str(global_firestore_diag.get("auth_mode", "")) or "<unknown>",
         bool(global_firestore_diag.get("credentials_path_exists", False)),
         bool(global_firestore_diag.get("api_key_set", False)),
+    )
+    job.logger.info(
+        "dataset build progressive global merge config | enabled=%s | target_dataset_id=%s | source_prefix=%s | include_partial=%s | every_n_partial_exports=%s | min_interval_seconds=%.1f | min_sources=%s | on_completion=%s | dedupe_sample_ids=%s",
+        progressive_global_merge_enabled,
+        progressive_global_merge_dataset_id or "<empty>",
+        progressive_global_merge_source_dataset_id_prefix or "<none>",
+        progressive_global_merge_include_partial,
+        progressive_global_merge_every_n_partial_exports,
+        progressive_global_merge_min_interval_seconds,
+        progressive_global_merge_min_sources,
+        progressive_global_merge_on_completion,
+        progressive_global_merge_dedupe_sample_ids,
     )
 
     dataset_dir = job.job_dir / "dataset_build"
@@ -7099,6 +7150,8 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
     last_logged_progress_count = -1
     build_started_monotonic = time.monotonic()
     last_partial_export_processed = 0
+    progressive_global_merge_exports_count = 0
+    last_progressive_global_merge_monotonic = 0.0
     last_completed_file_name = sampled_relative_names[contiguous_completed_prefix - 1] if contiguous_completed_prefix > 0 else ""
 
     def _estimate_remaining_seconds() -> float | None:
@@ -7138,6 +7191,116 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
             }
         )
 
+    def _collect_progressive_global_merge_source_dataset_ids() -> list[str]:
+        if not progressive_global_merge_enabled:
+            return []
+        registry = _read_dataset_registry(job)
+        candidates: list[str] = []
+        seen: set[str] = set()
+        for entry in registry.get("built_datasets", []):
+            if not isinstance(entry, dict):
+                continue
+            candidate_id = str(entry.get("dataset_id", "")).strip()
+            if not candidate_id or candidate_id in seen:
+                continue
+            if candidate_id == progressive_global_merge_dataset_id:
+                continue
+            if (
+                progressive_global_merge_source_dataset_id_prefix
+                and not candidate_id.startswith(progressive_global_merge_source_dataset_id_prefix)
+            ):
+                continue
+            build_status = str(entry.get("build_status", "")).strip().lower()
+            if not progressive_global_merge_include_partial and build_status != "completed":
+                continue
+            output_dir_text = str(entry.get("output_dir", "")).strip()
+            if not output_dir_text:
+                continue
+            output_dir = Path(output_dir_text)
+            if not (
+                (output_dir / "train.npz").exists()
+                and (output_dir / "validation.npz").exists()
+                and (output_dir / "test.npz").exists()
+            ):
+                continue
+            seen.add(candidate_id)
+            candidates.append(candidate_id)
+        return candidates
+
+    def _maybe_progressive_global_merge(*, force: bool = False, trigger: str = "partial_snapshot") -> None:
+        nonlocal last_progressive_global_merge_monotonic
+        if not progressive_global_merge_enabled:
+            return
+        now_monotonic = time.monotonic()
+        if not force:
+            if (
+                progressive_global_merge_exports_count % progressive_global_merge_every_n_partial_exports
+            ) != 0:
+                return
+            if (
+                progressive_global_merge_min_interval_seconds > 0
+                and (now_monotonic - last_progressive_global_merge_monotonic)
+                < progressive_global_merge_min_interval_seconds
+            ):
+                return
+        source_dataset_ids_for_merge = _collect_progressive_global_merge_source_dataset_ids()
+        if len(source_dataset_ids_for_merge) < progressive_global_merge_min_sources:
+            job.logger.info(
+                "dataset build progressive global merge skipped | trigger=%s | reason=insufficient_sources | sources=%s | min_sources=%s",
+                trigger,
+                len(source_dataset_ids_for_merge),
+                progressive_global_merge_min_sources,
+            )
+            return
+        merge_cfg = {
+            "dataset_id": progressive_global_merge_dataset_id,
+            "source_dataset_ids": source_dataset_ids_for_merge,
+            "include_all_built": False,
+            "dedupe_sample_ids": progressive_global_merge_dedupe_sample_ids,
+            "merge_lock_ttl_seconds": progressive_global_merge_lock_ttl_seconds,
+            "merge_lock_wait_seconds": progressive_global_merge_lock_wait_seconds,
+        }
+        previous_merge_cfg = job.config.get("dataset_merge_final")
+        try:
+            job.config["dataset_merge_final"] = merge_cfg
+            merge_summary = run_dataset_merge_final(job)
+            merged_labeled_samples = int(merge_summary.get("labeled_samples", 0)) if isinstance(merge_summary, dict) else 0
+            last_progressive_global_merge_monotonic = now_monotonic
+            job.logger.info(
+                "dataset build progressive global merge completed | trigger=%s | target_dataset_id=%s | source_datasets=%s | labeled_samples=%s",
+                trigger,
+                progressive_global_merge_dataset_id,
+                len(source_dataset_ids_for_merge),
+                merged_labeled_samples,
+            )
+            job.write_event(
+                "dataset_build_progressive_global_merge_completed",
+                trigger=trigger,
+                target_dataset_id=progressive_global_merge_dataset_id,
+                source_dataset_count=len(source_dataset_ids_for_merge),
+                labeled_samples=merged_labeled_samples,
+            )
+        except Exception as exc:
+            job.logger.warning(
+                "dataset build progressive global merge failed | trigger=%s | target_dataset_id=%s | source_datasets=%s | error=%s",
+                trigger,
+                progressive_global_merge_dataset_id,
+                len(source_dataset_ids_for_merge),
+                exc,
+            )
+            job.write_event(
+                "dataset_build_progressive_global_merge_failed",
+                trigger=trigger,
+                target_dataset_id=progressive_global_merge_dataset_id,
+                source_dataset_count=len(source_dataset_ids_for_merge),
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        finally:
+            if previous_merge_cfg is None:
+                job.config.pop("dataset_merge_final", None)
+            else:
+                job.config["dataset_merge_final"] = previous_merge_cfg
+
     def _log_build_progress_if_needed() -> None:
         nonlocal last_logged_progress_count
         if processed_count == last_logged_progress_count:
@@ -7163,7 +7326,7 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         return target_labeled_samples > 0 and labeled_samples_total >= target_labeled_samples
 
     def _export_partial_snapshot_if_needed(*, force: bool = False) -> None:
-        nonlocal last_partial_export_processed
+        nonlocal last_partial_export_processed, progressive_global_merge_exports_count
         if processed_count <= 0:
             return
         if not force and (processed_count - last_partial_export_processed) < export_partial_every_n_files:
@@ -7216,6 +7379,8 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
             dedupe_sample_ids=dedupe_sample_ids,
             input_dim=exported_input_dim,
         )
+        progressive_global_merge_exports_count += 1
+        _maybe_progressive_global_merge(force=False, trigger="partial_snapshot")
 
     job.logger.info(
         "dataset build started | dataset=%s | source_dataset_id=%s | build_mode=%s | teacher=%s:%s | sampled_root=%s | label_cache=%s | output_dir=%s | files=%s | target_labeled_samples=%s | workers=%s | include_tactical_analysis=%s | dedupe_sample_ids=%s",
@@ -7758,6 +7923,8 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
         duplicate_samples_removed=duplicate_samples_removed,
         dedupe_sample_ids=dedupe_sample_ids,
     )
+    if progressive_global_merge_enabled and progressive_global_merge_on_completion:
+        _maybe_progressive_global_merge(force=True, trigger="build_completed")
     _write_global_progress_read_telemetry_metric()
     return summary
 
@@ -7770,6 +7937,7 @@ def run_dataset_merge_final(job: JobContext) -> dict[str, object]:
 
     source_dataset_ids = [str(value).strip() for value in cfg.get("source_dataset_ids", []) if str(value).strip()]
     include_all_built = bool(cfg.get("include_all_built", False))
+    source_dataset_id_prefix = str(cfg.get("source_dataset_id_prefix", "")).strip()
     dedupe_sample_ids = bool(cfg.get("dedupe_sample_ids", True))
     merge_lock_ttl_seconds = max(30.0, float(cfg.get("merge_lock_ttl_seconds", 1800.0)))
     merge_lock_wait_seconds = max(1.0, float(cfg.get("merge_lock_wait_seconds", 180.0)))
@@ -7799,6 +7967,10 @@ def run_dataset_merge_final(job: JobContext) -> dict[str, object]:
         built_entries = registry.get("built_datasets", [])
         if include_all_built:
             source_dataset_ids = [str(entry.get("dataset_id", "")).strip() for entry in built_entries if str(entry.get("dataset_id", "")).strip()]
+        if source_dataset_id_prefix:
+            source_dataset_ids = [item for item in source_dataset_ids if item.startswith(source_dataset_id_prefix)]
+        source_dataset_ids = [item for item in source_dataset_ids if item and item != dataset_id]
+        source_dataset_ids = list(dict.fromkeys(source_dataset_ids))
         if not source_dataset_ids:
             raise ValueError("Aucun `source_dataset_ids` fourni pour `dataset_merge_final`")
 
