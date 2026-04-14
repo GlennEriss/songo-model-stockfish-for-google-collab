@@ -4096,11 +4096,12 @@ cells = [
         DATASET_PREVIEW_SPLIT = 'train'  # 'train', 'validation', 'test'
         DATASET_PREVIEW_SEED = 42
         DATASET_PREVIEW_FEATURES_HEAD = 16
+        DATASET_SANITY_DATASET_ID = str(BASE_DATASET_BUILD_ID).strip()
 
         def _resolve_preview_dataset_entry() -> dict:
             registry = _load_dataset_registry_payload()
             built_entries = [item for item in registry.get('built_datasets', []) if isinstance(item, dict)]
-            requested = str(DATASET_BUILD_ID).strip()
+            requested = str(DATASET_SANITY_DATASET_ID).strip() or str(BASE_DATASET_BUILD_ID).strip()
             split_name = str(DATASET_PREVIEW_SPLIT).strip().lower() or 'train'
 
             def _has_split(entry: dict) -> bool:
@@ -4816,7 +4817,111 @@ cells = [
             f'train --config {shlex.quote(str(TRAIN_CONTINUE_CONFIG_ACTIVE))} '
             f'--job-id {shlex.quote(TRAIN_CONTINUE_JOB_ID)}'
         )
-        subprocess.run(['/bin/bash', '-lc', train_cmd], check=True)
+        def _run_train_with_progress(*, cmd: str, job_id: str, mode_label: str) -> None:
+            import json as _json
+            import time as _time
+            from datetime import datetime as _dt, timezone as _tz
+            from pathlib import Path as _Path
+            import subprocess as _subprocess
+
+            def _load_json_dict(path: _Path, default=None):
+                fallback = {} if default is None else default
+                if not path.exists():
+                    return fallback
+                try:
+                    payload = _json.loads(path.read_text(encoding='utf-8'))
+                except Exception:
+                    return fallback
+                return payload if isinstance(payload, dict) else fallback
+
+            def _job_prefix_for_rollover(job_id_value: str) -> str:
+                text = str(job_id_value).strip()
+                if not text:
+                    return text
+                parts = text.rsplit('_', 1)
+                if len(parts) == 2 and parts[1].isdigit():
+                    return parts[0]
+                return text
+
+            def _latest_job_dir_for_job_id(job_id_value: str) -> _Path | None:
+                jobs_root = _Path(JOBS_ROOT)
+                if not jobs_root.exists():
+                    return None
+                requested = str(job_id_value).strip()
+                if not requested:
+                    return None
+                prefix = _job_prefix_for_rollover(requested)
+                candidates = []
+                for path in jobs_root.iterdir():
+                    if not path.is_dir():
+                        continue
+                    name = path.name
+                    if name == requested or name == prefix or (prefix and name.startswith(prefix + '_')):
+                        candidates.append(path)
+                if not candidates:
+                    return None
+                return sorted(candidates, key=lambda p: p.stat().st_mtime)[-1]
+
+            def _fmt_age_seconds(updated_at_text: str) -> str:
+                text = str(updated_at_text or '').strip()
+                if not text:
+                    return '<none>'
+                try:
+                    dt = _dt.fromisoformat(text.replace('Z', '+00:00'))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=_tz.utc)
+                    age = int((_dt.now(_tz.utc) - dt.astimezone(_tz.utc)).total_seconds())
+                    return f'{max(0, age)}s'
+                except Exception:
+                    return '<none>'
+
+            print(f'[TRAIN PROGRESS][{mode_label}] lancement...')
+            proc = _subprocess.Popen(['/bin/bash', '-lc', cmd])
+            loop_idx = 0
+            while True:
+                loop_idx += 1
+                return_code = proc.poll()
+                job_dir = _latest_job_dir_for_job_id(job_id)
+                run_status = {}
+                summary = {}
+                if job_dir is not None:
+                    run_status = _load_json_dict(job_dir / 'run_status.json', default={})
+                    summary = _load_json_dict(job_dir / 'training_summary.json', default={})
+                state = run_status.get('state_summary', {}) if isinstance(run_status.get('state_summary', {}), dict) else {}
+                status = run_status.get('status', '<none>')
+                phase = run_status.get('phase', '<none>')
+                updated_at = run_status.get('updated_at', '')
+                epoch_current = (
+                    state.get('epoch')
+                    or state.get('current_epoch')
+                    or summary.get('epochs_completed')
+                    or summary.get('epoch')
+                    or '<none>'
+                )
+                epoch_total = (
+                    state.get('epochs_total')
+                    or state.get('max_epochs')
+                    or summary.get('max_epochs')
+                    or summary.get('epochs')
+                    or '<none>'
+                )
+                best_epoch = summary.get('best_epoch', '<none>')
+                best_val_metric = summary.get('best_val_metric', '<none>')
+                last_val_acc = summary.get('last_val_acc', '<none>')
+                print(
+                    f'[TRAIN PROGRESS][{mode_label}][{loop_idx:03d}] '
+                    f'status={status} | phase={phase} | epoch={epoch_current}/{epoch_total} '
+                    f'| best_epoch={best_epoch} | best_val_metric={best_val_metric} '
+                    f'| last_val_acc={last_val_acc} | age={_fmt_age_seconds(updated_at)}'
+                )
+                if return_code is not None:
+                    if return_code != 0:
+                        raise _subprocess.CalledProcessError(return_code, cmd)
+                    print(f'[TRAIN PROGRESS][{mode_label}] termine avec succes.')
+                    break
+                _time.sleep(15.0)
+
+        _run_train_with_progress(cmd=train_cmd, job_id=TRAIN_CONTINUE_JOB_ID, mode_label='continue')
 
         train_dataset_id, train_model_id, train_checkpoint_path = _resolve_train_artifacts(TRAIN_CONTINUE_JOB_ID)
         print('Evaluation lock        = dataset_id', train_dataset_id, '| model_id', train_model_id)
@@ -4983,7 +5088,111 @@ cells = [
             f'train --config {shlex.quote(str(TRAIN_SCRATCH_CONFIG_ACTIVE))} '
             f'--job-id {shlex.quote(TRAIN_SCRATCH_JOB_ID)}'
         )
-        subprocess.run(['/bin/bash', '-lc', train_cmd], check=True)
+        def _run_train_with_progress(*, cmd: str, job_id: str, mode_label: str) -> None:
+            import json as _json
+            import time as _time
+            from datetime import datetime as _dt, timezone as _tz
+            from pathlib import Path as _Path
+            import subprocess as _subprocess
+
+            def _load_json_dict(path: _Path, default=None):
+                fallback = {} if default is None else default
+                if not path.exists():
+                    return fallback
+                try:
+                    payload = _json.loads(path.read_text(encoding='utf-8'))
+                except Exception:
+                    return fallback
+                return payload if isinstance(payload, dict) else fallback
+
+            def _job_prefix_for_rollover(job_id_value: str) -> str:
+                text = str(job_id_value).strip()
+                if not text:
+                    return text
+                parts = text.rsplit('_', 1)
+                if len(parts) == 2 and parts[1].isdigit():
+                    return parts[0]
+                return text
+
+            def _latest_job_dir_for_job_id(job_id_value: str) -> _Path | None:
+                jobs_root = _Path(JOBS_ROOT)
+                if not jobs_root.exists():
+                    return None
+                requested = str(job_id_value).strip()
+                if not requested:
+                    return None
+                prefix = _job_prefix_for_rollover(requested)
+                candidates = []
+                for path in jobs_root.iterdir():
+                    if not path.is_dir():
+                        continue
+                    name = path.name
+                    if name == requested or name == prefix or (prefix and name.startswith(prefix + '_')):
+                        candidates.append(path)
+                if not candidates:
+                    return None
+                return sorted(candidates, key=lambda p: p.stat().st_mtime)[-1]
+
+            def _fmt_age_seconds(updated_at_text: str) -> str:
+                text = str(updated_at_text or '').strip()
+                if not text:
+                    return '<none>'
+                try:
+                    dt = _dt.fromisoformat(text.replace('Z', '+00:00'))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=_tz.utc)
+                    age = int((_dt.now(_tz.utc) - dt.astimezone(_tz.utc)).total_seconds())
+                    return f'{max(0, age)}s'
+                except Exception:
+                    return '<none>'
+
+            print(f'[TRAIN PROGRESS][{mode_label}] lancement...')
+            proc = _subprocess.Popen(['/bin/bash', '-lc', cmd])
+            loop_idx = 0
+            while True:
+                loop_idx += 1
+                return_code = proc.poll()
+                job_dir = _latest_job_dir_for_job_id(job_id)
+                run_status = {}
+                summary = {}
+                if job_dir is not None:
+                    run_status = _load_json_dict(job_dir / 'run_status.json', default={})
+                    summary = _load_json_dict(job_dir / 'training_summary.json', default={})
+                state = run_status.get('state_summary', {}) if isinstance(run_status.get('state_summary', {}), dict) else {}
+                status = run_status.get('status', '<none>')
+                phase = run_status.get('phase', '<none>')
+                updated_at = run_status.get('updated_at', '')
+                epoch_current = (
+                    state.get('epoch')
+                    or state.get('current_epoch')
+                    or summary.get('epochs_completed')
+                    or summary.get('epoch')
+                    or '<none>'
+                )
+                epoch_total = (
+                    state.get('epochs_total')
+                    or state.get('max_epochs')
+                    or summary.get('max_epochs')
+                    or summary.get('epochs')
+                    or '<none>'
+                )
+                best_epoch = summary.get('best_epoch', '<none>')
+                best_val_metric = summary.get('best_val_metric', '<none>')
+                last_val_acc = summary.get('last_val_acc', '<none>')
+                print(
+                    f'[TRAIN PROGRESS][{mode_label}][{loop_idx:03d}] '
+                    f'status={status} | phase={phase} | epoch={epoch_current}/{epoch_total} '
+                    f'| best_epoch={best_epoch} | best_val_metric={best_val_metric} '
+                    f'| last_val_acc={last_val_acc} | age={_fmt_age_seconds(updated_at)}'
+                )
+                if return_code is not None:
+                    if return_code != 0:
+                        raise _subprocess.CalledProcessError(return_code, cmd)
+                    print(f'[TRAIN PROGRESS][{mode_label}] termine avec succes.')
+                    break
+                _time.sleep(15.0)
+
+        _run_train_with_progress(cmd=train_cmd, job_id=TRAIN_SCRATCH_JOB_ID, mode_label='scratch')
 
         train_dataset_id, train_model_id, train_checkpoint_path = _resolve_train_artifacts(TRAIN_SCRATCH_JOB_ID)
         print('Evaluation lock        = dataset_id', train_dataset_id, '| model_id', train_model_id)
