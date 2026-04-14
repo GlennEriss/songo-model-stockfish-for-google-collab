@@ -351,6 +351,7 @@ cells = [
         TRAIN_SCRATCH_20M_CONFIG_ACTIVE_PATH = f'{WORKTREE}/config/generated/train.full_matrix.colab_pro.scratch.dataset20m.active.yaml'
         EVALUATION_20M_CONFIG_ACTIVE_PATH = f'{WORKTREE}/config/generated/evaluation.full_matrix.colab_pro.dataset20m.active.yaml'
         EVALUATION_20M_RUNTIME_CONFIG_PATH = f'{WORKTREE}/config/generated/evaluation.full_matrix.colab_pro.dataset20m.runtime.active.yaml'
+        TRAIN_REQUIRE_GLOBAL_MERGED_DATASET = True
 
         DATASET_LIST_KIND = 'all'       # 'sources', 'built', 'all'
         DATASET_LIST_SORT_BY = 'size'   # 'size', 'created_at', 'updated_at'
@@ -1664,6 +1665,13 @@ cells = [
             if exact_global is not None:
                 return str(exact_global.get('dataset_id', BASE_DATASET_BUILD_ID))
 
+            if bool(TRAIN_REQUIRE_GLOBAL_MERGED_DATASET):
+                raise RuntimeError(
+                    'Dataset global fusionne requis pour train/eval mais indisponible '
+                    f'(dataset_id={BASE_DATASET_BUILD_ID}). Verifie train.npz/validation.npz '
+                    'dans output_dir du merged_final.'
+                )
+
             family_prefix = f'{BASE_DATASET_BUILD_ID}_'
             family = [
                 item
@@ -1730,6 +1738,13 @@ cells = [
         eval_cfg['evaluation'] = eval_block
         EVALUATION_20M_CONFIG_ACTIVE = _write_yaml(eval_cfg, EVALUATION_20M_CONFIG_ACTIVE_PATH)
 
+        # Important: les cellules Train/Eval (A/B) utilisent TRAIN_*_CONFIG_ACTIVE.
+        # On les bascule explicitement vers les configs "20M active" pour garantir
+        # un dataset_selection_mode=configured sur le dataset global resolu.
+        TRAIN_CONTINUE_CONFIG_ACTIVE = str(TRAIN_CONTINUE_20M_CONFIG_ACTIVE)
+        TRAIN_SCRATCH_CONFIG_ACTIVE = str(TRAIN_SCRATCH_20M_CONFIG_ACTIVE)
+        EVALUATION_CONFIG_ACTIVE = str(EVALUATION_20M_CONFIG_ACTIVE)
+
         benchmark_cfg = yaml.safe_load(Path(BENCHMARK_CONFIG_ACTIVE).read_text(encoding='utf-8')) or {}
         benchmark_block = dict(benchmark_cfg.get('benchmark', {}) or {})
         benchmark_block['parallel_enabled'] = bool(BENCHMARK_PARALLEL_ENABLED)
@@ -1750,6 +1765,7 @@ cells = [
         print('DATASET_GENERATE_CONFIG_ACTIVE =', DATASET_GENERATE_CONFIG_ACTIVE)
         print('DATASET_BUILD_CONFIG_ACTIVE    =', DATASET_BUILD_CONFIG_ACTIVE)
         print('TRAIN_EVAL_DATASET_ID          =', TRAIN_EVAL_DATASET_ID)
+        print('TRAIN_REQUIRE_GLOBAL_MERGED_DATASET =', TRAIN_REQUIRE_GLOBAL_MERGED_DATASET)
         print('GLOBAL_PROGRESS_BACKEND        =', GLOBAL_PROGRESS_BACKEND)
         print('FIRESTORE_PROJECT_ID           =', FIRESTORE_PROJECT_ID)
         print('FIRESTORE_COLLECTION           =', FIRESTORE_COLLECTION)
@@ -3821,8 +3837,38 @@ cells = [
                     return (str(item.get('dataset_version', '')), _size_value(item, kind))
                 return (str(item.get('updated_at', '')), _size_value(item, kind))
 
+            built_entries = [item for item in registry.get('built_datasets', []) if isinstance(item, dict)]
+            global_dataset_id = str(BASE_DATASET_BUILD_ID).strip()
+            global_candidates = [
+                item
+                for item in built_entries
+                if str(item.get('dataset_id', '')).strip() == global_dataset_id
+            ]
+            global_entry = None
+            if global_candidates:
+                global_candidates = sorted(
+                    global_candidates,
+                    key=lambda item: (str(item.get('updated_at', '')), int(item.get('labeled_samples', 0) or 0)),
+                    reverse=True,
+                )
+                global_entry = global_candidates[0]
+
+            print('Global merged dataset:')
+            if isinstance(global_entry, dict):
+                print(
+                    '-', global_entry.get('dataset_id'),
+                    '| build_mode=', global_entry.get('build_mode', 'merged_final'),
+                    '| status=', global_entry.get('build_status', 'completed'),
+                    '| labeled=', global_entry.get('labeled_samples', 0),
+                    '| schema=', global_entry.get('feature_schema_version', '<na>'),
+                    '| created=', _fmt_ts(global_entry.get('dataset_version', '')),
+                    '| updated=', _fmt_ts(global_entry.get('updated_at', '')),
+                )
+            else:
+                print('-', global_dataset_id, '| status=not_found_in_registry')
+
             if DATASET_LIST_KIND in ('sources', 'all'):
-                print('Sources datasets:')
+                print('\\nSources datasets:')
                 sources = sorted(registry.get('dataset_sources', []), key=lambda item: _sort_key(item, 'source'), reverse=True)
                 for item in sources[:DATASET_LIST_LIMIT]:
                     print(
@@ -3838,7 +3884,7 @@ cells = [
 
             if DATASET_LIST_KIND in ('built', 'all'):
                 print('\\nBuilt datasets:')
-                built = sorted(registry.get('built_datasets', []), key=lambda item: _sort_key(item, 'built'), reverse=True)
+                built = sorted(built_entries, key=lambda item: _sort_key(item, 'built'), reverse=True)
                 for item in built[:DATASET_LIST_LIMIT]:
                     print(
                         '-', item.get('dataset_id'),
@@ -3853,6 +3899,176 @@ cells = [
                     print('- none')
         except Exception as exc:
             print('dataset_registry Firestore introuvable:', f'{type(exc).__name__}: {exc}')
+        """
+    ),
+    md("## 6ter. Suivi Clair Du Dataset En Construction"),
+    code(
+        """
+        import json
+        import time
+        from datetime import datetime, timezone
+        from pathlib import Path
+
+        BUILD_TRACK_REFRESH_SECONDS = 20
+        BUILD_TRACK_MAX_LOOPS = 0  # 0 = infini
+        BUILD_TRACK_HISTORY_SIZE = 8
+
+        def _parse_iso_epoch(value: object) -> float:
+            text = str(value or '').strip()
+            if not text:
+                return 0.0
+            try:
+                return float(datetime.fromisoformat(text.replace('Z', '+00:00')).timestamp())
+            except Exception:
+                return 0.0
+
+        def _fmt_ts(epoch: float) -> str:
+            if epoch <= 0:
+                return '<none>'
+            return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%SZ')
+
+        def _fmt_duration(seconds: float) -> str:
+            total = max(0, int(seconds))
+            hours = total // 3600
+            minutes = (total % 3600) // 60
+            secs = total % 60
+            return f'{hours}h {minutes:02d}m {secs:02d}s'
+
+        def _read_json(path: Path) -> dict:
+            if not path.exists():
+                return {}
+            try:
+                payload = json.loads(path.read_text(encoding='utf-8'))
+                return payload if isinstance(payload, dict) else {}
+            except Exception:
+                return {}
+
+        def _load_manifest_local_or_firestore() -> dict:
+            local = Path(PIPELINE_MANIFEST_PATH)
+            if local.exists():
+                payload = _read_json(local)
+                if payload:
+                    return payload
+            try:
+                payload = _load_pipeline_manifest_payload(WORKER_TAG)
+                return payload if isinstance(payload, dict) else {}
+            except Exception:
+                return {}
+
+        def _extract_build_job_id(manifest: dict) -> str:
+            build_job_id = str(manifest.get('build_job_id', '')).strip()
+            if build_job_id:
+                return build_job_id
+            processes = manifest.get('processes', {})
+            if isinstance(processes, dict):
+                build_info = processes.get('dataset-build', {})
+                if isinstance(build_info, dict):
+                    cmd = str(build_info.get('command', '')).strip()
+                    token = '--job-id '
+                    if token in cmd:
+                        return cmd.split(token, 1)[1].split()[0].strip()
+            return ''
+
+        manifest = _load_manifest_local_or_firestore()
+        build_job_id = _extract_build_job_id(manifest)
+        if not build_job_id:
+            raise RuntimeError('build_job_id introuvable dans le manifest pipeline.')
+
+        build_dataset_id = str(manifest.get('dataset_id', '')).strip() or '<unknown_dataset>'
+        job_dir = Path(JOBS_ROOT) / build_job_id
+        run_status_path = job_dir / 'run_status.json'
+        state_path = job_dir / 'state.json'
+
+        print('Suivi dataset build (clair):')
+        print('  build_job_id    =', build_job_id)
+        print('  build_dataset   =', build_dataset_id)
+        print('  job_dir         =', job_dir)
+        print('  refresh_s       =', BUILD_TRACK_REFRESH_SECONDS)
+        print('  max_loops       =', BUILD_TRACK_MAX_LOOPS if BUILD_TRACK_MAX_LOOPS > 0 else 'infini')
+
+        prev_labeled = None
+        last_change_epoch = 0.0
+        change_history: list[tuple[float, int, int, int]] = []  # (ts, old, new, delta)
+
+        loop_idx = 0
+        while True:
+            loop_idx += 1
+            now_epoch = time.time()
+
+            run_status = _read_json(run_status_path)
+            state = _read_json(state_path)
+
+            status = str(run_status.get('status', '<none>'))
+            phase = str(run_status.get('phase', '<none>'))
+            created_epoch = _parse_iso_epoch(run_status.get('created_at', ''))
+            updated_epoch_status = _parse_iso_epoch(run_status.get('updated_at', ''))
+            updated_epoch_state = float(state_path.stat().st_mtime) if state_path.exists() else 0.0
+            updated_epoch = max(updated_epoch_status, updated_epoch_state)
+
+            labeled_samples = state.get('labeled_samples')
+            processed_files = state.get('processed_files')
+            try:
+                labeled_int = int(labeled_samples) if labeled_samples is not None else None
+            except Exception:
+                labeled_int = None
+            try:
+                files_int = int(processed_files) if processed_files is not None else None
+            except Exception:
+                files_int = None
+
+            if labeled_int is not None:
+                if prev_labeled is None:
+                    prev_labeled = labeled_int
+                    last_change_epoch = now_epoch
+                elif labeled_int != prev_labeled:
+                    delta = labeled_int - prev_labeled
+                    change_history.append((now_epoch, prev_labeled, labeled_int, delta))
+                    if len(change_history) > int(max(1, BUILD_TRACK_HISTORY_SIZE)):
+                        change_history = change_history[-int(max(1, BUILD_TRACK_HISTORY_SIZE)) :]
+                    prev_labeled = labeled_int
+                    last_change_epoch = now_epoch
+
+            unchanged_for = max(0.0, now_epoch - last_change_epoch) if last_change_epoch > 0 else 0.0
+            job_age = max(0.0, now_epoch - created_epoch) if created_epoch > 0 else 0.0
+
+            print('\\n' + '-' * 120)
+            print(f'[{datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")}Z] loop={loop_idx}')
+            print(
+                'DATASET',
+                f'| id={build_dataset_id}',
+                f'| labeled_samples={labeled_int if labeled_int is not None else "<none>"}',
+                f'| processed_files={files_int if files_int is not None else "<none>"}',
+            )
+            print(
+                'JOB',
+                f'| status={status}',
+                f'| phase={phase}',
+                f'| age={_fmt_duration(job_age)}',
+                f'| last_update={_fmt_ts(updated_epoch)}',
+            )
+            print(
+                'CHANGEMENT',
+                f'| last_change_at={_fmt_ts(last_change_epoch)}',
+                f'| unchanged_for={_fmt_duration(unchanged_for)}',
+            )
+
+            if change_history:
+                print('Derniers changements:')
+                for ts, old_v, new_v, delta_v in change_history[-int(max(1, BUILD_TRACK_HISTORY_SIZE)) :]:
+                    print(
+                        '-',
+                        _fmt_ts(ts),
+                        '|',
+                        f'{old_v} -> {new_v}',
+                        f'(delta={delta_v:+d})',
+                    )
+            else:
+                print('Derniers changements: aucun changement detecte pour l instant.')
+
+            if BUILD_TRACK_MAX_LOOPS > 0 and loop_idx >= BUILD_TRACK_MAX_LOOPS:
+                print('\\nFin du suivi (BUILD_TRACK_MAX_LOOPS atteint).')
+                break
+            time.sleep(max(5.0, float(BUILD_TRACK_REFRESH_SECONDS)))
         """
     ),
     md("## 6bis. Sanity Check Dataset (10 echantillons aleatoires)"),
