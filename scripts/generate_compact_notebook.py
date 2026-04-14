@@ -4790,23 +4790,103 @@ cells = [
                 return text
 
             def _latest_job_dir_for_job_id(job_id: str) -> Path | None:
-                jobs_root = Path(JOBS_ROOT)
-                if not jobs_root.exists():
-                    return None
                 requested = str(job_id).strip()
                 if not requested:
                     return None
                 prefix = _job_prefix_for_rollover(requested)
-                candidates = []
-                for path in jobs_root.iterdir():
-                    if not path.is_dir():
+                roots = []
+                for raw in [
+                    str(JOBS_ROOT),
+                    str(globals().get('RUNTIME_HYBRID_BACKUP_JOBS_ROOT', '')).strip(),
+                    '/content/songo-stockfish-runtime/jobs',
+                    '/content/drive/MyDrive/songo-stockfish/jobs',
+                ]:
+                    text = str(raw or '').strip()
+                    if not text:
                         continue
-                    name = path.name
-                    if name == requested or name == prefix or (prefix and name.startswith(prefix + '_')):
-                        candidates.append(path)
+                    path_root = Path(text)
+                    if path_root not in roots:
+                        roots.append(path_root)
+
+                def _is_backup_path(path: Path) -> bool:
+                    text = str(path).replace('\\\\', '/')
+                    return '/runtime_backup/jobs/' in text or text.endswith('/runtime_backup/jobs')
+
+                candidates = []
+                for root in roots:
+                    if not root.exists():
+                        continue
+                    for path in root.iterdir():
+                        if not path.is_dir():
+                            continue
+                        name = path.name
+                        if name == requested or name == prefix or (prefix and name.startswith(prefix + '_')):
+                            status_payload = _load_json_dict(path / 'run_status.json', default={})
+                            status = str(status_payload.get('status', '')).strip().lower()
+                            candidates.append(
+                                {
+                                    'path': path,
+                                    'is_running': status in {'running', 'pending'},
+                                    'is_backup': _is_backup_path(path),
+                                    'mtime': float(path.stat().st_mtime),
+                                }
+                            )
                 if not candidates:
                     return None
-                return sorted(candidates, key=lambda p: p.stat().st_mtime)[-1]
+                candidates_sorted = sorted(
+                    candidates,
+                    key=lambda item: (
+                        bool(item.get('is_running', False)),
+                        not bool(item.get('is_backup', False)),
+                        float(item.get('mtime', 0.0)),
+                    ),
+                    reverse=True,
+                )
+                best = candidates_sorted[0]
+                if bool(best.get('is_running', False)):
+                    return Path(str(best['path']))
+
+                running_fallback = []
+                for root in roots:
+                    if not root.exists():
+                        continue
+                    for path in root.iterdir():
+                        if not path.is_dir():
+                            continue
+                        status_payload = _load_json_dict(path / 'run_status.json', default={})
+                        status = str(status_payload.get('status', '')).strip().lower()
+                        if status not in {'running', 'pending'}:
+                            continue
+                        run_type = str(status_payload.get('run_type', '')).strip().lower()
+                        if run_type and run_type != 'train':
+                            continue
+                        config_hit = False
+                        try:
+                            config_text = (path / 'config.yaml').read_text(encoding='utf-8', errors='ignore')
+                            config_hit = bool(requested) and (requested in config_text)
+                        except Exception:
+                            config_hit = False
+                        running_fallback.append(
+                            {
+                                'path': path,
+                                'config_hit': config_hit,
+                                'is_backup': _is_backup_path(path),
+                                'mtime': float(path.stat().st_mtime),
+                            }
+                        )
+                if running_fallback:
+                    running_sorted = sorted(
+                        running_fallback,
+                        key=lambda item: (
+                            bool(item.get('config_hit', False)),
+                            not bool(item.get('is_backup', False)),
+                            float(item.get('mtime', 0.0)),
+                        ),
+                        reverse=True,
+                    )
+                    return Path(str(running_sorted[0]['path']))
+
+                return Path(str(best['path']))
 
             def _read_job_summary(job_id: str, filename: str) -> tuple[dict, Path | None]:
                 job_dir = _latest_job_dir_for_job_id(job_id)
@@ -5197,23 +5277,103 @@ cells = [
                 return text
 
             def _latest_job_dir_for_job_id(job_id: str) -> Path | None:
-                jobs_root = Path(JOBS_ROOT)
-                if not jobs_root.exists():
-                    return None
                 requested = str(job_id).strip()
                 if not requested:
                     return None
                 prefix = _job_prefix_for_rollover(requested)
-                candidates = []
-                for path in jobs_root.iterdir():
-                    if not path.is_dir():
+                roots = []
+                for raw in [
+                    str(JOBS_ROOT),
+                    str(globals().get('RUNTIME_HYBRID_BACKUP_JOBS_ROOT', '')).strip(),
+                    '/content/songo-stockfish-runtime/jobs',
+                    '/content/drive/MyDrive/songo-stockfish/jobs',
+                ]:
+                    text = str(raw or '').strip()
+                    if not text:
                         continue
-                    name = path.name
-                    if name == requested or name == prefix or (prefix and name.startswith(prefix + '_')):
-                        candidates.append(path)
+                    path_root = Path(text)
+                    if path_root not in roots:
+                        roots.append(path_root)
+
+                def _is_backup_path(path: Path) -> bool:
+                    text = str(path).replace('\\\\', '/')
+                    return '/runtime_backup/jobs/' in text or text.endswith('/runtime_backup/jobs')
+
+                candidates = []
+                for root in roots:
+                    if not root.exists():
+                        continue
+                    for path in root.iterdir():
+                        if not path.is_dir():
+                            continue
+                        name = path.name
+                        if name == requested or name == prefix or (prefix and name.startswith(prefix + '_')):
+                            status_payload = _load_json_dict(path / 'run_status.json', default={})
+                            status = str(status_payload.get('status', '')).strip().lower()
+                            candidates.append(
+                                {
+                                    'path': path,
+                                    'is_running': status in {'running', 'pending'},
+                                    'is_backup': _is_backup_path(path),
+                                    'mtime': float(path.stat().st_mtime),
+                                }
+                            )
                 if not candidates:
                     return None
-                return sorted(candidates, key=lambda p: p.stat().st_mtime)[-1]
+                candidates_sorted = sorted(
+                    candidates,
+                    key=lambda item: (
+                        bool(item.get('is_running', False)),
+                        not bool(item.get('is_backup', False)),
+                        float(item.get('mtime', 0.0)),
+                    ),
+                    reverse=True,
+                )
+                best = candidates_sorted[0]
+                if bool(best.get('is_running', False)):
+                    return Path(str(best['path']))
+
+                running_fallback = []
+                for root in roots:
+                    if not root.exists():
+                        continue
+                    for path in root.iterdir():
+                        if not path.is_dir():
+                            continue
+                        status_payload = _load_json_dict(path / 'run_status.json', default={})
+                        status = str(status_payload.get('status', '')).strip().lower()
+                        if status not in {'running', 'pending'}:
+                            continue
+                        run_type = str(status_payload.get('run_type', '')).strip().lower()
+                        if run_type and run_type != 'train':
+                            continue
+                        config_hit = False
+                        try:
+                            config_text = (path / 'config.yaml').read_text(encoding='utf-8', errors='ignore')
+                            config_hit = bool(requested) and (requested in config_text)
+                        except Exception:
+                            config_hit = False
+                        running_fallback.append(
+                            {
+                                'path': path,
+                                'config_hit': config_hit,
+                                'is_backup': _is_backup_path(path),
+                                'mtime': float(path.stat().st_mtime),
+                            }
+                        )
+                if running_fallback:
+                    running_sorted = sorted(
+                        running_fallback,
+                        key=lambda item: (
+                            bool(item.get('config_hit', False)),
+                            not bool(item.get('is_backup', False)),
+                            float(item.get('mtime', 0.0)),
+                        ),
+                        reverse=True,
+                    )
+                    return Path(str(running_sorted[0]['path']))
+
+                return Path(str(best['path']))
 
             def _read_job_summary(job_id: str, filename: str) -> tuple[dict, Path | None]:
                 job_dir = _latest_job_dir_for_job_id(job_id)
