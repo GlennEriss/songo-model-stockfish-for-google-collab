@@ -4869,6 +4869,22 @@ cells = [
                         roots.append(path)
                 return roots
 
+            def _parse_iso_epoch(value: str) -> float:
+                text = str(value or '').strip()
+                if not text:
+                    return 0.0
+                try:
+                    dt = _dt.fromisoformat(text.replace('Z', '+00:00'))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=_tz.utc)
+                    return float(dt.astimezone(_tz.utc).timestamp())
+                except Exception:
+                    return 0.0
+
+            def _is_backup_path(path: _Path) -> bool:
+                text = str(path).replace('\\\\', '/')
+                return '/runtime_backup/jobs/' in text or text.endswith('/runtime_backup/jobs')
+
             def _latest_job_dir_for_job_id(job_id_value: str, roots: list[_Path]) -> _Path | None:
                 requested = str(job_id_value).strip()
                 if not requested:
@@ -4883,10 +4899,31 @@ cells = [
                             continue
                         name = path.name
                         if name == requested or name == prefix or (prefix and name.startswith(prefix + '_')):
-                            candidates.append(path)
+                            status_payload = _load_json_dict(path / 'run_status.json', default={})
+                            status = str(status_payload.get('status', '')).strip().lower()
+                            updated_epoch = _parse_iso_epoch(status_payload.get('updated_at', ''))
+                            candidates.append(
+                                {
+                                    'path': path,
+                                    'status': status,
+                                    'updated_epoch': updated_epoch,
+                                    'is_running': status in {'running', 'pending'},
+                                    'is_backup': _is_backup_path(path),
+                                }
+                            )
                 if not candidates:
                     return None
-                return sorted(candidates, key=lambda p: p.stat().st_mtime)[-1]
+                candidates_sorted = sorted(
+                    candidates,
+                    key=lambda item: (
+                        bool(item.get('is_running', False)),
+                        not bool(item.get('is_backup', False)),
+                        float(item.get('updated_epoch', 0.0)),
+                        float(item.get('path').stat().st_mtime),
+                    ),
+                    reverse=True,
+                )
+                return _Path(candidates_sorted[0]['path'])
 
             def _fmt_age_seconds(updated_at_text: str) -> str:
                 text = str(updated_at_text or '').strip()
@@ -5179,6 +5216,22 @@ cells = [
                         roots.append(path)
                 return roots
 
+            def _parse_iso_epoch(value: str) -> float:
+                text = str(value or '').strip()
+                if not text:
+                    return 0.0
+                try:
+                    dt = _dt.fromisoformat(text.replace('Z', '+00:00'))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=_tz.utc)
+                    return float(dt.astimezone(_tz.utc).timestamp())
+                except Exception:
+                    return 0.0
+
+            def _is_backup_path(path: _Path) -> bool:
+                text = str(path).replace('\\\\', '/')
+                return '/runtime_backup/jobs/' in text or text.endswith('/runtime_backup/jobs')
+
             def _latest_job_dir_for_job_id(job_id_value: str, roots: list[_Path]) -> _Path | None:
                 requested = str(job_id_value).strip()
                 if not requested:
@@ -5193,10 +5246,31 @@ cells = [
                             continue
                         name = path.name
                         if name == requested or name == prefix or (prefix and name.startswith(prefix + '_')):
-                            candidates.append(path)
+                            status_payload = _load_json_dict(path / 'run_status.json', default={})
+                            status = str(status_payload.get('status', '')).strip().lower()
+                            updated_epoch = _parse_iso_epoch(status_payload.get('updated_at', ''))
+                            candidates.append(
+                                {
+                                    'path': path,
+                                    'status': status,
+                                    'updated_epoch': updated_epoch,
+                                    'is_running': status in {'running', 'pending'},
+                                    'is_backup': _is_backup_path(path),
+                                }
+                            )
                 if not candidates:
                     return None
-                return sorted(candidates, key=lambda p: p.stat().st_mtime)[-1]
+                candidates_sorted = sorted(
+                    candidates,
+                    key=lambda item: (
+                        bool(item.get('is_running', False)),
+                        not bool(item.get('is_backup', False)),
+                        float(item.get('updated_epoch', 0.0)),
+                        float(item.get('path').stat().st_mtime),
+                    ),
+                    reverse=True,
+                )
+                return _Path(candidates_sorted[0]['path'])
 
             def _fmt_age_seconds(updated_at_text: str) -> str:
                 text = str(updated_at_text or '').strip()
