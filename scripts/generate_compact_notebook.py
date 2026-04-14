@@ -4503,23 +4503,104 @@ cells = [
             return text
 
         def _latest_job_dir_for_job_id(job_id: str) -> Path | None:
-            jobs_root = Path(JOBS_ROOT)
-            if not jobs_root.exists():
-                return None
             requested = str(job_id).strip()
             if not requested:
                 return None
             prefix = _job_prefix_for_rollover(requested)
-            candidates = []
-            for path in jobs_root.iterdir():
-                if not path.is_dir():
+            roots = []
+            for raw in [
+                str(JOBS_ROOT),
+                str(globals().get('RUNTIME_HYBRID_BACKUP_JOBS_ROOT', '')).strip(),
+                '/content/songo-stockfish-runtime/jobs',
+                '/content/drive/MyDrive/songo-stockfish/jobs',
+            ]:
+                text = str(raw or '').strip()
+                if not text:
                     continue
-                name = path.name
-                if name == requested or name == prefix or (prefix and name.startswith(prefix + '_')):
-                    candidates.append(path)
+                path_root = Path(text)
+                if path_root not in roots:
+                    roots.append(path_root)
+
+            def _is_backup_path(path: Path) -> bool:
+                text = str(path).replace('\\\\', '/')
+                return '/runtime_backup/jobs/' in text or text.endswith('/runtime_backup/jobs')
+
+            candidates = []
+            for root in roots:
+                if not root.exists():
+                    continue
+                for path in root.iterdir():
+                    if not path.is_dir():
+                        continue
+                    name = path.name
+                    if name == requested or name == prefix or (prefix and name.startswith(prefix + '_')):
+                        status_payload = _load_json_dict(path / 'run_status.json', default={})
+                        status = str(status_payload.get('status', '')).strip().lower()
+                        candidates.append(
+                            {
+                                'path': path,
+                                'is_running': status in {'running', 'pending'},
+                                'is_backup': _is_backup_path(path),
+                                'mtime': float(path.stat().st_mtime),
+                            }
+                        )
             if not candidates:
                 return None
-            return sorted(candidates, key=lambda p: p.stat().st_mtime)[-1]
+            candidates_sorted = sorted(
+                candidates,
+                key=lambda item: (
+                    bool(item.get('is_running', False)),
+                    not bool(item.get('is_backup', False)),
+                    float(item.get('mtime', 0.0)),
+                ),
+                reverse=True,
+            )
+            best = candidates_sorted[0]
+            if bool(best.get('is_running', False)):
+                return Path(str(best['path']))
+
+            # Fallback: job rollover non detecte par le nom -> chercher un train actif recent.
+            running_fallback = []
+            for root in roots:
+                if not root.exists():
+                    continue
+                for path in root.iterdir():
+                    if not path.is_dir():
+                        continue
+                    status_payload = _load_json_dict(path / 'run_status.json', default={})
+                    status = str(status_payload.get('status', '')).strip().lower()
+                    if status not in {'running', 'pending'}:
+                        continue
+                    run_type = str(status_payload.get('run_type', '')).strip().lower()
+                    if run_type and run_type != 'train':
+                        continue
+                    config_hit = False
+                    try:
+                        config_text = (path / 'config.yaml').read_text(encoding='utf-8', errors='ignore')
+                        config_hit = bool(requested) and (requested in config_text)
+                    except Exception:
+                        config_hit = False
+                    running_fallback.append(
+                        {
+                            'path': path,
+                            'config_hit': config_hit,
+                            'is_backup': _is_backup_path(path),
+                            'mtime': float(path.stat().st_mtime),
+                        }
+                    )
+            if running_fallback:
+                running_sorted = sorted(
+                    running_fallback,
+                    key=lambda item: (
+                        bool(item.get('config_hit', False)),
+                        not bool(item.get('is_backup', False)),
+                        float(item.get('mtime', 0.0)),
+                    ),
+                    reverse=True,
+                )
+                return Path(str(running_sorted[0]['path']))
+
+            return Path(str(best['path']))
 
         def _read_job_summary(job_id: str, filename: str) -> tuple[dict, Path | None]:
             job_dir = _latest_job_dir_for_job_id(job_id)
@@ -4923,7 +5004,59 @@ cells = [
                     ),
                     reverse=True,
                 )
-                return _Path(candidates_sorted[0]['path'])
+                best = candidates_sorted[0]
+                if bool(best.get('is_running', False)):
+                    return _Path(best['path'])
+
+                # Fallback robuste: si le meilleur match est "completed" (souvent backup),
+                # chercher un job train actif recent dans les roots disponibles.
+                now_epoch = float(_time.time())
+                running_candidates: list[dict[str, object]] = []
+                for root in roots:
+                    if not root.exists():
+                        continue
+                    for path in root.iterdir():
+                        if not path.is_dir():
+                            continue
+                        status_payload = _load_json_dict(path / 'run_status.json', default={})
+                        status = str(status_payload.get('status', '')).strip().lower()
+                        if status not in {'running', 'pending'}:
+                            continue
+                        run_type = str(status_payload.get('run_type', '')).strip().lower()
+                        if run_type and run_type != 'train':
+                            continue
+                        updated_epoch = _parse_iso_epoch(status_payload.get('updated_at', ''))
+                        config_hit = False
+                        try:
+                            config_text = (path / 'config.yaml').read_text(encoding='utf-8', errors='ignore')
+                            config_hit = bool(requested) and (requested in config_text)
+                        except Exception:
+                            config_hit = False
+                        running_candidates.append(
+                            {
+                                'path': path,
+                                'config_hit': config_hit,
+                                'is_backup': _is_backup_path(path),
+                                'updated_epoch': updated_epoch,
+                            }
+                        )
+                if running_candidates:
+                    running_sorted = sorted(
+                        running_candidates,
+                        key=lambda item: (
+                            bool(item.get('config_hit', False)),
+                            not bool(item.get('is_backup', False)),
+                            float(item.get('updated_epoch', 0.0)),
+                            float(item.get('path').stat().st_mtime),
+                        ),
+                        reverse=True,
+                    )
+                    top_running = running_sorted[0]
+                    top_epoch = float(top_running.get('updated_epoch', 0.0))
+                    if bool(top_running.get('config_hit', False)) or (now_epoch - top_epoch) <= 1800.0:
+                        return _Path(top_running['path'])
+
+                return _Path(best['path'])
 
             def _fmt_age_seconds(updated_at_text: str) -> str:
                 text = str(updated_at_text or '').strip()
@@ -4976,7 +5109,15 @@ cells = [
                 )
                 best_epoch = state.get('best_epoch', summary.get('best_epoch', '<none>'))
                 best_val_metric = state.get('best_metric', summary.get('best_val_metric', '<none>'))
-                last_val_acc = state.get('last_val_acc', summary.get('last_val_acc', '<none>'))
+                history = summary.get('history', [])
+                history_last = history[-1] if isinstance(history, list) and history and isinstance(history[-1], dict) else {}
+                last_val_acc = (
+                    state.get('last_val_acc')
+                    or summary.get('last_val_acc')
+                    or summary.get('last_validation_policy_accuracy')
+                    or history_last.get('validation_policy_accuracy')
+                    or '<none>'
+                )
                 job_dir_text = str(job_dir) if job_dir is not None else '<not_found>'
                 print(
                     f'[TRAIN PROGRESS][{mode_label}][{loop_idx:03d}] '
@@ -5270,7 +5411,59 @@ cells = [
                     ),
                     reverse=True,
                 )
-                return _Path(candidates_sorted[0]['path'])
+                best = candidates_sorted[0]
+                if bool(best.get('is_running', False)):
+                    return _Path(best['path'])
+
+                # Fallback robuste: si le meilleur match est "completed" (souvent backup),
+                # chercher un job train actif recent dans les roots disponibles.
+                now_epoch = float(_time.time())
+                running_candidates: list[dict[str, object]] = []
+                for root in roots:
+                    if not root.exists():
+                        continue
+                    for path in root.iterdir():
+                        if not path.is_dir():
+                            continue
+                        status_payload = _load_json_dict(path / 'run_status.json', default={})
+                        status = str(status_payload.get('status', '')).strip().lower()
+                        if status not in {'running', 'pending'}:
+                            continue
+                        run_type = str(status_payload.get('run_type', '')).strip().lower()
+                        if run_type and run_type != 'train':
+                            continue
+                        updated_epoch = _parse_iso_epoch(status_payload.get('updated_at', ''))
+                        config_hit = False
+                        try:
+                            config_text = (path / 'config.yaml').read_text(encoding='utf-8', errors='ignore')
+                            config_hit = bool(requested) and (requested in config_text)
+                        except Exception:
+                            config_hit = False
+                        running_candidates.append(
+                            {
+                                'path': path,
+                                'config_hit': config_hit,
+                                'is_backup': _is_backup_path(path),
+                                'updated_epoch': updated_epoch,
+                            }
+                        )
+                if running_candidates:
+                    running_sorted = sorted(
+                        running_candidates,
+                        key=lambda item: (
+                            bool(item.get('config_hit', False)),
+                            not bool(item.get('is_backup', False)),
+                            float(item.get('updated_epoch', 0.0)),
+                            float(item.get('path').stat().st_mtime),
+                        ),
+                        reverse=True,
+                    )
+                    top_running = running_sorted[0]
+                    top_epoch = float(top_running.get('updated_epoch', 0.0))
+                    if bool(top_running.get('config_hit', False)) or (now_epoch - top_epoch) <= 1800.0:
+                        return _Path(top_running['path'])
+
+                return _Path(best['path'])
 
             def _fmt_age_seconds(updated_at_text: str) -> str:
                 text = str(updated_at_text or '').strip()
@@ -5323,7 +5516,15 @@ cells = [
                 )
                 best_epoch = state.get('best_epoch', summary.get('best_epoch', '<none>'))
                 best_val_metric = state.get('best_metric', summary.get('best_val_metric', '<none>'))
-                last_val_acc = state.get('last_val_acc', summary.get('last_val_acc', '<none>'))
+                history = summary.get('history', [])
+                history_last = history[-1] if isinstance(history, list) and history and isinstance(history[-1], dict) else {}
+                last_val_acc = (
+                    state.get('last_val_acc')
+                    or summary.get('last_val_acc')
+                    or summary.get('last_validation_policy_accuracy')
+                    or history_last.get('validation_policy_accuracy')
+                    or '<none>'
+                )
                 job_dir_text = str(job_dir) if job_dir is not None else '<not_found>'
                 print(
                     f'[TRAIN PROGRESS][{mode_label}][{loop_idx:03d}] '
