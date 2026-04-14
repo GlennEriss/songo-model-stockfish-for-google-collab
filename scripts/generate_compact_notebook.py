@@ -1967,7 +1967,8 @@ cells = [
         - `5bis.A` = Manifest pipeline (runtime local prioritaire, Firestore fallback)
         - `5bis.A2` = Suivi live des processus (refresh `ps`)
         - `5bis.A3` = Keep-Alive Colab (cellule infinie anti-deconnexion)
-        - `5bis.B` = Runtime local worker (etat local des jobs)
+        - `5bis.B` = Runtime local worker [LOCAL VM]
+        - `5bis.B2` = Comparatif clair [LOCAL VM] vs [GLOBAL TRAIN DATASET]
         - `5bis.C` = Redis cache (et ecart vs Firestore)
         - `5bis.D` = Logs worker (fichiers runtime)
         - `5bis.E` = Metriques checkpoint sync Firestore (events/metrics de run)
@@ -2941,11 +2942,20 @@ cells = [
         build_total = 0
         build_workers = 0
         registry = _load_dataset_registry_payload()
+        global_train_entry = None
         for item in registry.get('built_datasets', []):
             dataset_id = str(item.get('dataset_id', ''))
             if dataset_id == BASE_DATASET_BUILD_ID or dataset_id.startswith(f'{BASE_DATASET_BUILD_ID}_'):
                 build_total += int(item.get('labeled_samples', 0))
                 build_workers += 1
+            if dataset_id == BASE_DATASET_BUILD_ID and isinstance(item, dict):
+                if global_train_entry is None:
+                    global_train_entry = item
+                else:
+                    prev_updated = _parse_iso_to_epoch(global_train_entry.get('updated_at', ''))
+                    cur_updated = _parse_iso_to_epoch(item.get('updated_at', ''))
+                    if cur_updated >= prev_updated:
+                        global_train_entry = item
 
         current = {
             'ts': now_ts,
@@ -3001,6 +3011,39 @@ cells = [
             f"| workers_inactive={len(inactive_rows)} | global_age_s={global_age_display} "
             f"| unchanged_global_s={unchanged_global_seconds} | unchanged_build_s={unchanged_build_seconds}"
         )
+        global_train_labeled = (
+            int(global_train_entry.get('labeled_samples', 0) or 0)
+            if isinstance(global_train_entry, dict)
+            else None
+        )
+        global_train_status = (
+            str(global_train_entry.get('build_status', '<none>'))
+            if isinstance(global_train_entry, dict)
+            else '<none>'
+        )
+        global_train_updated_at = (
+            str(global_train_entry.get('updated_at', '<none>'))
+            if isinstance(global_train_entry, dict)
+            else '<none>'
+        )
+        global_train_updated_ts = _parse_iso_to_epoch(global_train_updated_at)
+        global_train_age_s = (
+            int(max(0.0, now_ts - global_train_updated_ts))
+            if global_train_updated_ts > 0
+            else 'inf'
+        )
+        print(
+            f"[GLOBAL GENERATION] samples={current['global_samples']}/{target} | games={current['global_games']} | "
+            f"updated_at={global_updated_at} | updated_age_s={global_age_display}"
+        )
+        print(
+            f"[GLOBAL TRAIN DATASET] dataset_id={BASE_DATASET_BUILD_ID} | labeled={global_train_labeled if global_train_labeled is not None else '<none>'} "
+            f"| status={global_train_status} | updated_at={global_train_updated_at} | updated_age_s={global_train_age_s}"
+        )
+        print(
+            f"[BUILD FAMILY SUM] labeled_sum={current['build_total']} | datasets_count={build_workers} "
+            f"| unchanged_for={_format_duration(unchanged_build_seconds)}"
+        )
         print(
             f"HEALTH_TIMERS | global_unchanged_for={_format_duration(unchanged_global_seconds)} "
             f"| build_unchanged_for={_format_duration(unchanged_build_seconds)}"
@@ -3035,7 +3078,7 @@ cells = [
             print(f'INACTIVE | +{len(inactive_rows) - 3} autres workers inactifs')
         """
     ),
-    md("### 5bis.B Suivi Runtime (fichiers worker locaux)"),
+    md("### 5bis.B Suivi Runtime [LOCAL VM]"),
     code(
         """
         # Vue runtime local: progression locale du worker (fichiers jobs/*)
@@ -3127,14 +3170,15 @@ cells = [
             build_unchanged_seconds = int(max(0.0, now_epoch - float(progress_watch['build']['last_change_epoch'])))
 
             ts = time.strftime('%Y-%m-%d %H:%M:%S')
+            print(f'[{ts}] [LOCAL VM] runtime snapshot')
             print(
-                f'[{ts}] [RUNTIME generate] dir={generate_dir} | status={generate_status.get("status", "<none>")} '
+                f'[{ts}] [LOCAL VM][RUNTIME generate] dir={generate_dir} | status={generate_status.get("status", "<none>")} '
                 f'| phase={generate_status.get("phase", "<none>")} | sample_count={generate_state.get("sample_count", "<none>")} '
                 f'| total_samples_summary={generate_summary.get("total_samples", "<none>")} | added_games_summary={generate_summary.get("added_games", "<none>")} '
                 f'| unchanged_s={generate_unchanged_seconds}'
             )
             print(
-                f'[{ts}] [RUNTIME build] dir={build_dir} | status={build_status.get("status", "<none>")} '
+                f'[{ts}] [LOCAL VM][RUNTIME build] dir={build_dir} | status={build_status.get("status", "<none>")} '
                 f'| phase={build_status.get("phase", "<none>")} | labeled_samples_state={build_state.get("labeled_samples", "<none>")} '
                 f'| processed_files_state={build_state.get("processed_files", "<none>")} | labeled_samples_summary={build_summary.get("labeled_samples", "<none>")} '
                 f'| unchanged_s={build_unchanged_seconds}'
@@ -3146,7 +3190,7 @@ cells = [
             time.sleep(REFRESH_SECONDS)
         """
     ),
-    md("### 5bis.B2 Suivi Local Delta (avant sync global)"),
+    md("### 5bis.B2 Comparatif Clair [LOCAL VM] vs [GLOBAL TRAIN DATASET]"),
     code(
         """
         # Source de verite locale (runtime jobs) avec deltas + suivi fusions progressives
@@ -3328,6 +3372,10 @@ cells = [
             return completed, failed, end_offset
 
         generate_job_id, build_job_id, manifest_path = _resolve_job_ids()
+        print('=== SEPARATION DES LOGS ===')
+        print('[LOCAL VM] = progression runtime du worker courant (fichiers jobs/* locaux)')
+        print('[GLOBAL TRAIN DATASET] = dataset fusionne utilise pour le train (dataset_registry)')
+        print('[GLOBAL MERGE EVENTS] = evenements de fusion progressive vers le global')
         print('manifest =', str(manifest_path) if manifest_path is not None else '<none>')
         print('generate_job_id =', generate_job_id)
         print('build_job_id    =', build_job_id)
@@ -3410,7 +3458,7 @@ cells = [
 
             ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             print(
-                f'[{ts}] [{idx:03d}] '
+                f'[{ts}] [{idx:03d}] [LOCAL VM] '
                 f'gen_samples={_fmt(local["gen_samples"])} (Δ{_fmt(delta_samples)}) | '
                 f'gen_games={_fmt(local["gen_games"])} (Δ{_fmt(delta_games)}) | '
                 f'build_labeled={_fmt(local["build_labeled"])} (Δ{_fmt(delta_build)}) | '
@@ -3419,7 +3467,7 @@ cells = [
                 f'age_gen={_fmt(local["gen_updated_age_s"])}s age_build={_fmt(local["build_updated_age_s"])}s'
             )
             print(
-                f'      global_dataset={GLOBAL_DATASET_ID or "<none>"} | '
+                f'      [GLOBAL TRAIN DATASET] id={GLOBAL_DATASET_ID or "<none>"} | '
                 f'global_labeled={_fmt(global_labeled)} (Δ{_fmt(delta_global_labeled)}) | '
                 f'global_build_status={_fmt(global_snapshot.get("build_status"))} | '
                 f'global_updated_at={_fmt(global_snapshot.get("updated_at"))} | '
@@ -3427,7 +3475,7 @@ cells = [
                 f'global_snapshot_age_loops={global_snapshot_age_loops} | refresh_count={global_snapshot_refresh_count}'
             )
             print(
-                f'      merges_completed={merge_completed_total} (+{len(new_merge_events)}) | '
+                f'      [GLOBAL MERGE EVENTS] merges_completed={merge_completed_total} (+{len(new_merge_events)}) | '
                 f'merges_failed={merge_failed_total} (+{len(new_failed_events)}) | '
                 f'events_offset={events_offset_by_path.get(events_key, 0)} | '
                 f'events_path={str(events_path) if bld_dir else "<none>"}'
@@ -3443,7 +3491,7 @@ cells = [
                 if before_value is not None and after_value is not None:
                     delta_value = int(after_value - before_value)
                 print(
-                    f'      MERGE #{merge_completed_total} | ts={_fmt(event.get("timestamp"))} | trigger={_fmt(event.get("trigger"))} | '
+                    f'      [GLOBAL MERGE EVENTS] MERGE #{merge_completed_total} | ts={_fmt(event.get("timestamp"))} | trigger={_fmt(event.get("trigger"))} | '
                     f'sources={_fmt(event.get("source_dataset_count"))} | source_labeled={_fmt(event.get("source_labeled_total"))} | '
                     f'global_before={_fmt(before_value)} -> global_after={_fmt(after_value)} | Δ={_fmt(delta_value)} | '
                     f'async={_fmt(event.get("async_mode"))}'
@@ -3458,13 +3506,13 @@ cells = [
 
             if last_merge_event:
                 print(
-                    f'      last_merge | ts={_fmt(last_merge_event.get("timestamp"))} | trigger={_fmt(last_merge_event.get("trigger"))} | '
+                    f'      [GLOBAL MERGE EVENTS] last_merge | ts={_fmt(last_merge_event.get("timestamp"))} | trigger={_fmt(last_merge_event.get("trigger"))} | '
                     f'sources={_fmt(last_merge_event.get("source_dataset_count"))} | source_labeled={_fmt(last_merge_event.get("source_labeled_total"))} | '
                     f'global_after={_fmt(last_merge_event.get("labeled_samples_after"))}'
                 )
             if last_failed_merge_event:
                 print(
-                    f'      last_merge_failed | ts={_fmt(last_failed_merge_event.get("timestamp"))} | '
+                    f'      [GLOBAL MERGE EVENTS] last_merge_failed | ts={_fmt(last_failed_merge_event.get("timestamp"))} | '
                     f'trigger={_fmt(last_failed_merge_event.get("trigger"))} | error={_fmt(last_failed_merge_event.get("error"))}'
                 )
 
@@ -3901,17 +3949,16 @@ cells = [
             print('dataset_registry Firestore introuvable:', f'{type(exc).__name__}: {exc}')
         """
     ),
-    md("## 6ter. Suivi Clair Du Dataset En Construction"),
+    md("## 6ter. Suivi Clair Du Dataset Global D Entrainement"),
     code(
         """
-        import json
         import time
         from datetime import datetime, timezone
-        from pathlib import Path
 
-        BUILD_TRACK_REFRESH_SECONDS = 20
-        BUILD_TRACK_MAX_LOOPS = 0  # 0 = infini
-        BUILD_TRACK_HISTORY_SIZE = 8
+        GLOBAL_DATASET_TRACK_ID = str(BASE_DATASET_BUILD_ID).strip()
+        GLOBAL_TRACK_REFRESH_SECONDS = 20
+        GLOBAL_TRACK_MAX_LOOPS = 0  # 0 = infini
+        GLOBAL_TRACK_HISTORY_SIZE = 10
 
         def _parse_iso_epoch(value: object) -> float:
             text = str(value or '').strip()
@@ -3934,127 +3981,94 @@ cells = [
             secs = total % 60
             return f'{hours}h {minutes:02d}m {secs:02d}s'
 
-        def _read_json(path: Path) -> dict:
-            if not path.exists():
-                return {}
-            try:
-                payload = json.loads(path.read_text(encoding='utf-8'))
-                return payload if isinstance(payload, dict) else {}
-            except Exception:
-                return {}
-
-        def _load_manifest_local_or_firestore() -> dict:
-            local = Path(PIPELINE_MANIFEST_PATH)
-            if local.exists():
-                payload = _read_json(local)
-                if payload:
-                    return payload
-            try:
-                payload = _load_pipeline_manifest_payload(WORKER_TAG)
-                return payload if isinstance(payload, dict) else {}
-            except Exception:
-                return {}
-
-        def _extract_build_job_id(manifest: dict) -> str:
-            build_job_id = str(manifest.get('build_job_id', '')).strip()
-            if build_job_id:
-                return build_job_id
-            processes = manifest.get('processes', {})
-            if isinstance(processes, dict):
-                build_info = processes.get('dataset-build', {})
-                if isinstance(build_info, dict):
-                    cmd = str(build_info.get('command', '')).strip()
-                    token = '--job-id '
-                    if token in cmd:
-                        return cmd.split(token, 1)[1].split()[0].strip()
-            return ''
-
-        manifest = _load_manifest_local_or_firestore()
-        build_job_id = _extract_build_job_id(manifest)
-        if not build_job_id:
-            raise RuntimeError('build_job_id introuvable dans le manifest pipeline.')
-
-        build_dataset_id = str(manifest.get('dataset_id', '')).strip() or '<unknown_dataset>'
-        job_dir = Path(JOBS_ROOT) / build_job_id
-        run_status_path = job_dir / 'run_status.json'
-        state_path = job_dir / 'state.json'
-
-        print('Suivi dataset build (clair):')
-        print('  build_job_id    =', build_job_id)
-        print('  build_dataset   =', build_dataset_id)
-        print('  job_dir         =', job_dir)
-        print('  refresh_s       =', BUILD_TRACK_REFRESH_SECONDS)
-        print('  max_loops       =', BUILD_TRACK_MAX_LOOPS if BUILD_TRACK_MAX_LOOPS > 0 else 'infini')
+        print('Suivi dataset global (clair):')
+        print('  global_dataset_id =', GLOBAL_DATASET_TRACK_ID)
+        print('  refresh_s         =', GLOBAL_TRACK_REFRESH_SECONDS)
+        print('  max_loops         =', GLOBAL_TRACK_MAX_LOOPS if GLOBAL_TRACK_MAX_LOOPS > 0 else 'infini')
 
         prev_labeled = None
-        last_change_epoch = 0.0
+        last_size_change_epoch = 0.0
+        prev_registry_update_epoch = 0.0
+        created_epoch = 0.0
+        first_seen_epoch = 0.0
         change_history: list[tuple[float, int, int, int]] = []  # (ts, old, new, delta)
 
         loop_idx = 0
         while True:
             loop_idx += 1
             now_epoch = time.time()
+            registry = _load_dataset_registry_payload()
+            built_entries = [item for item in registry.get('built_datasets', []) if isinstance(item, dict)]
+            global_entry = next(
+                (
+                    item
+                    for item in built_entries
+                    if str(item.get('dataset_id', '')).strip() == GLOBAL_DATASET_TRACK_ID
+                ),
+                None,
+            )
 
-            run_status = _read_json(run_status_path)
-            state = _read_json(state_path)
+            if not isinstance(global_entry, dict):
+                print('\\n' + '-' * 120)
+                print(f'[{datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")}Z] loop={loop_idx}')
+                print('GLOBAL DATASET | introuvable dans dataset_registry')
+                print('Conseil: attendre une fusion merged_final ou verifier dataset_id.')
+                if GLOBAL_TRACK_MAX_LOOPS > 0 and loop_idx >= GLOBAL_TRACK_MAX_LOOPS:
+                    print('\\nFin du suivi (GLOBAL_TRACK_MAX_LOOPS atteint).')
+                    break
+                time.sleep(max(5.0, float(GLOBAL_TRACK_REFRESH_SECONDS)))
+                continue
 
-            status = str(run_status.get('status', '<none>'))
-            phase = str(run_status.get('phase', '<none>'))
-            created_epoch = _parse_iso_epoch(run_status.get('created_at', ''))
-            updated_epoch_status = _parse_iso_epoch(run_status.get('updated_at', ''))
-            updated_epoch_state = float(state_path.stat().st_mtime) if state_path.exists() else 0.0
-            updated_epoch = max(updated_epoch_status, updated_epoch_state)
+            labeled_int = int(global_entry.get('labeled_samples', 0) or 0)
+            status = str(global_entry.get('build_status', '<none>'))
+            build_mode = str(global_entry.get('build_mode', '<none>'))
+            registry_updated_epoch = _parse_iso_epoch(global_entry.get('updated_at', ''))
+            created_epoch = max(created_epoch, _parse_iso_epoch(global_entry.get('dataset_version', '')))
+            if first_seen_epoch <= 0:
+                first_seen_epoch = now_epoch
 
-            labeled_samples = state.get('labeled_samples')
-            processed_files = state.get('processed_files')
-            try:
-                labeled_int = int(labeled_samples) if labeled_samples is not None else None
-            except Exception:
-                labeled_int = None
-            try:
-                files_int = int(processed_files) if processed_files is not None else None
-            except Exception:
-                files_int = None
+            if prev_labeled is None:
+                prev_labeled = labeled_int
+                last_size_change_epoch = now_epoch
+            elif labeled_int != prev_labeled:
+                delta = labeled_int - prev_labeled
+                change_history.append((now_epoch, prev_labeled, labeled_int, delta))
+                if len(change_history) > int(max(1, GLOBAL_TRACK_HISTORY_SIZE)):
+                    change_history = change_history[-int(max(1, GLOBAL_TRACK_HISTORY_SIZE)) :]
+                prev_labeled = labeled_int
+                last_size_change_epoch = now_epoch
 
-            if labeled_int is not None:
-                if prev_labeled is None:
-                    prev_labeled = labeled_int
-                    last_change_epoch = now_epoch
-                elif labeled_int != prev_labeled:
-                    delta = labeled_int - prev_labeled
-                    change_history.append((now_epoch, prev_labeled, labeled_int, delta))
-                    if len(change_history) > int(max(1, BUILD_TRACK_HISTORY_SIZE)):
-                        change_history = change_history[-int(max(1, BUILD_TRACK_HISTORY_SIZE)) :]
-                    prev_labeled = labeled_int
-                    last_change_epoch = now_epoch
+            if registry_updated_epoch > prev_registry_update_epoch:
+                prev_registry_update_epoch = registry_updated_epoch
 
-            unchanged_for = max(0.0, now_epoch - last_change_epoch) if last_change_epoch > 0 else 0.0
-            job_age = max(0.0, now_epoch - created_epoch) if created_epoch > 0 else 0.0
+            unchanged_for = max(0.0, now_epoch - last_size_change_epoch) if last_size_change_epoch > 0 else 0.0
+            tracked_age = max(0.0, now_epoch - first_seen_epoch) if first_seen_epoch > 0 else 0.0
+            dataset_age = max(0.0, now_epoch - created_epoch) if created_epoch > 0 else 0.0
 
             print('\\n' + '-' * 120)
             print(f'[{datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")}Z] loop={loop_idx}')
             print(
-                'DATASET',
-                f'| id={build_dataset_id}',
-                f'| labeled_samples={labeled_int if labeled_int is not None else "<none>"}',
-                f'| processed_files={files_int if files_int is not None else "<none>"}',
-            )
-            print(
-                'JOB',
+                'GLOBAL DATASET',
+                f'| id={GLOBAL_DATASET_TRACK_ID}',
+                f'| labeled_samples={labeled_int}',
+                f'| build_mode={build_mode}',
                 f'| status={status}',
-                f'| phase={phase}',
-                f'| age={_fmt_duration(job_age)}',
-                f'| last_update={_fmt_ts(updated_epoch)}',
             )
             print(
-                'CHANGEMENT',
-                f'| last_change_at={_fmt_ts(last_change_epoch)}',
+                'TEMPS',
+                f'| suivi_depuis={_fmt_duration(tracked_age)}',
+                f'| age_dataset={_fmt_duration(dataset_age)}',
+                f'| last_registry_update={_fmt_ts(prev_registry_update_epoch)}',
+            )
+            print(
+                'CHANGEMENT TAILLE',
+                f'| last_size_change_at={_fmt_ts(last_size_change_epoch)}',
                 f'| unchanged_for={_fmt_duration(unchanged_for)}',
             )
 
             if change_history:
                 print('Derniers changements:')
-                for ts, old_v, new_v, delta_v in change_history[-int(max(1, BUILD_TRACK_HISTORY_SIZE)) :]:
+                for ts, old_v, new_v, delta_v in change_history[-int(max(1, GLOBAL_TRACK_HISTORY_SIZE)) :]:
                     print(
                         '-',
                         _fmt_ts(ts),
@@ -4065,10 +4079,10 @@ cells = [
             else:
                 print('Derniers changements: aucun changement detecte pour l instant.')
 
-            if BUILD_TRACK_MAX_LOOPS > 0 and loop_idx >= BUILD_TRACK_MAX_LOOPS:
-                print('\\nFin du suivi (BUILD_TRACK_MAX_LOOPS atteint).')
+            if GLOBAL_TRACK_MAX_LOOPS > 0 and loop_idx >= GLOBAL_TRACK_MAX_LOOPS:
+                print('\\nFin du suivi (GLOBAL_TRACK_MAX_LOOPS atteint).')
                 break
-            time.sleep(max(5.0, float(BUILD_TRACK_REFRESH_SECONDS)))
+            time.sleep(max(5.0, float(GLOBAL_TRACK_REFRESH_SECONDS)))
         """
     ),
     md("## 6bis. Sanity Check Dataset (10 echantillons aleatoires)"),
@@ -4783,6 +4797,18 @@ cells = [
                 + ". Relance la cellule '## 7. Entrainement + Evaluation Automatique' (utilitaire commun)."
             )
 
+        try:
+            from pathlib import Path as _Path
+            import yaml as _yaml
+
+            _train_cfg_payload = _yaml.safe_load(_Path(TRAIN_CONTINUE_CONFIG_ACTIVE).read_text(encoding='utf-8')) or {}
+            _train_cfg_block = dict(_train_cfg_payload.get('train', {}) or {})
+            print('[TRAIN LOG][continue] dataset_selection_mode =', _train_cfg_block.get('dataset_selection_mode', '<none>'))
+            print('[TRAIN LOG][continue] dataset_id(config)      =', _train_cfg_block.get('dataset_id', '<none>'))
+            print('[TRAIN LOG][continue] init_from_best          =', _train_cfg_block.get('init_from_promoted_best', '<none>'))
+        except Exception as exc:
+            print('[TRAIN LOG][continue] config unreadable:', f'{type(exc).__name__}: {exc}')
+
         train_cmd = (
             f'cd {shlex.quote(WORKTREE)} && '
             f'PYTHONPATH={shlex.quote(f"{WORKTREE}/src")} '
@@ -4937,6 +4963,18 @@ cells = [
                 + ', '.join(missing_helpers)
                 + ". Relance la cellule '## 7. Entrainement + Evaluation Automatique' (utilitaire commun)."
             )
+
+        try:
+            from pathlib import Path as _Path
+            import yaml as _yaml
+
+            _train_cfg_payload = _yaml.safe_load(_Path(TRAIN_SCRATCH_CONFIG_ACTIVE).read_text(encoding='utf-8')) or {}
+            _train_cfg_block = dict(_train_cfg_payload.get('train', {}) or {})
+            print('[TRAIN LOG][scratch] dataset_selection_mode =', _train_cfg_block.get('dataset_selection_mode', '<none>'))
+            print('[TRAIN LOG][scratch] dataset_id(config)      =', _train_cfg_block.get('dataset_id', '<none>'))
+            print('[TRAIN LOG][scratch] init_from_best          =', _train_cfg_block.get('init_from_promoted_best', '<none>'))
+        except Exception as exc:
+            print('[TRAIN LOG][scratch] config unreadable:', f'{type(exc).__name__}: {exc}')
 
         train_cmd = (
             f'cd {shlex.quote(WORKTREE)} && '
