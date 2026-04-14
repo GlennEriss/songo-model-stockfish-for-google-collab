@@ -1950,6 +1950,7 @@ cells = [
         Vue par source:
         - `5bis.A` = Manifest pipeline (runtime local prioritaire, Firestore fallback)
         - `5bis.A2` = Suivi live des processus (refresh `ps`)
+        - `5bis.A3` = Keep-Alive Colab (cellule infinie anti-deconnexion)
         - `5bis.B` = Runtime local worker (etat local des jobs)
         - `5bis.C` = Redis cache (et ecart vs Firestore)
         - `5bis.D` = Logs worker (fichiers runtime)
@@ -2164,6 +2165,115 @@ cells = [
             if loop_idx + 1 >= max(1, LIVE_MAX_LOOPS):
                 break
             time.sleep(max(1.0, float(LIVE_REFRESH_SECONDS)))
+        """
+    ),
+    md("### 5bis.A3 Keep-Alive Colab (cellule infinie anti-deconnexion)"),
+    code(
+        """
+        import json
+        import subprocess
+        import time
+        from pathlib import Path
+
+        def _as_bool_local(value: object, *, default: bool = False) -> bool:
+            text = str(value).strip().lower()
+            if text in {'1', 'true', 'yes', 'on'}:
+                return True
+            if text in {'0', 'false', 'no', 'off'}:
+                return False
+            return bool(default)
+
+        KEEPALIVE_REFRESH_SECONDS = float(globals().get('KEEPALIVE_REFRESH_SECONDS', 30.0))
+        KEEPALIVE_MAX_LOOPS = int(globals().get('KEEPALIVE_MAX_LOOPS', 0))  # 0 = infini
+        KEEPALIVE_STOP_WHEN_NO_PROCESS = _as_bool_local(
+            globals().get('KEEPALIVE_STOP_WHEN_NO_PROCESS', False),
+            default=False,
+        )
+
+        local_manifest_path = Path(PIPELINE_MANIFEST_PATH)
+
+        def _load_manifest_keepalive() -> dict:
+            manifest = {}
+            if local_manifest_path.exists():
+                try:
+                    manifest = json.loads(local_manifest_path.read_text(encoding='utf-8'))
+                    if isinstance(manifest, dict) and manifest:
+                        return manifest
+                except Exception:
+                    manifest = {}
+            if '_load_pipeline_manifest_payload' in globals():
+                try:
+                    manifest = _load_pipeline_manifest_payload(WORKER_TAG)
+                    if isinstance(manifest, dict):
+                        return manifest
+                except Exception:
+                    manifest = {}
+            return {}
+
+        def _extract_pids(manifest: dict) -> list[int]:
+            pids: list[int] = []
+            processes = manifest.get('processes', {})
+            if isinstance(processes, dict):
+                for info in processes.values():
+                    if not isinstance(info, dict):
+                        continue
+                    pid = int(info.get('pid', 0) or 0)
+                    if pid > 0:
+                        pids.append(pid)
+            for legacy_key in ('generate_pid', 'build_pid'):
+                pid = int(manifest.get(legacy_key, 0) or 0)
+                if pid > 0:
+                    pids.append(pid)
+            # dedupe + ordre stable
+            seen: set[int] = set()
+            ordered: list[int] = []
+            for pid in pids:
+                if pid in seen:
+                    continue
+                seen.add(pid)
+                ordered.append(pid)
+            return ordered
+
+        def _is_pid_alive(pid: int) -> bool:
+            if int(pid) <= 0:
+                return False
+            proc = subprocess.run(
+                ['ps', '-p', str(pid), '-o', 'pid='],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return bool(proc.stdout.strip())
+
+        print('Keep-alive actif. Stop manuel possible via le bouton Stop.')
+        print(
+            'Parametres | refresh_s =',
+            KEEPALIVE_REFRESH_SECONDS,
+            '| max_loops =',
+            KEEPALIVE_MAX_LOOPS if KEEPALIVE_MAX_LOOPS > 0 else 'infini',
+            '| stop_when_no_process =',
+            KEEPALIVE_STOP_WHEN_NO_PROCESS,
+        )
+
+        loop_idx = 0
+        while True:
+            loop_idx += 1
+            now = time.strftime('%Y-%m-%d %H:%M:%S')
+            manifest = _load_manifest_keepalive()
+            pids = _extract_pids(manifest)
+            running = sum(1 for pid in pids if _is_pid_alive(pid))
+            print(
+                f'[{now}] keepalive_loop={loop_idx} | tracked_pids={len(pids)} '
+                f'| running={running}'
+            )
+
+            if KEEPALIVE_STOP_WHEN_NO_PROCESS and pids and running == 0:
+                print('Aucun processus pipeline actif detecte. Arret keep-alive.')
+                break
+            if KEEPALIVE_MAX_LOOPS > 0 and loop_idx >= KEEPALIVE_MAX_LOOPS:
+                print('KEEPALIVE_MAX_LOOPS atteint. Arret keep-alive.')
+                break
+            time.sleep(max(5.0, float(KEEPALIVE_REFRESH_SECONDS)))
         """
     ),
     code(
