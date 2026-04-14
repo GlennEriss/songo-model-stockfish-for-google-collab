@@ -5151,6 +5151,18 @@ cells = [
                 except Exception:
                     return '<none>'
 
+            def _status_age_seconds(updated_at_text: str) -> int | None:
+                text = str(updated_at_text or '').strip()
+                if not text:
+                    return None
+                try:
+                    dt = _dt.fromisoformat(text.replace('Z', '+00:00'))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=_tz.utc)
+                    return max(0, int((_dt.now(_tz.utc) - dt.astimezone(_tz.utc)).total_seconds()))
+                except Exception:
+                    return None
+
             jobs_roots = _discover_jobs_roots()
             print(f'[TRAIN PROGRESS][{mode_label}] lancement...')
             print(
@@ -5158,11 +5170,33 @@ cells = [
                 + ', '.join(f'{str(root)}(exists={root.exists()})' for root in jobs_roots)
             )
             proc = _subprocess.Popen(['/bin/bash', '-lc', cmd])
+            launch_epoch = float(_time.time())
+            pinned_job_dir: _Path | None = None
             loop_idx = 0
             while True:
                 loop_idx += 1
                 return_code = proc.poll()
-                job_dir = _latest_job_dir_for_job_id(job_id, jobs_roots)
+                if pinned_job_dir is not None and pinned_job_dir.exists():
+                    job_dir = pinned_job_dir
+                else:
+                    job_dir = _latest_job_dir_for_job_id(job_id, jobs_roots)
+                    if job_dir is not None:
+                        probe_status = _load_json_dict(job_dir / 'run_status.json', default={})
+                        probe_age = _status_age_seconds(probe_status.get('updated_at', ''))
+                        elapsed_since_launch = max(0, int(_time.time() - launch_epoch))
+                        # Evite de locker sur un vieux run "running" au tout debut;
+                        # on attend un job frais quelques secondes.
+                        if probe_age is not None and (probe_age <= 120 or elapsed_since_launch >= 120):
+                            pinned_job_dir = job_dir
+                            print(
+                                f'[TRAIN PROGRESS][{mode_label}] job_dir pinned={job_dir} '
+                                f'| candidate_age_s={probe_age} | elapsed_since_launch_s={elapsed_since_launch}'
+                            )
+                        elif probe_age is not None and elapsed_since_launch < 120:
+                            print(
+                                f'[TRAIN PROGRESS][{mode_label}] waiting fresh job_dir '
+                                f'| candidate={job_dir} | candidate_age_s={probe_age} | elapsed_since_launch_s={elapsed_since_launch}'
+                            )
                 run_status = {}
                 state = {}
                 summary = {}
@@ -5638,6 +5672,18 @@ cells = [
                 except Exception:
                     return '<none>'
 
+            def _status_age_seconds(updated_at_text: str) -> int | None:
+                text = str(updated_at_text or '').strip()
+                if not text:
+                    return None
+                try:
+                    dt = _dt.fromisoformat(text.replace('Z', '+00:00'))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=_tz.utc)
+                    return max(0, int((_dt.now(_tz.utc) - dt.astimezone(_tz.utc)).total_seconds()))
+                except Exception:
+                    return None
+
             jobs_roots = _discover_jobs_roots()
             print(f'[TRAIN PROGRESS][{mode_label}] lancement...')
             print(
@@ -5645,11 +5691,33 @@ cells = [
                 + ', '.join(f'{str(root)}(exists={root.exists()})' for root in jobs_roots)
             )
             proc = _subprocess.Popen(['/bin/bash', '-lc', cmd])
+            launch_epoch = float(_time.time())
+            pinned_job_dir: _Path | None = None
             loop_idx = 0
             while True:
                 loop_idx += 1
                 return_code = proc.poll()
-                job_dir = _latest_job_dir_for_job_id(job_id, jobs_roots)
+                if pinned_job_dir is not None and pinned_job_dir.exists():
+                    job_dir = pinned_job_dir
+                else:
+                    job_dir = _latest_job_dir_for_job_id(job_id, jobs_roots)
+                    if job_dir is not None:
+                        probe_status = _load_json_dict(job_dir / 'run_status.json', default={})
+                        probe_age = _status_age_seconds(probe_status.get('updated_at', ''))
+                        elapsed_since_launch = max(0, int(_time.time() - launch_epoch))
+                        # Evite de locker sur un vieux run "running" au tout debut;
+                        # on attend un job frais quelques secondes.
+                        if probe_age is not None and (probe_age <= 120 or elapsed_since_launch >= 120):
+                            pinned_job_dir = job_dir
+                            print(
+                                f'[TRAIN PROGRESS][{mode_label}] job_dir pinned={job_dir} '
+                                f'| candidate_age_s={probe_age} | elapsed_since_launch_s={elapsed_since_launch}'
+                            )
+                        elif probe_age is not None and elapsed_since_launch < 120:
+                            print(
+                                f'[TRAIN PROGRESS][{mode_label}] waiting fresh job_dir '
+                                f'| candidate={job_dir} | candidate_age_s={probe_age} | elapsed_since_launch_s={elapsed_since_launch}'
+                            )
                 run_status = {}
                 state = {}
                 summary = {}
