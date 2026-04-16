@@ -4611,9 +4611,61 @@ cells = [
 
         def _read_job_summary(job_id: str, filename: str) -> tuple[dict, Path | None]:
             job_dir = _latest_job_dir_for_job_id(job_id, expected_run_type=_infer_expected_run_type(job_id))
-            if job_dir is None:
-                return {}, None
-            payload = _load_json_dict(job_dir / filename, default={})
+            payload = _load_json_dict(job_dir / filename, default={}) if job_dir is not None else {}
+            if payload:
+                return payload, job_dir
+
+            # Fichier potentiellement absent/retarde sur un des mirrors (runtime <-> backup):
+            # re-scan tous les job_dirs matches et retourner le premier resume non vide.
+            requested = str(job_id).strip()
+            if not requested:
+                return payload, job_dir
+            prefix = _job_prefix_for_rollover(requested)
+            roots = []
+            for raw in [
+                str(JOBS_ROOT),
+                str(globals().get('RUNTIME_HYBRID_BACKUP_JOBS_ROOT', '')).strip(),
+                '/content/songo-stockfish-runtime/jobs',
+                '/content/drive/MyDrive/songo-stockfish/jobs',
+            ]:
+                text = str(raw or '').strip()
+                if not text:
+                    continue
+                path_root = Path(text)
+                if path_root not in roots:
+                    roots.append(path_root)
+
+            expected_run_type = _infer_expected_run_type(job_id)
+            candidates: list[Path] = []
+            for root in roots:
+                if not root.exists():
+                    continue
+                for path in root.iterdir():
+                    if not path.is_dir():
+                        continue
+                    name = path.name
+                    if not (name == requested or name == prefix or (prefix and name.startswith(prefix + '_'))):
+                        continue
+                    status_payload = _load_json_dict(path / 'run_status.json', default={})
+                    run_type = str(status_payload.get('run_type', '')).strip().lower()
+                    if expected_run_type and run_type and run_type != str(expected_run_type).strip().lower():
+                        continue
+                    candidates.append(path)
+            if candidates:
+                candidates = sorted(
+                    candidates,
+                    key=lambda p: (
+                        '/runtime_backup/jobs/' not in str(p).replace('\\\\', '/'),
+                        float(p.stat().st_mtime),
+                    ),
+                    reverse=True,
+                )
+                for candidate in candidates:
+                    if job_dir is not None and str(candidate) == str(job_dir):
+                        continue
+                    candidate_payload = _load_json_dict(candidate / filename, default={})
+                    if candidate_payload:
+                        return candidate_payload, candidate
             return payload, job_dir
 
         def _resolve_train_artifacts(job_id: str) -> tuple[str, str, str]:
