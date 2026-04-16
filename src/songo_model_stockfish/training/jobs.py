@@ -510,6 +510,7 @@ def run_train(job: JobContext) -> dict[str, object]:
     global_step = int(state.get("global_step", 0))
     best_metric = float(state.get("best_metric", float("-inf")))
     best_epoch = int(state.get("best_epoch", 0))
+    last_val_acc = float(state.get("last_val_acc", 0.0))
     epochs_without_improvement = int(state.get("epochs_without_improvement", 0))
     if best_metric == float("-inf"):
         best_metric = 0.0
@@ -714,6 +715,7 @@ def run_train(job: JobContext) -> dict[str, object]:
                 "global_step": global_step,
                 "best_metric": best_metric,
                 "best_epoch": best_epoch,
+                "last_val_acc": last_val_acc,
                 "epochs_without_improvement": epochs_without_improvement,
                 "last_completed_phase": "epoch_initialized",
                 "checkpoint_path": str(last_checkpoint_path),
@@ -728,6 +730,9 @@ def run_train(job: JobContext) -> dict[str, object]:
                 "resume_granularity": "epoch",
                 "current_epoch": epoch_number,
                 "total_epochs": epochs,
+                "best_metric": best_metric,
+                "best_epoch": best_epoch,
+                "last_val_acc": last_val_acc,
                 "last_checkpoint_path": str(last_checkpoint_path),
                 "last_state_path": str(job.state_path),
             },
@@ -769,6 +774,9 @@ def run_train(job: JobContext) -> dict[str, object]:
                         "resume_granularity": "epoch",
                         "current_epoch": epoch_number,
                         "total_epochs": epochs,
+                        "best_metric": best_metric,
+                        "best_epoch": best_epoch,
+                        "last_val_acc": last_val_acc,
                         "stage": "train",
                         "batch_index": batch_index,
                         "total_batches": total_batches,
@@ -785,6 +793,9 @@ def run_train(job: JobContext) -> dict[str, object]:
                         "total_batches": total_batches,
                         "global_step": global_step,
                         "best_metric": best_metric,
+                        "best_epoch": best_epoch,
+                        "last_val_acc": last_val_acc,
+                        "epochs_without_improvement": epochs_without_improvement,
                         "last_completed_phase": "train_batch_progress",
                         "checkpoint_path": str(last_checkpoint_path),
                     }
@@ -835,6 +846,9 @@ def run_train(job: JobContext) -> dict[str, object]:
                 "resume_granularity": "epoch",
                 "current_epoch": epoch_number,
                 "total_epochs": epochs,
+                "best_metric": best_metric,
+                "best_epoch": best_epoch,
+                "last_val_acc": last_val_acc,
                 "stage": "validation",
                 "batch_index": 0,
                 "total_batches": len(validation_loader),
@@ -879,6 +893,9 @@ def run_train(job: JobContext) -> dict[str, object]:
                         "resume_granularity": "epoch",
                         "current_epoch": epoch_number,
                         "total_epochs": epochs,
+                        "best_metric": best_metric,
+                        "best_epoch": best_epoch,
+                        "last_val_acc": last_val_acc,
                         "stage": "validation",
                         "batch_index": batch_index,
                         "total_batches": total_batches,
@@ -895,6 +912,9 @@ def run_train(job: JobContext) -> dict[str, object]:
                         "total_batches": total_batches,
                         "global_step": global_step,
                         "best_metric": best_metric,
+                        "best_epoch": best_epoch,
+                        "last_val_acc": last_val_acc,
+                        "epochs_without_improvement": epochs_without_improvement,
                         "last_completed_phase": "validation_batch_progress",
                         "checkpoint_path": str(last_checkpoint_path),
                     }
@@ -959,6 +979,7 @@ def run_train(job: JobContext) -> dict[str, object]:
         )
 
         validation_score = float(validation_metrics["policy_accuracy"])
+        last_val_acc = validation_score
         improved = validation_score >= best_metric
         if improved:
             best_metric = validation_score
@@ -1003,6 +1024,7 @@ def run_train(job: JobContext) -> dict[str, object]:
                 "global_step": global_step,
                 "best_metric": best_metric,
                 "best_epoch": best_epoch,
+                "last_val_acc": last_val_acc,
                 "epochs_without_improvement": epochs_without_improvement,
                 "last_completed_phase": "validation",
                 "checkpoint_path": str(last_checkpoint_path),
@@ -1013,6 +1035,13 @@ def run_train(job: JobContext) -> dict[str, object]:
             phase=f"epoch_{epoch_number:03d}_validation",
             extra={
                 "dataset_id": dataset_id,
+                "model_id": model_id,
+                "resume_granularity": "epoch",
+                "current_epoch": epoch_number,
+                "total_epochs": epochs,
+                "best_metric": best_metric,
+                "best_epoch": best_epoch,
+                "last_val_acc": last_val_acc,
                 "last_checkpoint_path": str(last_checkpoint_path),
                 "last_state_path": str(job.state_path),
             },

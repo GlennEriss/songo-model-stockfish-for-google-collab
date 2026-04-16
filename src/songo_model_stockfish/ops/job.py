@@ -254,13 +254,11 @@ def _next_cycle_job_id(requested_job_id: str, jobs_root: Path, *, backup_jobs_ro
     if stem.endswith("_") and len(stem) > 1:
         stem = stem[:-1]
 
-    import re
-
-    match = re.search(r"^(.*?)(\d+)$", stem)
-    if match:
-        prefix = match.group(1)
-        width = len(match.group(2))
-        candidate = int(match.group(2))
+    parts = stem.rsplit("_", 1)
+    if len(parts) == 2 and parts[1].isdigit():
+        prefix = f"{parts[0]}_"
+        width = len(parts[1])
+        candidate = int(parts[1])
         while True:
             candidate += 1
             next_job_id = f"{prefix}{candidate:0{width}d}"

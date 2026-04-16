@@ -4978,7 +4978,7 @@ cells = [
             f'train --config {shlex.quote(str(TRAIN_CONTINUE_CONFIG_ACTIVE))} '
             f'--job-id {shlex.quote(TRAIN_CONTINUE_JOB_ID)}'
         )
-        def _run_train_with_progress(*, cmd: str, job_id: str, mode_label: str, config_path: str) -> None:
+        def _run_train_with_progress(*, cmd: str, job_id: str, mode_label: str, config_path: str) -> str:
             import json as _json
             import os as _os
             import time as _time
@@ -5172,6 +5172,7 @@ cells = [
             proc = _subprocess.Popen(['/bin/bash', '-lc', cmd])
             launch_epoch = float(_time.time())
             pinned_job_dir: _Path | None = None
+            resolved_job_id = str(job_id)
             loop_idx = 0
             while True:
                 loop_idx += 1
@@ -5201,6 +5202,7 @@ cells = [
                 state = {}
                 summary = {}
                 if job_dir is not None:
+                    resolved_job_id = str(job_dir.name)
                     run_status = _load_json_dict(job_dir / 'run_status.json', default={})
                     state = _load_json_dict(job_dir / 'state.json', default={})
                     summary = _load_json_dict(job_dir / 'training_summary.json', default={})
@@ -5221,17 +5223,37 @@ cells = [
                     or summary.get('epochs')
                     or '<none>'
                 )
-                best_epoch = state.get('best_epoch', summary.get('best_epoch', '<none>'))
-                best_val_metric = state.get('best_metric', summary.get('best_val_metric', '<none>'))
+                def _first_non_none(*values):
+                    for value in values:
+                        if value is not None:
+                            return value
+                    return None
+
+                best_epoch = _first_non_none(
+                    run_status.get('best_epoch'),
+                    state.get('best_epoch'),
+                    summary.get('best_epoch'),
+                )
+                if best_epoch is None:
+                    best_epoch = '<none>'
+                best_val_metric = _first_non_none(
+                    run_status.get('best_metric'),
+                    state.get('best_metric'),
+                    summary.get('best_val_metric'),
+                )
+                if best_val_metric is None:
+                    best_val_metric = '<none>'
                 history = summary.get('history', [])
                 history_last = history[-1] if isinstance(history, list) and history and isinstance(history[-1], dict) else {}
-                last_val_acc = (
-                    state.get('last_val_acc')
-                    or summary.get('last_val_acc')
-                    or summary.get('last_validation_policy_accuracy')
-                    or history_last.get('validation_policy_accuracy')
-                    or '<none>'
+                last_val_acc = _first_non_none(
+                    run_status.get('last_val_acc'),
+                    state.get('last_val_acc'),
+                    summary.get('last_val_acc'),
+                    summary.get('last_validation_policy_accuracy'),
+                    history_last.get('validation_policy_accuracy'),
                 )
+                if last_val_acc is None:
+                    last_val_acc = '<none>'
                 job_dir_text = str(job_dir) if job_dir is not None else '<not_found>'
                 print(
                     f'[TRAIN PROGRESS][{mode_label}][{loop_idx:03d}] '
@@ -5244,17 +5266,20 @@ cells = [
                     if return_code != 0:
                         raise _subprocess.CalledProcessError(return_code, cmd)
                     print(f'[TRAIN PROGRESS][{mode_label}] termine avec succes.')
-                    break
+                    return resolved_job_id
                 _time.sleep(15.0)
 
-        _run_train_with_progress(
+        resolved_train_job_id = _run_train_with_progress(
             cmd=train_cmd,
             job_id=TRAIN_CONTINUE_JOB_ID,
             mode_label='continue',
             config_path=str(TRAIN_CONTINUE_CONFIG_ACTIVE),
         )
+        print(f'[TRAIN PROGRESS][continue] resolved_job_id={resolved_train_job_id}')
 
-        train_dataset_id, train_model_id, train_checkpoint_path = _resolve_train_artifacts(TRAIN_CONTINUE_JOB_ID)
+        train_dataset_id, train_model_id, train_checkpoint_path = _resolve_train_artifacts(
+            resolved_train_job_id or TRAIN_CONTINUE_JOB_ID
+        )
         print('Evaluation lock        = dataset_id', train_dataset_id, '| model_id', train_model_id)
         runtime_eval_cfg_path, selected_model_id = _prepare_eval_runtime_config(
             locked_dataset_id=train_dataset_id,
@@ -5499,7 +5524,7 @@ cells = [
             f'train --config {shlex.quote(str(TRAIN_SCRATCH_CONFIG_ACTIVE))} '
             f'--job-id {shlex.quote(TRAIN_SCRATCH_JOB_ID)}'
         )
-        def _run_train_with_progress(*, cmd: str, job_id: str, mode_label: str, config_path: str) -> None:
+        def _run_train_with_progress(*, cmd: str, job_id: str, mode_label: str, config_path: str) -> str:
             import json as _json
             import os as _os
             import time as _time
@@ -5693,6 +5718,7 @@ cells = [
             proc = _subprocess.Popen(['/bin/bash', '-lc', cmd])
             launch_epoch = float(_time.time())
             pinned_job_dir: _Path | None = None
+            resolved_job_id = str(job_id)
             loop_idx = 0
             while True:
                 loop_idx += 1
@@ -5722,6 +5748,7 @@ cells = [
                 state = {}
                 summary = {}
                 if job_dir is not None:
+                    resolved_job_id = str(job_dir.name)
                     run_status = _load_json_dict(job_dir / 'run_status.json', default={})
                     state = _load_json_dict(job_dir / 'state.json', default={})
                     summary = _load_json_dict(job_dir / 'training_summary.json', default={})
@@ -5742,17 +5769,37 @@ cells = [
                     or summary.get('epochs')
                     or '<none>'
                 )
-                best_epoch = state.get('best_epoch', summary.get('best_epoch', '<none>'))
-                best_val_metric = state.get('best_metric', summary.get('best_val_metric', '<none>'))
+                def _first_non_none(*values):
+                    for value in values:
+                        if value is not None:
+                            return value
+                    return None
+
+                best_epoch = _first_non_none(
+                    run_status.get('best_epoch'),
+                    state.get('best_epoch'),
+                    summary.get('best_epoch'),
+                )
+                if best_epoch is None:
+                    best_epoch = '<none>'
+                best_val_metric = _first_non_none(
+                    run_status.get('best_metric'),
+                    state.get('best_metric'),
+                    summary.get('best_val_metric'),
+                )
+                if best_val_metric is None:
+                    best_val_metric = '<none>'
                 history = summary.get('history', [])
                 history_last = history[-1] if isinstance(history, list) and history and isinstance(history[-1], dict) else {}
-                last_val_acc = (
-                    state.get('last_val_acc')
-                    or summary.get('last_val_acc')
-                    or summary.get('last_validation_policy_accuracy')
-                    or history_last.get('validation_policy_accuracy')
-                    or '<none>'
+                last_val_acc = _first_non_none(
+                    run_status.get('last_val_acc'),
+                    state.get('last_val_acc'),
+                    summary.get('last_val_acc'),
+                    summary.get('last_validation_policy_accuracy'),
+                    history_last.get('validation_policy_accuracy'),
                 )
+                if last_val_acc is None:
+                    last_val_acc = '<none>'
                 job_dir_text = str(job_dir) if job_dir is not None else '<not_found>'
                 print(
                     f'[TRAIN PROGRESS][{mode_label}][{loop_idx:03d}] '
@@ -5765,17 +5812,20 @@ cells = [
                     if return_code != 0:
                         raise _subprocess.CalledProcessError(return_code, cmd)
                     print(f'[TRAIN PROGRESS][{mode_label}] termine avec succes.')
-                    break
+                    return resolved_job_id
                 _time.sleep(15.0)
 
-        _run_train_with_progress(
+        resolved_train_job_id = _run_train_with_progress(
             cmd=train_cmd,
             job_id=TRAIN_SCRATCH_JOB_ID,
             mode_label='scratch',
             config_path=str(TRAIN_SCRATCH_CONFIG_ACTIVE),
         )
+        print(f'[TRAIN PROGRESS][scratch] resolved_job_id={resolved_train_job_id}')
 
-        train_dataset_id, train_model_id, train_checkpoint_path = _resolve_train_artifacts(TRAIN_SCRATCH_JOB_ID)
+        train_dataset_id, train_model_id, train_checkpoint_path = _resolve_train_artifacts(
+            resolved_train_job_id or TRAIN_SCRATCH_JOB_ID
+        )
         print('Evaluation lock        = dataset_id', train_dataset_id, '| model_id', train_model_id)
         runtime_eval_cfg_path, selected_model_id = _prepare_eval_runtime_config(
             locked_dataset_id=train_dataset_id,
