@@ -275,8 +275,12 @@ def run_benchmark_job(job: JobContext) -> dict[str, object]:
         wins_b = 0
         draws = 0
         total_moves = 0
+        total_choose_fallbacks_target = 0
+        total_choose_fallbacks_opponent = 0
         as_first = {"wins": 0, "losses": 0, "draws": 0}
         as_second = {"wins": 0, "losses": 0, "draws": 0}
+        as_first_choose_fallbacks_target = 0
+        as_second_choose_fallbacks_target = 0
         game_results: dict[int, dict[str, object]] = {}
         pending_game_indices: list[int] = []
         for game_index in range(games):
@@ -335,6 +339,8 @@ def run_benchmark_job(job: JobContext) -> dict[str, object]:
                     "game_id": game_filename.removesuffix(".json"),
                     "winner": payload["winner"],
                     "moves": payload["moves"],
+                    "choose_fallbacks_target": int((payload.get("choose_fallbacks") or [0, 0])[0] or 0),
+                    "choose_fallbacks_opponent": int((payload.get("choose_fallbacks") or [0, 0])[1] or 0),
                     "avg_move_time_ms": (
                         (sum(payload["think_ms"]) / len(payload["think_ms"]))
                         if payload["think_ms"]
@@ -378,14 +384,17 @@ def run_benchmark_job(job: JobContext) -> dict[str, object]:
                             resolved_game_index, game_payload = future.result()
                         except Exception as exc:
                             job.logger.exception(
-                                "benchmark worker echec | matchup=%s | game=%s/%s | cause=%s: %s | retry=sequential",
+                                "benchmark worker echec | matchup=%s | game=%s/%s | cause=%s: %s | strict_mode_abort=true",
                                 matchup_key,
                                 game_index + 1,
                                 games,
                                 type(exc).__name__,
                                 exc,
                             )
-                            resolved_game_index, game_payload = _play_single_game_payload(game_index)
+                            raise RuntimeError(
+                                f"Benchmark game failed in strict mode | matchup={matchup_key} | "
+                                f"game={game_index + 1}/{games} | cause={type(exc).__name__}: {exc}"
+                            ) from exc
                         game_results[resolved_game_index] = game_payload
                         _persist_new_game(resolved_game_index, game_payload)
             else:
@@ -404,20 +413,29 @@ def run_benchmark_job(job: JobContext) -> dict[str, object]:
             starter = game_index % 2
             game_payload = game_results[game_index]
             winner = game_payload["winner"]
+            choose_fallbacks = game_payload.get("choose_fallbacks", [0, 0])
+            if not isinstance(choose_fallbacks, (list, tuple)) or len(choose_fallbacks) < 2:
+                choose_fallbacks = [0, 0]
+            target_fallbacks = int(choose_fallbacks[0] or 0)
+            opponent_fallbacks = int(choose_fallbacks[1] or 0)
             if winner == 0:
                 wins_a += 1
             elif winner == 1:
                 wins_b += 1
             else:
                 draws += 1
+            total_choose_fallbacks_target += target_fallbacks
+            total_choose_fallbacks_opponent += opponent_fallbacks
             if int(game_payload.get("starter", starter)) == 0:
                 _record_by_role(as_first, winner)
+                as_first_choose_fallbacks_target += target_fallbacks
             else:
                 _record_by_role(as_second, winner)
+                as_second_choose_fallbacks_target += target_fallbacks
             total_moves += int(game_payload["moves"])
             winner_label = _winner_label(winner, target_agent.display_name, opponent.display_name)
             job.logger.info(
-                "benchmark game completed | matchup=%s | game=%s/%s | winner=%s | score=%s-%s | moves=%s | reason=%s",
+                "benchmark game completed | matchup=%s | game=%s/%s | winner=%s | score=%s-%s | moves=%s | reason=%s | choose_fallbacks_target=%s | choose_fallbacks_opponent=%s",
                 matchup_key,
                 game_index + 1,
                 games,
@@ -426,6 +444,8 @@ def run_benchmark_job(job: JobContext) -> dict[str, object]:
                 game_payload["scores"][1],
                 game_payload["moves"],
                 game_payload.get("reason", ""),
+                target_fallbacks,
+                opponent_fallbacks,
             )
         payload = {
             "opponent": str(opponent_spec),
@@ -437,16 +457,20 @@ def run_benchmark_job(job: JobContext) -> dict[str, object]:
             "winrate": wins_a / games if games else 0.0,
             "score_rate": (wins_a + 0.5 * draws) / games if games else 0.0,
             "avg_moves": total_moves / games if games else 0.0,
+            "choose_fallbacks_target_total": int(total_choose_fallbacks_target),
+            "choose_fallbacks_opponent_total": int(total_choose_fallbacks_opponent),
             "difficulty_weight": _opponent_weight(str(opponent_spec)),
             "opponent_rating": _opponent_rating(str(opponent_spec), configured_ratings),
             "as_first_player": {
                 **as_first,
+                "choose_fallbacks_target": int(as_first_choose_fallbacks_target),
                 "games": sum(as_first.values()),
                 "winrate": (as_first["wins"] / sum(as_first.values())) if sum(as_first.values()) else 0.0,
                 "score_rate": ((as_first["wins"] + 0.5 * as_first["draws"]) / sum(as_first.values())) if sum(as_first.values()) else 0.0,
             },
             "as_second_player": {
                 **as_second,
+                "choose_fallbacks_target": int(as_second_choose_fallbacks_target),
                 "games": sum(as_second.values()),
                 "winrate": (as_second["wins"] / sum(as_second.values())) if sum(as_second.values()) else 0.0,
                 "score_rate": ((as_second["wins"] + 0.5 * as_second["draws"]) / sum(as_second.values())) if sum(as_second.values()) else 0.0,

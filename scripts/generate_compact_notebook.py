@@ -4407,10 +4407,6 @@ cells = [
                     registry_checkpoint = Path(str(registry_row.get('checkpoint_path', '')).strip())
                     if registry_checkpoint.exists():
                         candidate_checkpoint = registry_checkpoint
-                    else:
-                        fallback_checkpoint = Path(DRIVE_ROOT) / 'models' / 'final' / f'{locked_model_id_value}.pt'
-                        if fallback_checkpoint.exists():
-                            candidate_checkpoint = fallback_checkpoint
                 if candidate_checkpoint is None:
                     raise ValueError(
                         f'Impossible de resoudre le checkpoint verrouille pour model_id={locked_model_id_value or "<empty>"}'
@@ -4611,51 +4607,6 @@ cells = [
             best = candidates_sorted[0]
             if bool(best.get('is_running', False)):
                 return Path(str(best['path']))
-
-            # Fallback: job rollover non detecte par le nom -> chercher un train actif recent.
-            running_fallback = []
-            for root in roots:
-                if not root.exists():
-                    continue
-                for path in root.iterdir():
-                    if not path.is_dir():
-                        continue
-                    status_payload = _load_json_dict(path / 'run_status.json', default={})
-                    status = str(status_payload.get('status', '')).strip().lower()
-                    if status not in {'running', 'pending'}:
-                        continue
-                    run_type = str(status_payload.get('run_type', '')).strip().lower()
-                    if expected_run_type:
-                        if run_type and run_type != str(expected_run_type).strip().lower():
-                            continue
-                    elif run_type and run_type != 'train':
-                        continue
-                    config_hit = False
-                    try:
-                        config_text = (path / 'config.yaml').read_text(encoding='utf-8', errors='ignore')
-                        config_hit = bool(requested) and (requested in config_text)
-                    except Exception:
-                        config_hit = False
-                    running_fallback.append(
-                        {
-                            'path': path,
-                            'config_hit': config_hit,
-                            'is_backup': _is_backup_path(path),
-                            'mtime': float(path.stat().st_mtime),
-                        }
-                    )
-            if running_fallback:
-                running_sorted = sorted(
-                    running_fallback,
-                    key=lambda item: (
-                        bool(item.get('config_hit', False)),
-                        not bool(item.get('is_backup', False)),
-                        float(item.get('mtime', 0.0)),
-                    ),
-                    reverse=True,
-                )
-                return Path(str(running_sorted[0]['path']))
-
             return Path(str(best['path']))
 
         def _read_job_summary(job_id: str, filename: str) -> tuple[dict, Path | None]:
@@ -4667,6 +4618,10 @@ cells = [
 
         def _resolve_train_artifacts(job_id: str) -> tuple[str, str, str]:
             train_summary, train_job_dir = _read_job_summary(job_id, 'training_summary.json')
+            if train_job_dir is None:
+                raise FileNotFoundError(
+                    f'job_dir introuvable pour job_id={job_id} (strict mode, aucun fallback autorise)'
+                )
             dataset_id = str(train_summary.get('dataset_id', '')).strip()
             model_id = str(train_summary.get('model_id', '')).strip()
             checkpoint_path = str(train_summary.get('final_model_path', '')).strip()
@@ -4680,41 +4635,20 @@ cells = [
                 if (checkpoint is None or not checkpoint.exists()) and not checkpoint_path:
                     alt_checkpoint_path = str(run_status.get('checkpoint_path', '')).strip()
                     checkpoint = Path(alt_checkpoint_path) if alt_checkpoint_path else None
-            if (checkpoint is None or not checkpoint.exists()) and model_id:
-                fallback = Path(DRIVE_ROOT) / 'models' / 'final' / f'{model_id}.pt'
-                if fallback.exists():
-                    checkpoint = fallback
-            if not dataset_id:
-                datasets_registry = _load_json_dict(
-                    Path(DRIVE_ROOT) / 'data' / 'datasets' / 'dataset_registry.json',
-                    default={},
-                )
-                built_entries = datasets_registry.get('built_datasets', []) if isinstance(datasets_registry, dict) else []
-                best_entry = {}
-                if isinstance(built_entries, list) and built_entries:
-                    def _samples(entry: dict) -> int:
-                        try:
-                            return int(entry.get('labeled_samples') or entry.get('sample_count') or 0)
-                        except Exception:
-                            return 0
-                    best_entry = max(
-                        [entry for entry in built_entries if isinstance(entry, dict)],
-                        key=_samples,
-                        default={},
-                    )
-                dataset_id = str(best_entry.get('dataset_id', '')).strip()
             if not dataset_id:
                 raise ValueError(
-                    f'dataset_id absent dans training_summary pour job_id={job_id} (job_dir={train_job_dir})'
+                    f'dataset_id absent dans training_summary/run_status pour job_id={job_id} '
+                    f'(job_dir={train_job_dir}) | strict mode'
                 )
             if not model_id:
                 raise ValueError(
-                    f'model_id absent dans training_summary pour job_id={job_id} (job_dir={train_job_dir})'
+                    f'model_id absent dans training_summary/run_status pour job_id={job_id} '
+                    f'(job_dir={train_job_dir}) | strict mode'
                 )
             if checkpoint is None or not checkpoint.exists():
                 raise FileNotFoundError(
                     f'checkpoint introuvable pour job_id={job_id} | model_id={model_id} | '
-                    f'checkpoint(train_summary)={checkpoint_path}'
+                    f'checkpoint(training_summary/run_status)={checkpoint_path} | strict mode'
                 )
             return dataset_id, model_id, str(checkpoint)
 
@@ -4913,47 +4847,6 @@ cells = [
                 best = candidates_sorted[0]
                 if bool(best.get('is_running', False)):
                     return Path(str(best['path']))
-
-                running_fallback = []
-                for root in roots:
-                    if not root.exists():
-                        continue
-                    for path in root.iterdir():
-                        if not path.is_dir():
-                            continue
-                        status_payload = _load_json_dict(path / 'run_status.json', default={})
-                        status = str(status_payload.get('status', '')).strip().lower()
-                        if status not in {'running', 'pending'}:
-                            continue
-                        run_type = str(status_payload.get('run_type', '')).strip().lower()
-                        if run_type and run_type != 'train':
-                            continue
-                        config_hit = False
-                        try:
-                            config_text = (path / 'config.yaml').read_text(encoding='utf-8', errors='ignore')
-                            config_hit = bool(requested) and (requested in config_text)
-                        except Exception:
-                            config_hit = False
-                        running_fallback.append(
-                            {
-                                'path': path,
-                                'config_hit': config_hit,
-                                'is_backup': _is_backup_path(path),
-                                'mtime': float(path.stat().st_mtime),
-                            }
-                        )
-                if running_fallback:
-                    running_sorted = sorted(
-                        running_fallback,
-                        key=lambda item: (
-                            bool(item.get('config_hit', False)),
-                            not bool(item.get('is_backup', False)),
-                            float(item.get('mtime', 0.0)),
-                        ),
-                        reverse=True,
-                    )
-                    return Path(str(running_sorted[0]['path']))
-
                 return Path(str(best['path']))
 
             def _read_job_summary(job_id: str, filename: str) -> tuple[dict, Path | None]:
@@ -4965,6 +4858,10 @@ cells = [
 
             def _resolve_train_artifacts(job_id: str) -> tuple[str, str, str]:
                 train_summary, train_job_dir = _read_job_summary(job_id, 'training_summary.json')
+                if train_job_dir is None:
+                    raise FileNotFoundError(
+                        f'job_dir introuvable pour job_id={job_id} (strict mode, aucun fallback autorise)'
+                    )
                 dataset_id = str(train_summary.get('dataset_id', '')).strip()
                 model_id = str(train_summary.get('model_id', '')).strip()
                 checkpoint_path = str(train_summary.get('final_model_path', '')).strip()
@@ -4978,41 +4875,20 @@ cells = [
                     if (checkpoint is None or not checkpoint.exists()) and not checkpoint_path:
                         alt_checkpoint_path = str(run_status.get('checkpoint_path', '')).strip()
                         checkpoint = Path(alt_checkpoint_path) if alt_checkpoint_path else None
-                if (checkpoint is None or not checkpoint.exists()) and model_id:
-                    fallback = Path(DRIVE_ROOT) / 'models' / 'final' / f'{model_id}.pt'
-                    if fallback.exists():
-                        checkpoint = fallback
-                if not dataset_id:
-                    datasets_registry = _load_json_dict(
-                        Path(DRIVE_ROOT) / 'data' / 'datasets' / 'dataset_registry.json',
-                        default={},
-                    )
-                    built_entries = datasets_registry.get('built_datasets', []) if isinstance(datasets_registry, dict) else []
-                    best_entry = {}
-                    if isinstance(built_entries, list) and built_entries:
-                        def _samples(entry: dict) -> int:
-                            try:
-                                return int(entry.get('labeled_samples') or entry.get('sample_count') or 0)
-                            except Exception:
-                                return 0
-                        best_entry = max(
-                            [entry for entry in built_entries if isinstance(entry, dict)],
-                            key=_samples,
-                            default={},
-                        )
-                    dataset_id = str(best_entry.get('dataset_id', '')).strip()
                 if not dataset_id:
                     raise ValueError(
-                        f'dataset_id absent dans training_summary pour job_id={job_id} (job_dir={train_job_dir})'
+                        f'dataset_id absent dans training_summary/run_status pour job_id={job_id} '
+                        f'(job_dir={train_job_dir}) | strict mode'
                     )
                 if not model_id:
                     raise ValueError(
-                        f'model_id absent dans training_summary pour job_id={job_id} (job_dir={train_job_dir})'
+                        f'model_id absent dans training_summary/run_status pour job_id={job_id} '
+                        f'(job_dir={train_job_dir}) | strict mode'
                     )
                 if checkpoint is None or not checkpoint.exists():
                     raise FileNotFoundError(
                         f'checkpoint introuvable pour job_id={job_id} | model_id={model_id} | '
-                        f'checkpoint(train_summary)={checkpoint_path}'
+                        f'checkpoint(training_summary/run_status)={checkpoint_path} | strict mode'
                     )
                 return dataset_id, model_id, str(checkpoint)
 
@@ -5248,23 +5124,24 @@ cells = [
                 if pinned_job_dir is not None and pinned_job_dir.exists():
                     job_dir = pinned_job_dir
                 else:
-                    job_dir = _latest_job_dir_for_job_id(job_id, jobs_roots)
-                    if job_dir is not None:
-                        probe_status = _load_json_dict(job_dir / 'run_status.json', default={})
+                    job_dir = None
+                    candidate_job_dir = _latest_job_dir_for_job_id(job_id, jobs_roots)
+                    if candidate_job_dir is not None:
+                        probe_status = _load_json_dict(candidate_job_dir / 'run_status.json', default={})
                         probe_age = _status_age_seconds(probe_status.get('updated_at', ''))
                         elapsed_since_launch = max(0, int(_time.time() - launch_epoch))
-                        # Evite de locker sur un vieux run "running" au tout debut;
-                        # on attend un job frais quelques secondes.
-                        if probe_age is not None and (probe_age <= 120 or elapsed_since_launch >= 120):
-                            pinned_job_dir = job_dir
+                        if probe_age is not None and probe_age <= 120:
+                            pinned_job_dir = candidate_job_dir
+                            job_dir = candidate_job_dir
                             print(
-                                f'[TRAIN PROGRESS][{mode_label}] job_dir pinned={job_dir} '
+                                f'[TRAIN PROGRESS][{mode_label}] job_dir pinned={candidate_job_dir} '
                                 f'| candidate_age_s={probe_age} | elapsed_since_launch_s={elapsed_since_launch}'
                             )
-                        elif probe_age is not None and elapsed_since_launch < 120:
+                        else:
                             print(
                                 f'[TRAIN PROGRESS][{mode_label}] waiting fresh job_dir '
-                                f'| candidate={job_dir} | candidate_age_s={probe_age} | elapsed_since_launch_s={elapsed_since_launch}'
+                                f'| candidate={candidate_job_dir} | candidate_age_s={probe_age} | '
+                                f'elapsed_since_launch_s={elapsed_since_launch}'
                             )
                 run_status = {}
                 state = {}
@@ -5333,6 +5210,11 @@ cells = [
                 if return_code is not None:
                     if return_code != 0:
                         raise _subprocess.CalledProcessError(return_code, cmd)
+                    if pinned_job_dir is None:
+                        raise RuntimeError(
+                            f'Train termine mais aucun job_dir frais n a ete detecte pour job_id={job_id} '
+                            f'(strict mode).'
+                        )
                     print(f'[TRAIN PROGRESS][{mode_label}] termine avec succes.')
                     return resolved_job_id
                 _time.sleep(15.0)
@@ -5345,11 +5227,13 @@ cells = [
         )
         print(f'[TRAIN PROGRESS][continue] resolved_job_id={resolved_train_job_id}')
 
-        def _resolve_artifacts_from_exact_job_dir(resolved_job_id: str, fallback_job_id: str) -> tuple[str, str, str]:
+        def _resolve_artifacts_from_exact_job_dir(resolved_job_id: str) -> tuple[str, str, str]:
             import json as _json
             from pathlib import Path as _Path
 
             requested = str(resolved_job_id or '').strip()
+            if not requested:
+                raise ValueError('resolved_job_id vide (strict mode, aucun fallback autorise)')
             roots = []
             for raw in [
                 str(JOBS_ROOT),
@@ -5373,34 +5257,46 @@ cells = [
                     return {}
                 return payload if isinstance(payload, dict) else {}
 
-            if requested:
-                exact_dirs = [root / requested for root in roots if (root / requested).exists() and (root / requested).is_dir()]
-                if exact_dirs:
-                    exact_dirs = sorted(
-                        exact_dirs,
-                        key=lambda p: (
-                            '/runtime_backup/jobs/' not in str(p).replace('\\\\', '/'),
-                            float(p.stat().st_mtime),
-                        ),
-                        reverse=True,
-                    )
-                    exact_dir = exact_dirs[0]
-                    train_summary = _load(exact_dir / 'training_summary.json')
-                    run_status = _load(exact_dir / 'run_status.json')
-                    dataset_id = str(train_summary.get('dataset_id') or run_status.get('dataset_id') or '').strip()
-                    model_id = str(train_summary.get('model_id') or run_status.get('model_id') or '').strip()
-                    checkpoint_path = str(train_summary.get('final_model_path') or run_status.get('checkpoint_path') or '').strip()
-                    if not checkpoint_path and model_id:
-                        fallback = _Path(DRIVE_ROOT) / 'models' / 'final' / f'{model_id}.pt'
-                        if fallback.exists():
-                            checkpoint_path = str(fallback)
-                    if dataset_id and model_id and checkpoint_path and _Path(checkpoint_path).exists():
-                        return dataset_id, model_id, checkpoint_path
-            return _resolve_train_artifacts(fallback_job_id)
+            exact_dirs = [root / requested for root in roots if (root / requested).exists() and (root / requested).is_dir()]
+            if not exact_dirs:
+                raise FileNotFoundError(
+                    f'job_dir exact introuvable pour resolved_job_id={requested} (strict mode)'
+                )
+            exact_dirs = sorted(
+                exact_dirs,
+                key=lambda p: (
+                    '/runtime_backup/jobs/' not in str(p).replace('\\\\', '/'),
+                    float(p.stat().st_mtime),
+                ),
+                reverse=True,
+            )
+            exact_dir = exact_dirs[0]
+            train_summary = _load(exact_dir / 'training_summary.json')
+            run_status = _load(exact_dir / 'run_status.json')
+            dataset_id = str(train_summary.get('dataset_id') or run_status.get('dataset_id') or '').strip()
+            model_id = str(train_summary.get('model_id') or run_status.get('model_id') or '').strip()
+            checkpoint_path = str(train_summary.get('final_model_path') or run_status.get('checkpoint_path') or '').strip()
+            if not dataset_id:
+                raise ValueError(
+                    f'dataset_id absent dans job_dir={exact_dir} (strict mode)'
+                )
+            if not model_id:
+                raise ValueError(
+                    f'model_id absent dans job_dir={exact_dir} (strict mode)'
+                )
+            if not checkpoint_path:
+                raise ValueError(
+                    f'checkpoint_path absent dans job_dir={exact_dir} (strict mode)'
+                )
+            checkpoint = _Path(checkpoint_path)
+            if not checkpoint.exists():
+                raise FileNotFoundError(
+                    f'checkpoint introuvable: {checkpoint} (job_dir={exact_dir}, strict mode)'
+                )
+            return dataset_id, model_id, str(checkpoint)
 
         train_dataset_id, train_model_id, train_checkpoint_path = _resolve_artifacts_from_exact_job_dir(
             resolved_train_job_id,
-            TRAIN_CONTINUE_JOB_ID,
         )
         print('Evaluation lock        = dataset_id', train_dataset_id, '| model_id', train_model_id)
         runtime_eval_cfg_path, selected_model_id = _prepare_eval_runtime_config(
@@ -5523,47 +5419,6 @@ cells = [
                 best = candidates_sorted[0]
                 if bool(best.get('is_running', False)):
                     return Path(str(best['path']))
-
-                running_fallback = []
-                for root in roots:
-                    if not root.exists():
-                        continue
-                    for path in root.iterdir():
-                        if not path.is_dir():
-                            continue
-                        status_payload = _load_json_dict(path / 'run_status.json', default={})
-                        status = str(status_payload.get('status', '')).strip().lower()
-                        if status not in {'running', 'pending'}:
-                            continue
-                        run_type = str(status_payload.get('run_type', '')).strip().lower()
-                        if run_type and run_type != 'train':
-                            continue
-                        config_hit = False
-                        try:
-                            config_text = (path / 'config.yaml').read_text(encoding='utf-8', errors='ignore')
-                            config_hit = bool(requested) and (requested in config_text)
-                        except Exception:
-                            config_hit = False
-                        running_fallback.append(
-                            {
-                                'path': path,
-                                'config_hit': config_hit,
-                                'is_backup': _is_backup_path(path),
-                                'mtime': float(path.stat().st_mtime),
-                            }
-                        )
-                if running_fallback:
-                    running_sorted = sorted(
-                        running_fallback,
-                        key=lambda item: (
-                            bool(item.get('config_hit', False)),
-                            not bool(item.get('is_backup', False)),
-                            float(item.get('mtime', 0.0)),
-                        ),
-                        reverse=True,
-                    )
-                    return Path(str(running_sorted[0]['path']))
-
                 return Path(str(best['path']))
 
             def _read_job_summary(job_id: str, filename: str) -> tuple[dict, Path | None]:
@@ -5575,6 +5430,10 @@ cells = [
 
             def _resolve_train_artifacts(job_id: str) -> tuple[str, str, str]:
                 train_summary, train_job_dir = _read_job_summary(job_id, 'training_summary.json')
+                if train_job_dir is None:
+                    raise FileNotFoundError(
+                        f'job_dir introuvable pour job_id={job_id} (strict mode, aucun fallback autorise)'
+                    )
                 dataset_id = str(train_summary.get('dataset_id', '')).strip()
                 model_id = str(train_summary.get('model_id', '')).strip()
                 checkpoint_path = str(train_summary.get('final_model_path', '')).strip()
@@ -5588,41 +5447,20 @@ cells = [
                     if (checkpoint is None or not checkpoint.exists()) and not checkpoint_path:
                         alt_checkpoint_path = str(run_status.get('checkpoint_path', '')).strip()
                         checkpoint = Path(alt_checkpoint_path) if alt_checkpoint_path else None
-                if (checkpoint is None or not checkpoint.exists()) and model_id:
-                    fallback = Path(DRIVE_ROOT) / 'models' / 'final' / f'{model_id}.pt'
-                    if fallback.exists():
-                        checkpoint = fallback
-                if not dataset_id:
-                    datasets_registry = _load_json_dict(
-                        Path(DRIVE_ROOT) / 'data' / 'datasets' / 'dataset_registry.json',
-                        default={},
-                    )
-                    built_entries = datasets_registry.get('built_datasets', []) if isinstance(datasets_registry, dict) else []
-                    best_entry = {}
-                    if isinstance(built_entries, list) and built_entries:
-                        def _samples(entry: dict) -> int:
-                            try:
-                                return int(entry.get('labeled_samples') or entry.get('sample_count') or 0)
-                            except Exception:
-                                return 0
-                        best_entry = max(
-                            [entry for entry in built_entries if isinstance(entry, dict)],
-                            key=_samples,
-                            default={},
-                        )
-                    dataset_id = str(best_entry.get('dataset_id', '')).strip()
                 if not dataset_id:
                     raise ValueError(
-                        f'dataset_id absent dans training_summary pour job_id={job_id} (job_dir={train_job_dir})'
+                        f'dataset_id absent dans training_summary/run_status pour job_id={job_id} '
+                        f'(job_dir={train_job_dir}) | strict mode'
                     )
                 if not model_id:
                     raise ValueError(
-                        f'model_id absent dans training_summary pour job_id={job_id} (job_dir={train_job_dir})'
+                        f'model_id absent dans training_summary/run_status pour job_id={job_id} '
+                        f'(job_dir={train_job_dir}) | strict mode'
                     )
                 if checkpoint is None or not checkpoint.exists():
                     raise FileNotFoundError(
                         f'checkpoint introuvable pour job_id={job_id} | model_id={model_id} | '
-                        f'checkpoint(train_summary)={checkpoint_path}'
+                        f'checkpoint(training_summary/run_status)={checkpoint_path} | strict mode'
                     )
                 return dataset_id, model_id, str(checkpoint)
 
@@ -5858,23 +5696,24 @@ cells = [
                 if pinned_job_dir is not None and pinned_job_dir.exists():
                     job_dir = pinned_job_dir
                 else:
-                    job_dir = _latest_job_dir_for_job_id(job_id, jobs_roots)
-                    if job_dir is not None:
-                        probe_status = _load_json_dict(job_dir / 'run_status.json', default={})
+                    job_dir = None
+                    candidate_job_dir = _latest_job_dir_for_job_id(job_id, jobs_roots)
+                    if candidate_job_dir is not None:
+                        probe_status = _load_json_dict(candidate_job_dir / 'run_status.json', default={})
                         probe_age = _status_age_seconds(probe_status.get('updated_at', ''))
                         elapsed_since_launch = max(0, int(_time.time() - launch_epoch))
-                        # Evite de locker sur un vieux run "running" au tout debut;
-                        # on attend un job frais quelques secondes.
-                        if probe_age is not None and (probe_age <= 120 or elapsed_since_launch >= 120):
-                            pinned_job_dir = job_dir
+                        if probe_age is not None and probe_age <= 120:
+                            pinned_job_dir = candidate_job_dir
+                            job_dir = candidate_job_dir
                             print(
-                                f'[TRAIN PROGRESS][{mode_label}] job_dir pinned={job_dir} '
+                                f'[TRAIN PROGRESS][{mode_label}] job_dir pinned={candidate_job_dir} '
                                 f'| candidate_age_s={probe_age} | elapsed_since_launch_s={elapsed_since_launch}'
                             )
-                        elif probe_age is not None and elapsed_since_launch < 120:
+                        else:
                             print(
                                 f'[TRAIN PROGRESS][{mode_label}] waiting fresh job_dir '
-                                f'| candidate={job_dir} | candidate_age_s={probe_age} | elapsed_since_launch_s={elapsed_since_launch}'
+                                f'| candidate={candidate_job_dir} | candidate_age_s={probe_age} | '
+                                f'elapsed_since_launch_s={elapsed_since_launch}'
                             )
                 run_status = {}
                 state = {}
@@ -5943,6 +5782,11 @@ cells = [
                 if return_code is not None:
                     if return_code != 0:
                         raise _subprocess.CalledProcessError(return_code, cmd)
+                    if pinned_job_dir is None:
+                        raise RuntimeError(
+                            f'Train termine mais aucun job_dir frais n a ete detecte pour job_id={job_id} '
+                            f'(strict mode).'
+                        )
                     print(f'[TRAIN PROGRESS][{mode_label}] termine avec succes.')
                     return resolved_job_id
                 _time.sleep(15.0)
@@ -5955,11 +5799,13 @@ cells = [
         )
         print(f'[TRAIN PROGRESS][scratch] resolved_job_id={resolved_train_job_id}')
 
-        def _resolve_artifacts_from_exact_job_dir(resolved_job_id: str, fallback_job_id: str) -> tuple[str, str, str]:
+        def _resolve_artifacts_from_exact_job_dir(resolved_job_id: str) -> tuple[str, str, str]:
             import json as _json
             from pathlib import Path as _Path
 
             requested = str(resolved_job_id or '').strip()
+            if not requested:
+                raise ValueError('resolved_job_id vide (strict mode, aucun fallback autorise)')
             roots = []
             for raw in [
                 str(JOBS_ROOT),
@@ -5983,34 +5829,46 @@ cells = [
                     return {}
                 return payload if isinstance(payload, dict) else {}
 
-            if requested:
-                exact_dirs = [root / requested for root in roots if (root / requested).exists() and (root / requested).is_dir()]
-                if exact_dirs:
-                    exact_dirs = sorted(
-                        exact_dirs,
-                        key=lambda p: (
-                            '/runtime_backup/jobs/' not in str(p).replace('\\\\', '/'),
-                            float(p.stat().st_mtime),
-                        ),
-                        reverse=True,
-                    )
-                    exact_dir = exact_dirs[0]
-                    train_summary = _load(exact_dir / 'training_summary.json')
-                    run_status = _load(exact_dir / 'run_status.json')
-                    dataset_id = str(train_summary.get('dataset_id') or run_status.get('dataset_id') or '').strip()
-                    model_id = str(train_summary.get('model_id') or run_status.get('model_id') or '').strip()
-                    checkpoint_path = str(train_summary.get('final_model_path') or run_status.get('checkpoint_path') or '').strip()
-                    if not checkpoint_path and model_id:
-                        fallback = _Path(DRIVE_ROOT) / 'models' / 'final' / f'{model_id}.pt'
-                        if fallback.exists():
-                            checkpoint_path = str(fallback)
-                    if dataset_id and model_id and checkpoint_path and _Path(checkpoint_path).exists():
-                        return dataset_id, model_id, checkpoint_path
-            return _resolve_train_artifacts(fallback_job_id)
+            exact_dirs = [root / requested for root in roots if (root / requested).exists() and (root / requested).is_dir()]
+            if not exact_dirs:
+                raise FileNotFoundError(
+                    f'job_dir exact introuvable pour resolved_job_id={requested} (strict mode)'
+                )
+            exact_dirs = sorted(
+                exact_dirs,
+                key=lambda p: (
+                    '/runtime_backup/jobs/' not in str(p).replace('\\\\', '/'),
+                    float(p.stat().st_mtime),
+                ),
+                reverse=True,
+            )
+            exact_dir = exact_dirs[0]
+            train_summary = _load(exact_dir / 'training_summary.json')
+            run_status = _load(exact_dir / 'run_status.json')
+            dataset_id = str(train_summary.get('dataset_id') or run_status.get('dataset_id') or '').strip()
+            model_id = str(train_summary.get('model_id') or run_status.get('model_id') or '').strip()
+            checkpoint_path = str(train_summary.get('final_model_path') or run_status.get('checkpoint_path') or '').strip()
+            if not dataset_id:
+                raise ValueError(
+                    f'dataset_id absent dans job_dir={exact_dir} (strict mode)'
+                )
+            if not model_id:
+                raise ValueError(
+                    f'model_id absent dans job_dir={exact_dir} (strict mode)'
+                )
+            if not checkpoint_path:
+                raise ValueError(
+                    f'checkpoint_path absent dans job_dir={exact_dir} (strict mode)'
+                )
+            checkpoint = _Path(checkpoint_path)
+            if not checkpoint.exists():
+                raise FileNotFoundError(
+                    f'checkpoint introuvable: {checkpoint} (job_dir={exact_dir}, strict mode)'
+                )
+            return dataset_id, model_id, str(checkpoint)
 
         train_dataset_id, train_model_id, train_checkpoint_path = _resolve_artifacts_from_exact_job_dir(
             resolved_train_job_id,
-            TRAIN_SCRATCH_JOB_ID,
         )
         print('Evaluation lock        = dataset_id', train_dataset_id, '| model_id', train_model_id)
         runtime_eval_cfg_path, selected_model_id = _prepare_eval_runtime_config(
@@ -6142,20 +6000,8 @@ cells = [
             if not model_id or model_id in seen_ids:
                 continue
             checkpoint = Path(str(item.get('checkpoint_path', '')).strip())
-            if not checkpoint.exists():
-                fallback = final_dir / f'{model_id}.pt'
-                checkpoint = fallback if fallback.exists() else checkpoint
             if checkpoint.exists():
                 models.append({'model_id': model_id, 'checkpoint_path': str(checkpoint)})
-                seen_ids.add(model_id)
-
-        # Fallback robuste: scan direct models/final/*.pt meme si registre vide/incomplet
-        if final_dir.exists():
-            for pt in sorted(final_dir.glob('*.pt'), key=lambda p: p.stat().st_mtime, reverse=True):
-                model_id = pt.stem.strip()
-                if not model_id or model_id in seen_ids:
-                    continue
-                models.append({'model_id': model_id, 'checkpoint_path': str(pt)})
                 seen_ids.add(model_id)
 
         if len(models) < TOURNAMENT_MIN_MODELS:

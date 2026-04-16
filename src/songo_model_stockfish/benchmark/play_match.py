@@ -23,6 +23,7 @@ class MatchResult:
     moves: int
     scores: tuple[int, int]
     think_ms: tuple[float, float]
+    choose_fallbacks: tuple[int, int]
     reason: str
     starter: int
 
@@ -30,6 +31,7 @@ class MatchResult:
         payload = asdict(self)
         payload["scores"] = list(self.scores)
         payload["think_ms"] = list(self.think_ms)
+        payload["choose_fallbacks"] = list(self.choose_fallbacks)
         return payload
 
 
@@ -50,11 +52,19 @@ def play_match(agent_a: AgentLike, agent_b: AgentLike, *, max_moves: int = 300, 
         t0 = time.perf_counter()
         try:
             move, _info = agents[player].choose(songo_ai_game.clone_state(state))
-        except Exception:
-            move = legal[0]
+        except Exception as exc:
+            raise RuntimeError(
+                "Agent choose failed | "
+                f"player={player} | starter={starter} | agent={agents[player].display_name} | "
+                f"legal={legal} | cause={type(exc).__name__}: {exc}"
+            ) from exc
         think[player] += (time.perf_counter() - t0) * 1000.0
         if move not in legal:
-            move = legal[0]
+            raise ValueError(
+                "Agent returned illegal move | "
+                f"player={player} | starter={starter} | agent={agents[player].display_name} | "
+                f"move={move} | legal={legal}"
+            )
         state = songo_ai_game.simulate_move(state, move)
         moves += 1
 
@@ -74,6 +84,7 @@ def play_match(agent_a: AgentLike, agent_b: AgentLike, *, max_moves: int = 300, 
         moves=moves,
         scores=songo_ai_game.scores(state),
         think_ms=(round(think[0], 2), round(think[1], 2)),
+        choose_fallbacks=(0, 0),
         reason="finished" if songo_ai_game.is_terminal(state) else (end_reason if end_reason != "finished" else f"max_moves_reached:{max_moves}"),
         starter=starter,
     )

@@ -88,7 +88,10 @@ class ModelAgent:
             move_index = int(policy_probs.argmax().item())
             move = move_index + 1
             if move not in legal_moves:
-                move = legal_moves[0]
+                raise RuntimeError(
+                    "ModelAgent produced an illegal argmax move in strict mode | "
+                    f"move={move} | legal_moves={legal_moves} | checkpoint={self._checkpoint_path}"
+                )
             return move, {"value": root_value, "search_enabled": False}
 
         policy_by_move = {move: float(policy_probs[move - 1].item()) for move in legal_moves}

@@ -4623,14 +4623,18 @@ def _play_and_sample_game(
         current = songo_ai_game.current_player(state)
         try:
             move, _info = agents[current].choose(songo_ai_game.clone_state(state))
-        except Exception:
-            if legal:
-                move = legal[0]
-            else:
-                end_reason = "agent_failed_no_legal_moves"
-                break
+        except Exception as exc:
+            raise RuntimeError(
+                "Benchmatch agent choose failed in strict mode | "
+                f"matchup_id={matchup_id} | game_id={game_id} | ply={ply} | "
+                f"player={current} | legal={legal} | cause={type(exc).__name__}: {exc}"
+            ) from exc
         if move not in legal:
-            move = legal[0]
+            raise ValueError(
+                "Benchmatch agent returned illegal move in strict mode | "
+                f"matchup_id={matchup_id} | game_id={game_id} | ply={ply} | "
+                f"player={current} | move={move} | legal={legal}"
+            )
         moves.append(int(move))
         state = songo_ai_game.simulate_move(state, int(move))
         ply += 1
