@@ -4502,7 +4502,21 @@ cells = [
                 return parts[0]
             return text
 
-        def _latest_job_dir_for_job_id(job_id: str) -> Path | None:
+        def _infer_expected_run_type(job_id: str) -> str | None:
+            text = str(job_id or '').strip().lower()
+            if text.startswith('train_'):
+                return 'train'
+            if text.startswith('eval_') or text.startswith('evaluation_'):
+                return 'evaluation'
+            if text.startswith('benchmark_'):
+                return 'benchmark'
+            if text.startswith('build_dataset_'):
+                return 'dataset_build'
+            if text.startswith('dataset_'):
+                return 'dataset_generation'
+            return None
+
+        def _latest_job_dir_for_job_id(job_id: str, *, expected_run_type: str | None = None) -> Path | None:
             requested = str(job_id).strip()
             if not requested:
                 return None
@@ -4525,6 +4539,43 @@ cells = [
                 text = str(path).replace('\\\\', '/')
                 return '/runtime_backup/jobs/' in text or text.endswith('/runtime_backup/jobs')
 
+            def _run_type_matches(status_payload: dict) -> bool:
+                if not expected_run_type:
+                    return True
+                run_type = str(status_payload.get('run_type', '')).strip().lower()
+                if not run_type:
+                    return True
+                return run_type == str(expected_run_type).strip().lower()
+
+            exact_candidates = []
+            for root in roots:
+                exact_path = root / requested
+                if not exact_path.exists() or not exact_path.is_dir():
+                    continue
+                status_payload = _load_json_dict(exact_path / 'run_status.json', default={})
+                if not _run_type_matches(status_payload):
+                    continue
+                status = str(status_payload.get('status', '')).strip().lower()
+                exact_candidates.append(
+                    {
+                        'path': exact_path,
+                        'is_running': status in {'running', 'pending'},
+                        'is_backup': _is_backup_path(exact_path),
+                        'mtime': float(exact_path.stat().st_mtime),
+                    }
+                )
+            if exact_candidates:
+                exact_sorted = sorted(
+                    exact_candidates,
+                    key=lambda item: (
+                        bool(item.get('is_running', False)),
+                        not bool(item.get('is_backup', False)),
+                        float(item.get('mtime', 0.0)),
+                    ),
+                    reverse=True,
+                )
+                return Path(str(exact_sorted[0]['path']))
+
             candidates = []
             for root in roots:
                 if not root.exists():
@@ -4535,6 +4586,8 @@ cells = [
                     name = path.name
                     if name == requested or name == prefix or (prefix and name.startswith(prefix + '_')):
                         status_payload = _load_json_dict(path / 'run_status.json', default={})
+                        if not _run_type_matches(status_payload):
+                            continue
                         status = str(status_payload.get('status', '')).strip().lower()
                         candidates.append(
                             {
@@ -4572,7 +4625,10 @@ cells = [
                     if status not in {'running', 'pending'}:
                         continue
                     run_type = str(status_payload.get('run_type', '')).strip().lower()
-                    if run_type and run_type != 'train':
+                    if expected_run_type:
+                        if run_type and run_type != str(expected_run_type).strip().lower():
+                            continue
+                    elif run_type and run_type != 'train':
                         continue
                     config_hit = False
                     try:
@@ -4603,7 +4659,7 @@ cells = [
             return Path(str(best['path']))
 
         def _read_job_summary(job_id: str, filename: str) -> tuple[dict, Path | None]:
-            job_dir = _latest_job_dir_for_job_id(job_id)
+            job_dir = _latest_job_dir_for_job_id(job_id, expected_run_type=_infer_expected_run_type(job_id))
             if job_dir is None:
                 return {}, None
             payload = _load_json_dict(job_dir / filename, default={})
@@ -4710,9 +4766,21 @@ cells = [
                 return 'faible (a renforcer)'
             return 'inconnu (donnees insuffisantes)'
 
-        def _print_post_train_eval_report(*, mode: str, train_job_id: str, eval_job_id: str, model_id: str) -> None:
+        def _print_post_train_eval_report(
+            *,
+            mode: str,
+            train_job_id: str,
+            eval_job_id: str,
+            model_id: str,
+            resolved_train_job_id: str | None = None,
+            resolved_eval_job_id: str | None = None,
+        ) -> None:
             train_summary, train_job_dir = _read_job_summary(train_job_id, 'training_summary.json')
             eval_summary, eval_job_dir = _read_job_summary(eval_job_id, 'evaluation_summary.json')
+            if (not train_summary) and resolved_train_job_id:
+                train_summary, train_job_dir = _read_job_summary(str(resolved_train_job_id), 'training_summary.json')
+            if (not eval_summary) and resolved_eval_job_id:
+                eval_summary, eval_job_dir = _read_job_summary(str(resolved_eval_job_id), 'evaluation_summary.json')
             registry_row = _load_model_registry_record(model_id)
             promoted = _load_promoted_best_metadata()
             benchmark_row = _load_latest_benchmark_for_model(model_id)
@@ -5277,8 +5345,62 @@ cells = [
         )
         print(f'[TRAIN PROGRESS][continue] resolved_job_id={resolved_train_job_id}')
 
-        train_dataset_id, train_model_id, train_checkpoint_path = _resolve_train_artifacts(
-            resolved_train_job_id or TRAIN_CONTINUE_JOB_ID
+        def _resolve_artifacts_from_exact_job_dir(resolved_job_id: str, fallback_job_id: str) -> tuple[str, str, str]:
+            import json as _json
+            from pathlib import Path as _Path
+
+            requested = str(resolved_job_id or '').strip()
+            roots = []
+            for raw in [
+                str(JOBS_ROOT),
+                str(globals().get('RUNTIME_HYBRID_BACKUP_JOBS_ROOT', '')).strip(),
+                '/content/songo-stockfish-runtime/jobs',
+                '/content/drive/MyDrive/songo-stockfish/jobs',
+            ]:
+                text = str(raw or '').strip()
+                if not text:
+                    continue
+                path_root = _Path(text)
+                if path_root not in roots:
+                    roots.append(path_root)
+
+            def _load(path: _Path) -> dict:
+                if not path.exists():
+                    return {}
+                try:
+                    payload = _json.loads(path.read_text(encoding='utf-8'))
+                except Exception:
+                    return {}
+                return payload if isinstance(payload, dict) else {}
+
+            if requested:
+                exact_dirs = [root / requested for root in roots if (root / requested).exists() and (root / requested).is_dir()]
+                if exact_dirs:
+                    exact_dirs = sorted(
+                        exact_dirs,
+                        key=lambda p: (
+                            '/runtime_backup/jobs/' not in str(p).replace('\\\\', '/'),
+                            float(p.stat().st_mtime),
+                        ),
+                        reverse=True,
+                    )
+                    exact_dir = exact_dirs[0]
+                    train_summary = _load(exact_dir / 'training_summary.json')
+                    run_status = _load(exact_dir / 'run_status.json')
+                    dataset_id = str(train_summary.get('dataset_id') or run_status.get('dataset_id') or '').strip()
+                    model_id = str(train_summary.get('model_id') or run_status.get('model_id') or '').strip()
+                    checkpoint_path = str(train_summary.get('final_model_path') or run_status.get('checkpoint_path') or '').strip()
+                    if not checkpoint_path and model_id:
+                        fallback = _Path(DRIVE_ROOT) / 'models' / 'final' / f'{model_id}.pt'
+                        if fallback.exists():
+                            checkpoint_path = str(fallback)
+                    if dataset_id and model_id and checkpoint_path and _Path(checkpoint_path).exists():
+                        return dataset_id, model_id, checkpoint_path
+            return _resolve_train_artifacts(fallback_job_id)
+
+        train_dataset_id, train_model_id, train_checkpoint_path = _resolve_artifacts_from_exact_job_dir(
+            resolved_train_job_id,
+            TRAIN_CONTINUE_JOB_ID,
         )
         print('Evaluation lock        = dataset_id', train_dataset_id, '| model_id', train_model_id)
         runtime_eval_cfg_path, selected_model_id = _prepare_eval_runtime_config(
@@ -5296,12 +5418,22 @@ cells = [
         )
         subprocess.run(['/bin/bash', '-lc', eval_cmd], check=True)
         print('Train + Eval termines | mode=continue | model_id=', selected_model_id, '| eval_job_id=', eval_job_id)
-        _print_post_train_eval_report(
-            mode='continue',
-            train_job_id=TRAIN_CONTINUE_JOB_ID,
-            eval_job_id=eval_job_id,
-            model_id=selected_model_id,
-        )
+        try:
+            _print_post_train_eval_report(
+                mode='continue',
+                train_job_id=resolved_train_job_id or TRAIN_CONTINUE_JOB_ID,
+                eval_job_id=eval_job_id,
+                model_id=selected_model_id,
+                resolved_train_job_id=resolved_train_job_id,
+                resolved_eval_job_id=eval_job_id,
+            )
+        except TypeError:
+            _print_post_train_eval_report(
+                mode='continue',
+                train_job_id=resolved_train_job_id or TRAIN_CONTINUE_JOB_ID,
+                eval_job_id=eval_job_id,
+                model_id=selected_model_id,
+            )
         """
     ),
     code(
@@ -5823,8 +5955,62 @@ cells = [
         )
         print(f'[TRAIN PROGRESS][scratch] resolved_job_id={resolved_train_job_id}')
 
-        train_dataset_id, train_model_id, train_checkpoint_path = _resolve_train_artifacts(
-            resolved_train_job_id or TRAIN_SCRATCH_JOB_ID
+        def _resolve_artifacts_from_exact_job_dir(resolved_job_id: str, fallback_job_id: str) -> tuple[str, str, str]:
+            import json as _json
+            from pathlib import Path as _Path
+
+            requested = str(resolved_job_id or '').strip()
+            roots = []
+            for raw in [
+                str(JOBS_ROOT),
+                str(globals().get('RUNTIME_HYBRID_BACKUP_JOBS_ROOT', '')).strip(),
+                '/content/songo-stockfish-runtime/jobs',
+                '/content/drive/MyDrive/songo-stockfish/jobs',
+            ]:
+                text = str(raw or '').strip()
+                if not text:
+                    continue
+                path_root = _Path(text)
+                if path_root not in roots:
+                    roots.append(path_root)
+
+            def _load(path: _Path) -> dict:
+                if not path.exists():
+                    return {}
+                try:
+                    payload = _json.loads(path.read_text(encoding='utf-8'))
+                except Exception:
+                    return {}
+                return payload if isinstance(payload, dict) else {}
+
+            if requested:
+                exact_dirs = [root / requested for root in roots if (root / requested).exists() and (root / requested).is_dir()]
+                if exact_dirs:
+                    exact_dirs = sorted(
+                        exact_dirs,
+                        key=lambda p: (
+                            '/runtime_backup/jobs/' not in str(p).replace('\\\\', '/'),
+                            float(p.stat().st_mtime),
+                        ),
+                        reverse=True,
+                    )
+                    exact_dir = exact_dirs[0]
+                    train_summary = _load(exact_dir / 'training_summary.json')
+                    run_status = _load(exact_dir / 'run_status.json')
+                    dataset_id = str(train_summary.get('dataset_id') or run_status.get('dataset_id') or '').strip()
+                    model_id = str(train_summary.get('model_id') or run_status.get('model_id') or '').strip()
+                    checkpoint_path = str(train_summary.get('final_model_path') or run_status.get('checkpoint_path') or '').strip()
+                    if not checkpoint_path and model_id:
+                        fallback = _Path(DRIVE_ROOT) / 'models' / 'final' / f'{model_id}.pt'
+                        if fallback.exists():
+                            checkpoint_path = str(fallback)
+                    if dataset_id and model_id and checkpoint_path and _Path(checkpoint_path).exists():
+                        return dataset_id, model_id, checkpoint_path
+            return _resolve_train_artifacts(fallback_job_id)
+
+        train_dataset_id, train_model_id, train_checkpoint_path = _resolve_artifacts_from_exact_job_dir(
+            resolved_train_job_id,
+            TRAIN_SCRATCH_JOB_ID,
         )
         print('Evaluation lock        = dataset_id', train_dataset_id, '| model_id', train_model_id)
         runtime_eval_cfg_path, selected_model_id = _prepare_eval_runtime_config(
@@ -5842,12 +6028,22 @@ cells = [
         )
         subprocess.run(['/bin/bash', '-lc', eval_cmd], check=True)
         print('Train + Eval termines | mode=scratch | model_id=', selected_model_id, '| eval_job_id=', eval_job_id)
-        _print_post_train_eval_report(
-            mode='scratch',
-            train_job_id=TRAIN_SCRATCH_JOB_ID,
-            eval_job_id=eval_job_id,
-            model_id=selected_model_id,
-        )
+        try:
+            _print_post_train_eval_report(
+                mode='scratch',
+                train_job_id=resolved_train_job_id or TRAIN_SCRATCH_JOB_ID,
+                eval_job_id=eval_job_id,
+                model_id=selected_model_id,
+                resolved_train_job_id=resolved_train_job_id,
+                resolved_eval_job_id=eval_job_id,
+            )
+        except TypeError:
+            _print_post_train_eval_report(
+                mode='scratch',
+                train_job_id=resolved_train_job_id or TRAIN_SCRATCH_JOB_ID,
+                eval_job_id=eval_job_id,
+                model_id=selected_model_id,
+            )
         """
     ),
     md("## 8. Benchmark"),
