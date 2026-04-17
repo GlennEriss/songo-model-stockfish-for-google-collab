@@ -4010,7 +4010,7 @@ cells = [
 
             if not isinstance(global_entry, dict):
                 print('\\n' + '-' * 120)
-                print(f'[{datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")}Z] loop={loop_idx}')
+                print(f'[{datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")}Z] loop={loop_idx}')
                 print('GLOBAL DATASET | introuvable dans dataset_registry')
                 print('Conseil: attendre une fusion merged_final ou verifier dataset_id.')
                 if GLOBAL_TRACK_MAX_LOOPS > 0 and loop_idx >= GLOBAL_TRACK_MAX_LOOPS:
@@ -4046,7 +4046,7 @@ cells = [
             dataset_age = max(0.0, now_epoch - created_epoch) if created_epoch > 0 else 0.0
 
             print('\\n' + '-' * 120)
-            print(f'[{datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")}Z] loop={loop_idx}')
+            print(f'[{datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")}Z] loop={loop_idx}')
             print(
                 'GLOBAL DATASET',
                 f'| id={GLOBAL_DATASET_TRACK_ID}',
