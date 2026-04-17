@@ -127,6 +127,45 @@ def _remove_tree(path: Path, *, apply: bool) -> bool:
         return False
 
 
+def _path_age_seconds(path: Path, *, now_epoch: float | None = None) -> float:
+    now_ts = float(now_epoch) if now_epoch is not None else time.time()
+    try:
+        modified_ts = float(path.stat().st_mtime)
+    except Exception:
+        return 0.0
+    return max(0.0, now_ts - modified_ts)
+
+
+def _job_dir_age_seconds(job_dir: Path, *, now_epoch: float | None = None) -> float:
+    status_payload = _load_json_dict(job_dir / "run_status.json", default={})
+    updated_epoch = _parse_iso_to_epoch(status_payload.get("updated_at"))
+    if updated_epoch > 0.0:
+        now_ts = float(now_epoch) if now_epoch is not None else time.time()
+        return max(0.0, now_ts - updated_epoch)
+    return _path_age_seconds(job_dir, now_epoch=now_epoch)
+
+
+def _resolve_retention_cfg(config: dict[str, Any]) -> dict[str, Any]:
+    cleanup_cfg = config.get("storage_cleanup", {})
+    if not isinstance(cleanup_cfg, dict):
+        return {}
+    retention_cfg = cleanup_cfg.get("retention", {})
+    if not isinstance(retention_cfg, dict):
+        return {}
+    return dict(retention_cfg)
+
+
+def _infer_checkpoint_model_id(stem: str) -> str:
+    text = str(stem or "").strip()
+    if not text:
+        return ""
+    if "_epoch_" in text:
+        return text.split("_epoch_", 1)[0].strip()
+    if text.endswith("_best") or text.endswith("_last"):
+        return text.rsplit("_", 1)[0].strip()
+    return text
+
+
 def _sort_model_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ranked = sorted(
         records,
@@ -236,12 +275,19 @@ def run_storage_cleanup(
     cleanup_drive_raw_dirs: bool,
     cleanup_drive_label_cache: bool,
     cleanup_models: bool,
+    cleanup_retention: bool = False,
     keep_model_ids: list[str] | None = None,
     keep_top_models: int = 1,
     keep_dataset_ids: list[str] | None = None,
     allow_purge_without_manifest: bool = False,
     drive_raw_cleanup_include_inactive_partial: bool = False,
     drive_raw_cleanup_inactive_min_age_seconds: float = 0.0,
+    retention_job_stream_ttl_seconds: float = 72.0 * 3600.0,
+    retention_quarantine_ttl_seconds: float = 72.0 * 3600.0,
+    retention_benchmark_report_ttl_seconds: float = 30.0 * 86400.0,
+    retention_benchmark_keep_recent: int = 40,
+    retention_checkpoint_ttl_seconds: float = 21.0 * 86400.0,
+    retention_checkpoint_keep_recent_per_model: int = 2,
 ) -> dict[str, Any]:
     keep_model_ids = list(keep_model_ids or [])
     keep_dataset_ids = [str(item).strip() for item in (keep_dataset_ids or []) if str(item).strip()]
@@ -252,6 +298,7 @@ def run_storage_cleanup(
         "cleanup_drive_raw_dirs": bool(cleanup_drive_raw_dirs),
         "cleanup_drive_label_cache": bool(cleanup_drive_label_cache),
         "cleanup_models": bool(cleanup_models),
+        "cleanup_retention": bool(cleanup_retention),
         "drive_raw_cleanup_include_inactive_partial": bool(drive_raw_cleanup_include_inactive_partial),
         "drive_raw_cleanup_inactive_min_age_seconds": float(max(0.0, drive_raw_cleanup_inactive_min_age_seconds)),
         "steps": {},
@@ -262,6 +309,47 @@ def run_storage_cleanup(
     logs_root = paths.logs_root
     data_root = paths.data_root
     models_root = paths.models_root
+    retention_cfg = _resolve_retention_cfg(config)
+    now_epoch = time.time()
+    job_stream_ttl_seconds = max(
+        0.0,
+        _as_float(
+            retention_cfg.get("job_stream_ttl_seconds", retention_job_stream_ttl_seconds),
+            retention_job_stream_ttl_seconds,
+        ),
+    )
+    quarantine_ttl_seconds = max(
+        0.0,
+        _as_float(
+            retention_cfg.get("quarantine_ttl_seconds", retention_quarantine_ttl_seconds),
+            retention_quarantine_ttl_seconds,
+        ),
+    )
+    benchmark_report_ttl_seconds = max(
+        0.0,
+        _as_float(
+            retention_cfg.get("benchmark_report_ttl_seconds", retention_benchmark_report_ttl_seconds),
+            retention_benchmark_report_ttl_seconds,
+        ),
+    )
+    benchmark_keep_recent = max(
+        0,
+        _as_int(retention_cfg.get("benchmark_keep_recent", retention_benchmark_keep_recent), retention_benchmark_keep_recent),
+    )
+    checkpoint_ttl_seconds = max(
+        0.0,
+        _as_float(
+            retention_cfg.get("checkpoint_ttl_seconds", retention_checkpoint_ttl_seconds),
+            retention_checkpoint_ttl_seconds,
+        ),
+    )
+    checkpoint_keep_recent_per_model = max(
+        0,
+        _as_int(
+            retention_cfg.get("checkpoint_keep_recent_per_model", retention_checkpoint_keep_recent_per_model),
+            retention_checkpoint_keep_recent_per_model,
+        ),
+    )
 
     if cleanup_runtime_migration:
         drive_jobs_root = drive_root / "jobs"
@@ -299,6 +387,8 @@ def run_storage_cleanup(
             "backup_root": str(backup_root),
             "jobs_scanned": 0,
             "jobs_skipped_active": 0,
+            "jobs_skipped_recent": 0,
+            "job_stream_ttl_seconds": float(job_stream_ttl_seconds),
             "events_removed": 0,
             "metrics_removed": 0,
             "errors": [],
@@ -309,6 +399,10 @@ def run_storage_cleanup(
                 active, _ = is_job_active(job_dir, active_updated_max_age_seconds=600.0)
                 if active:
                     step["jobs_skipped_active"] = int(step["jobs_skipped_active"]) + 1
+                    continue
+                age_seconds = _job_dir_age_seconds(job_dir, now_epoch=now_epoch)
+                if age_seconds < float(job_stream_ttl_seconds):
+                    step["jobs_skipped_recent"] = int(step["jobs_skipped_recent"]) + 1
                     continue
                 events_path = job_dir / "events.jsonl"
                 metrics_path = job_dir / "metrics.jsonl"
@@ -488,6 +582,98 @@ def run_storage_cleanup(
             )
         step["registry_sync"] = _resync_model_registry(paths, apply=apply)
         report["steps"]["model_cleanup"] = step
+
+    if cleanup_retention:
+        retention_step: dict[str, Any] = {
+            "job_stream_ttl_seconds": float(job_stream_ttl_seconds),
+            "quarantine_ttl_seconds": float(quarantine_ttl_seconds),
+            "benchmark_report_ttl_seconds": float(benchmark_report_ttl_seconds),
+            "benchmark_keep_recent": int(benchmark_keep_recent),
+            "checkpoint_ttl_seconds": float(checkpoint_ttl_seconds),
+            "checkpoint_keep_recent_per_model": int(checkpoint_keep_recent_per_model),
+            "quarantine_removed": [],
+            "benchmark_reports_removed": [],
+            "old_checkpoints_removed": [],
+            "errors": [],
+        }
+
+        # 1) Quarantine dirs older than TTL.
+        quarantine_roots = [
+            drive_root / "jobs",
+            drive_root / "logs",
+            drive_root / "runtime_backup",
+            drive_root / "runtime_migration",
+        ]
+        for root in quarantine_roots:
+            if not root.exists():
+                continue
+            try:
+                for path in root.rglob(".quarantine_*"):
+                    if not path.exists() or not path.is_dir():
+                        continue
+                    if not _path_within(path, drive_root):
+                        continue
+                    age_seconds = _path_age_seconds(path, now_epoch=now_epoch)
+                    if age_seconds < float(quarantine_ttl_seconds):
+                        continue
+                    if _remove_tree(path, apply=apply):
+                        retention_step["quarantine_removed"].append(str(path))
+            except Exception as exc:
+                retention_step["errors"].append(f"quarantine_scan_failed:{type(exc).__name__}:{exc}")
+
+        # 2) Benchmark reports rotation with TTL + keep recent.
+        benchmark_root = paths.reports_root / "benchmarks"
+        benchmark_candidates: list[Path] = []
+        if benchmark_root.exists() and _path_within(benchmark_root, drive_root):
+            for path in benchmark_root.rglob("*"):
+                if not path.is_file():
+                    continue
+                if path.name == "benchmark_history.jsonl":
+                    continue
+                if path.suffix.lower() not in {".json", ".jsonl"}:
+                    continue
+                benchmark_candidates.append(path)
+            benchmark_candidates_sorted = sorted(
+                benchmark_candidates,
+                key=lambda item: float(item.stat().st_mtime),
+                reverse=True,
+            )
+            for idx, path in enumerate(benchmark_candidates_sorted):
+                if idx < int(benchmark_keep_recent):
+                    continue
+                age_seconds = _path_age_seconds(path, now_epoch=now_epoch)
+                if age_seconds < float(benchmark_report_ttl_seconds):
+                    continue
+                if _remove_file(path, apply=apply):
+                    retention_step["benchmark_reports_removed"].append(str(path))
+
+        # 3) Old per-epoch checkpoints cleanup (keep best/last + recent per model).
+        checkpoints_dir = models_root / "checkpoints"
+        per_model_candidates: dict[str, list[Path]] = {}
+        if checkpoints_dir.exists() and _path_within(checkpoints_dir, drive_root):
+            for path in checkpoints_dir.glob("*.pt"):
+                if not path.is_file():
+                    continue
+                stem = str(path.stem or "").strip()
+                if not stem or stem.endswith("_best") or stem.endswith("_last"):
+                    continue
+                model_id = _infer_checkpoint_model_id(stem)
+                if not _is_safe_model_id(model_id):
+                    continue
+                per_model_candidates.setdefault(model_id, []).append(path)
+            for model_id, paths_for_model in per_model_candidates.items():
+                sorted_paths = sorted(paths_for_model, key=lambda item: float(item.stat().st_mtime), reverse=True)
+                for idx, path in enumerate(sorted_paths):
+                    if idx < int(checkpoint_keep_recent_per_model):
+                        continue
+                    age_seconds = _path_age_seconds(path, now_epoch=now_epoch)
+                    if age_seconds < float(checkpoint_ttl_seconds):
+                        continue
+                    if not _path_within(path, models_root):
+                        continue
+                    if _remove_file(path, apply=apply):
+                        retention_step["old_checkpoints_removed"].append(str(path))
+        report["steps"]["retention_cleanup"] = retention_step
 
     report["created_at_epoch"] = time.time()
     return report

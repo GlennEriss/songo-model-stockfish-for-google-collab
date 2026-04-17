@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import time
 from pathlib import Path
 
 from songo_model_stockfish.ops.paths import build_project_paths
@@ -124,3 +126,84 @@ def test_drive_raw_cleanup_keeps_partial_sources_by_default(tmp_path: Path) -> N
     assert str(completed_raw) in removed
     assert str(partial_raw) not in removed
     assert any(item.get("raw_dir") == str(partial_raw) and item.get("reason") == "status_not_completed" for item in skipped_reasons)
+
+
+def test_runtime_backup_stream_cleanup_respects_ttl(tmp_path: Path) -> None:
+    drive_root = tmp_path / "drive"
+    drive_root.mkdir(parents=True, exist_ok=True)
+    cfg = _make_config(drive_root)
+    paths = build_project_paths(cfg)
+    backup_root = paths.jobs_backup_root or (paths.drive_root / "runtime_backup" / "jobs")
+    backup_root.mkdir(parents=True, exist_ok=True)
+
+    old_job = backup_root / "job_old"
+    old_job.mkdir(parents=True, exist_ok=True)
+    _write_json(old_job / "run_status.json", {"status": "completed", "updated_at": "2026-01-01T00:00:00Z"})
+    (old_job / "events.jsonl").write_text("x", encoding="utf-8")
+    (old_job / "metrics.jsonl").write_text("x", encoding="utf-8")
+
+    recent_job = backup_root / "job_recent"
+    recent_job.mkdir(parents=True, exist_ok=True)
+    recent_updated_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time()))
+    _write_json(recent_job / "run_status.json", {"status": "completed", "updated_at": recent_updated_at})
+    (recent_job / "events.jsonl").write_text("x", encoding="utf-8")
+    (recent_job / "metrics.jsonl").write_text("x", encoding="utf-8")
+
+    report = run_storage_cleanup(
+        config=cfg,
+        paths=paths,
+        apply=False,
+        cleanup_runtime_migration=False,
+        cleanup_runtime_backup_streams=True,
+        cleanup_drive_raw_dirs=False,
+        cleanup_drive_label_cache=False,
+        cleanup_models=False,
+        cleanup_retention=False,
+        keep_model_ids=[],
+        keep_top_models=0,
+        keep_dataset_ids=[],
+        retention_job_stream_ttl_seconds=24.0 * 3600.0,
+    )
+
+    stream_step = report["steps"]["runtime_backup_stream_cleanup"]
+    assert int(stream_step.get("events_removed", 0)) == 1
+    assert int(stream_step.get("metrics_removed", 0)) == 1
+    assert int(stream_step.get("jobs_skipped_recent", 0)) == 1
+
+
+def test_retention_cleanup_removes_old_quarantine_dirs(tmp_path: Path) -> None:
+    drive_root = tmp_path / "drive"
+    drive_root.mkdir(parents=True, exist_ok=True)
+    cfg = _make_config(drive_root)
+    paths = build_project_paths(cfg)
+
+    quarantine_dir = paths.drive_root / "jobs" / ".quarantine_train_123"
+    quarantine_dir.mkdir(parents=True, exist_ok=True)
+    marker = quarantine_dir / "marker.txt"
+    marker.write_text("x", encoding="utf-8")
+
+    old_epoch = time.time() - 7.0 * 86400.0
+    quarantine_dir.chmod(0o755)
+    marker.chmod(0o644)
+    os.utime(quarantine_dir, (old_epoch, old_epoch))
+    os.utime(marker, (old_epoch, old_epoch))
+
+    report = run_storage_cleanup(
+        config=cfg,
+        paths=paths,
+        apply=False,
+        cleanup_runtime_migration=False,
+        cleanup_runtime_backup_streams=False,
+        cleanup_drive_raw_dirs=False,
+        cleanup_drive_label_cache=False,
+        cleanup_models=False,
+        cleanup_retention=True,
+        keep_model_ids=[],
+        keep_top_models=0,
+        keep_dataset_ids=[],
+        retention_quarantine_ttl_seconds=72.0 * 3600.0,
+    )
+
+    retention_step = report["steps"]["retention_cleanup"]
+    removed = set(str(item) for item in retention_step.get("quarantine_removed", []))
+    assert str(quarantine_dir) in removed

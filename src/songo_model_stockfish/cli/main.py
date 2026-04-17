@@ -301,6 +301,13 @@ def build_parser() -> argparse.ArgumentParser:
     storage_cleanup.add_argument("--purge-drive-raw-inactive-min-age-hours", type=float, default=24.0)
     storage_cleanup.add_argument("--purge-drive-label-cache", action="store_true")
     storage_cleanup.add_argument("--purge-models", action="store_true")
+    storage_cleanup.add_argument("--retention", action="store_true")
+    storage_cleanup.add_argument("--retention-job-stream-ttl-hours", type=float, default=72.0)
+    storage_cleanup.add_argument("--retention-quarantine-ttl-hours", type=float, default=72.0)
+    storage_cleanup.add_argument("--retention-benchmark-report-ttl-days", type=float, default=30.0)
+    storage_cleanup.add_argument("--retention-benchmark-keep-recent", type=int, default=40)
+    storage_cleanup.add_argument("--retention-checkpoint-ttl-days", type=float, default=21.0)
+    storage_cleanup.add_argument("--retention-checkpoint-keep-recent-per-model", type=int, default=2)
     storage_cleanup.add_argument("--keep-model-id", action="append", default=[])
     storage_cleanup.add_argument("--keep-model-ids")
     storage_cleanup.add_argument("--keep-top-models", type=int, default=1)
@@ -381,12 +388,19 @@ def main(argv: list[str] | None = None) -> int:
             cleanup_drive_raw_dirs=bool(cleanup_all or args.purge_drive_raw),
             cleanup_drive_label_cache=bool(cleanup_all or args.purge_drive_label_cache),
             cleanup_models=bool(cleanup_all or args.purge_models),
+            cleanup_retention=bool(cleanup_all or args.retention),
             keep_model_ids=keep_model_ids,
             keep_top_models=int(args.keep_top_models),
             keep_dataset_ids=list(args.keep_dataset_id or []),
             allow_purge_without_manifest=bool(args.allow_purge_without_manifest),
             drive_raw_cleanup_include_inactive_partial=bool(args.purge_drive_raw_include_inactive_partial),
             drive_raw_cleanup_inactive_min_age_seconds=max(0.0, float(args.purge_drive_raw_inactive_min_age_hours) * 3600.0),
+            retention_job_stream_ttl_seconds=max(0.0, float(args.retention_job_stream_ttl_hours) * 3600.0),
+            retention_quarantine_ttl_seconds=max(0.0, float(args.retention_quarantine_ttl_hours) * 3600.0),
+            retention_benchmark_report_ttl_seconds=max(0.0, float(args.retention_benchmark_report_ttl_days) * 86400.0),
+            retention_benchmark_keep_recent=max(0, int(args.retention_benchmark_keep_recent)),
+            retention_checkpoint_ttl_seconds=max(0.0, float(args.retention_checkpoint_ttl_days) * 86400.0),
+            retention_checkpoint_keep_recent_per_model=max(0, int(args.retention_checkpoint_keep_recent_per_model)),
         )
         print(json.dumps(result, indent=2, ensure_ascii=True))
         return 0

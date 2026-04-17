@@ -56,6 +56,9 @@ def test_storage_cleanup_cli_smoke_all_flags(monkeypatch, capsys, tmp_path: Path
             "--purge-drive-raw-include-inactive-partial",
             "--purge-drive-raw-inactive-min-age-hours",
             "48",
+            "--retention",
+            "--retention-job-stream-ttl-hours",
+            "96",
         ]
     )
 
@@ -63,8 +66,10 @@ def test_storage_cleanup_cli_smoke_all_flags(monkeypatch, capsys, tmp_path: Path
     assert bool(captured_kwargs.get("apply")) is True
     assert bool(captured_kwargs.get("cleanup_runtime_migration")) is True
     assert bool(captured_kwargs.get("cleanup_models")) is True
+    assert bool(captured_kwargs.get("cleanup_retention")) is True
     assert bool(captured_kwargs.get("drive_raw_cleanup_include_inactive_partial")) is True
     assert float(captured_kwargs.get("drive_raw_cleanup_inactive_min_age_seconds", 0.0)) == 48.0 * 3600.0
+    assert float(captured_kwargs.get("retention_job_stream_ttl_seconds", 0.0)) == 96.0 * 3600.0
     assert list(captured_kwargs.get("keep_model_ids", [])) == ["model_a", "model_b", "model_c", "model_d"]
 
     payload = json.loads(capsys.readouterr().out)
