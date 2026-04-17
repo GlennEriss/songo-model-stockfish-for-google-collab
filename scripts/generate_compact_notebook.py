@@ -264,6 +264,8 @@ cells = [
         GLOBAL_PROGRESS_WORKERS_MAX_ENTRIES = 5000
         WORKER_CHECKPOINTS_MIN_INTERVAL_SECONDS = 60.0
         WORKER_CHECKPOINTS_STATE_ONLY_ON_CHANGE = True
+        WORKER_CHECKPOINTS_RETRY_ATTEMPTS_NON_STRICT = 3
+        WORKER_CHECKPOINTS_RETRY_BACKOFF_SECONDS = 1.0
         SOURCE_POLL_INTERVAL_SECONDS = 20
         DATASET_BUILD_EXPORT_PARTIAL_EVERY_N_FILES = 20
         PROGRESSIVE_GLOBAL_MERGE_ENABLED = True
@@ -290,6 +292,10 @@ cells = [
         RUNTIME_HYBRID_BACKUP_JOBS_ROOT = f'{DRIVE_ROOT}/runtime_backup/jobs'
         RUNTIME_HYBRID_BACKUP_MIN_INTERVAL_SECONDS = 30.0
         RUNTIME_HYBRID_BACKUP_FORCE_INTERVAL_SECONDS = 180.0
+        RUNTIME_HYBRID_BACKUP_MODE = 'minimal'  # minimal => config/status/state/*_summary.json
+        RUNTIME_HYBRID_BACKUP_EVENTS_ENABLED = False
+        RUNTIME_HYBRID_BACKUP_METRICS_ENABLED = False
+        RUNTIME_HYBRID_BACKUP_ARTIFACT_PATTERNS = ['*_summary.json']
         if LOW_QUOTA_PROFILE:
             GLOBAL_BUDGET_ENFORCEMENT_MODE = 'batched'
             GLOBAL_PROGRESS_FLUSH_EVERY_N_GAMES = int(LOW_QUOTA_GLOBAL_PROGRESS_FLUSH_EVERY_N_GAMES)
@@ -904,6 +910,10 @@ cells = [
         print('RUNTIME_HYBRID_BACKUP_JOBS_ROOT =', RUNTIME_HYBRID_BACKUP_JOBS_ROOT)
         print('RUNTIME_HYBRID_BACKUP_MIN_INTERVAL_SECONDS =', RUNTIME_HYBRID_BACKUP_MIN_INTERVAL_SECONDS)
         print('RUNTIME_HYBRID_BACKUP_FORCE_INTERVAL_SECONDS =', RUNTIME_HYBRID_BACKUP_FORCE_INTERVAL_SECONDS)
+        print('RUNTIME_HYBRID_BACKUP_MODE =', RUNTIME_HYBRID_BACKUP_MODE)
+        print('RUNTIME_HYBRID_BACKUP_EVENTS_ENABLED =', RUNTIME_HYBRID_BACKUP_EVENTS_ENABLED)
+        print('RUNTIME_HYBRID_BACKUP_METRICS_ENABLED =', RUNTIME_HYBRID_BACKUP_METRICS_ENABLED)
+        print('RUNTIME_HYBRID_BACKUP_ARTIFACT_PATTERNS =', RUNTIME_HYBRID_BACKUP_ARTIFACT_PATTERNS)
         print('TARGET_SAMPLES          =', TARGET_SAMPLES)
         print('TARGET_LABELED_SAMPLES  =', TARGET_LABELED_SAMPLES)
         print('DATASET_GENERATE_SOURCE_MODE =', DATASET_GENERATE_SOURCE_MODE)
@@ -966,6 +976,8 @@ cells = [
         print('GLOBAL_PROGRESS_WORKERS_MAX_ENTRIES =', GLOBAL_PROGRESS_WORKERS_MAX_ENTRIES)
         print('WORKER_CHECKPOINTS_MIN_INTERVAL_SECONDS =', WORKER_CHECKPOINTS_MIN_INTERVAL_SECONDS)
         print('WORKER_CHECKPOINTS_STATE_ONLY_ON_CHANGE =', WORKER_CHECKPOINTS_STATE_ONLY_ON_CHANGE)
+        print('WORKER_CHECKPOINTS_RETRY_ATTEMPTS_NON_STRICT =', WORKER_CHECKPOINTS_RETRY_ATTEMPTS_NON_STRICT)
+        print('WORKER_CHECKPOINTS_RETRY_BACKOFF_SECONDS =', WORKER_CHECKPOINTS_RETRY_BACKOFF_SECONDS)
         print('DATASET_GENERATE_JOB_ID =', DATASET_GENERATE_JOB_ID)
         print('DATASET_BUILD_JOB_ID    =', DATASET_BUILD_JOB_ID)
         print('TRAIN_CONTINUE_JOB_ID   =', TRAIN_CONTINUE_JOB_ID)
@@ -1132,13 +1144,37 @@ cells = [
             storage_cfg['jobs_backup_root'] = str(RUNTIME_HYBRID_BACKUP_JOBS_ROOT)
             storage_cfg['runtime_state_backup_min_interval_seconds'] = float(RUNTIME_HYBRID_BACKUP_MIN_INTERVAL_SECONDS)
             storage_cfg['runtime_state_backup_force_interval_seconds'] = float(RUNTIME_HYBRID_BACKUP_FORCE_INTERVAL_SECONDS)
+            storage_cfg['runtime_state_backup_mode'] = str(RUNTIME_HYBRID_BACKUP_MODE)
+            storage_cfg['runtime_state_backup_events_enabled'] = bool(RUNTIME_HYBRID_BACKUP_EVENTS_ENABLED)
+            storage_cfg['runtime_state_backup_metrics_enabled'] = bool(RUNTIME_HYBRID_BACKUP_METRICS_ENABLED)
+            storage_cfg['runtime_state_backup_artifact_patterns'] = list(RUNTIME_HYBRID_BACKUP_ARTIFACT_PATTERNS)
             cfg['storage'] = storage_cfg
+            return cfg
+
+        def _apply_runtime_firestore_cfg(cfg: dict) -> dict:
+            firestore_cfg = dict(cfg.get('firestore', {}) or {})
+            run_type = str(dict(cfg.get('job', {}) or {}).get('run_type', '')).strip().lower()
+            strict_default = run_type not in {'train', 'evaluation', 'benchmark'}
+            firestore_cfg['job_firestore_backend'] = str(GLOBAL_PROGRESS_BACKEND)
+            firestore_cfg['job_firestore_enabled'] = str(GLOBAL_PROGRESS_BACKEND).strip().lower() == 'firestore'
+            if 'job_firestore_strict' not in firestore_cfg:
+                firestore_cfg['job_firestore_strict'] = bool(strict_default)
+            firestore_cfg['job_firestore_project_id'] = str(FIRESTORE_PROJECT_ID)
+            firestore_cfg['worker_checkpoints_firestore_collection'] = 'worker_checkpoints'
+            firestore_cfg['job_firestore_credentials_path'] = str(FIRESTORE_CREDENTIALS_PATH)
+            firestore_cfg['job_firestore_api_key'] = str(FIRESTORE_API_KEY)
+            firestore_cfg['job_firestore_checkpoint_min_interval_seconds'] = float(WORKER_CHECKPOINTS_MIN_INTERVAL_SECONDS)
+            firestore_cfg['job_firestore_checkpoint_state_only_on_change'] = bool(WORKER_CHECKPOINTS_STATE_ONLY_ON_CHANGE)
+            firestore_cfg['job_firestore_retry_attempts'] = int(max(1, WORKER_CHECKPOINTS_RETRY_ATTEMPTS_NON_STRICT))
+            firestore_cfg['job_firestore_retry_backoff_seconds'] = float(max(0.0, WORKER_CHECKPOINTS_RETRY_BACKOFF_SECONDS))
+            cfg['firestore'] = firestore_cfg
             return cfg
 
         def _write_yaml(payload: dict, target_path_str: str) -> str:
             target_path = Path(target_path_str)
             target_path.parent.mkdir(parents=True, exist_ok=True)
             normalized_payload = _apply_runtime_storage_cfg(dict(payload or {}))
+            normalized_payload = _apply_runtime_firestore_cfg(normalized_payload)
             target_path.write_text(yaml.safe_dump(normalized_payload, sort_keys=False, allow_unicode=True), encoding='utf-8')
             return str(target_path)
 
@@ -1281,6 +1317,7 @@ cells = [
                 train_payload['batch_size'] = int(tuned_batch_size)
                 cfg_payload['train'] = train_payload
                 cfg_payload = _apply_runtime_storage_cfg(cfg_payload)
+                cfg_payload = _apply_runtime_firestore_cfg(cfg_payload)
                 current_path.write_text(yaml.safe_dump(cfg_payload, sort_keys=False, allow_unicode=True), encoding='utf-8')
 
             eval_path = _resolve_cfg_path(str(EVALUATION_CONFIG_ACTIVE))
@@ -1297,6 +1334,7 @@ cells = [
             eval_runtime_payload['pin_memory'] = bool(eval_runtime_payload.get('device', 'cpu') == 'cuda')
             eval_cfg_payload['runtime'] = eval_runtime_payload
             eval_cfg_payload = _apply_runtime_storage_cfg(eval_cfg_payload)
+            eval_cfg_payload = _apply_runtime_firestore_cfg(eval_cfg_payload)
             eval_path.write_text(yaml.safe_dump(eval_cfg_payload, sort_keys=False, allow_unicode=True), encoding='utf-8')
 
         model_registry_path = Path(DRIVE_ROOT) / 'models' / 'model_registry.json'
@@ -1434,11 +1472,13 @@ cells = [
         generate_cfg = yaml.safe_load((Path(WORKTREE) / DATASET_GENERATE_CONFIG).read_text(encoding='utf-8')) or {}
         generate_block = dict(generate_cfg.get('dataset_generation', {}) or {})
         if DATASET_SOURCE_ID.startswith('sampled_'):
+            raw_dir_name = f"raw_{DATASET_SOURCE_ID[len('sampled_'):]}"
             output_sampled_dir = f'data/{DATASET_SOURCE_ID}'
-            output_raw_dir = f"data/raw_{DATASET_SOURCE_ID[len('sampled_'):]}"
         else:
+            raw_dir_name = f'raw_{DATASET_SOURCE_ID}'
             output_sampled_dir = f'data/{DATASET_SOURCE_ID}'
-            output_raw_dir = f'data/raw_{DATASET_SOURCE_ID}'
+        # Strategie stockage: raw volatils en runtime local, sampled durables sur Drive.
+        output_raw_dir = str(Path(RUNTIME_STATE_ROOT) / 'data' / raw_dir_name)
         pipeline_mode = str(DATASET_PIPELINE_MODE).strip().lower() or 'single_pass'
         pipeline_pass = str(DATASET_PIPELINE_ACTIVE_PASS).strip().upper() or 'A'
         generate_source_mode_requested = str(DATASET_GENERATE_SOURCE_MODE).strip().lower() or 'benchmatch'
@@ -1453,6 +1493,7 @@ cells = [
         generate_block['target_samples'] = int(TARGET_SAMPLES)
         generate_block['output_sampled_dir'] = output_sampled_dir
         generate_block['output_raw_dir'] = output_raw_dir
+        generate_block['completed_game_detection_mode'] = 'sampled_only'
         generate_block['workers'] = int(DATASET_GENERATE_WORKERS)
         generate_block['max_pending_futures'] = int(DATASET_GENERATE_MAX_PENDING_FUTURES)
         generate_block['model_agent_device'] = str(BENCHMATCH_MODEL_AGENT_DEVICE)
@@ -1551,6 +1592,7 @@ cells = [
         build_block['source_dataset_id'] = DATASET_SOURCE_ID
         build_block['input_sampled_dir'] = f'data/{DATASET_SOURCE_ID}'
         build_block['dataset_id'] = DATASET_BUILD_ID
+        build_block['label_cache_dir'] = str(Path(RUNTIME_STATE_ROOT) / 'data' / 'label_cache' / DATASET_BUILD_ID)
         build_block['target_labeled_samples'] = int(TARGET_LABELED_SAMPLES)
         build_block['value_target_mix_teacher_weight'] = float(VALUE_TARGET_MIX_TEACHER_WEIGHT)
         build_block['hard_examples_enabled'] = bool(HARD_EXAMPLES_ENABLED)
@@ -1752,6 +1794,7 @@ cells = [
         benchmark_block['parallel_workers'] = int(max(1, BENCHMARK_PARALLEL_WORKERS))
         benchmark_cfg['benchmark'] = benchmark_block
         benchmark_cfg = _apply_runtime_storage_cfg(benchmark_cfg)
+        benchmark_cfg = _apply_runtime_firestore_cfg(benchmark_cfg)
         Path(BENCHMARK_CONFIG_ACTIVE).write_text(
             yaml.safe_dump(benchmark_cfg, sort_keys=False, allow_unicode=True),
             encoding='utf-8',
@@ -1792,6 +1835,8 @@ cells = [
         print('pass_b_build_id                =', DATASET_BUILD_ID_PASS_B)
         print('output_raw_dir                 =', output_raw_dir)
         print('output_sampled_dir             =', output_sampled_dir)
+        print('completed_game_detection_mode  =', generate_block.get('completed_game_detection_mode'))
+        print('label_cache_dir                =', build_block.get('label_cache_dir'))
         print('model_scan_dir                 =', model_scan_dir)
         print('model_order                    =', 'newest_first' if newest_first else 'oldest_first')
         print('discovered_model_ids           =', [str(item.get('model_id', '')) for item in discovered_model_rows])

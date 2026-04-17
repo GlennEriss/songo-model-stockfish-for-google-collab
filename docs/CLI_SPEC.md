@@ -23,6 +23,12 @@ Les commandes de job (`dataset-generate`, `dataset-build`, `dataset-merge-final`
 
 Elles creent un `JobContext`, ecrivent `run_status.json` / `state.json`, puis executent le handler associe.
 
+`storage-cleanup` est une commande d'operations de stockage:
+
+- par defaut: dry-run (aucune suppression)
+- `--apply`: active les suppressions effectives
+- `--all`: active toutes les familles de cleanup en une passe
+
 ## 4. Commandes supportees
 
 ### 4.1 `dataset-generate`
@@ -147,6 +153,28 @@ Note:
 
 - cette commande lit le registre dataset local (`data/dataset_registry.json`) via `build_project_paths`.
 - en monitoring Firestore runtime, le notebook compact utilise des helpers dedies pour lire `dataset_registry/primary`.
+
+### 4.10 `storage-cleanup`
+
+Usage:
+
+```bash
+python -m songo_model_stockfish.cli.main storage-cleanup --config config/train.full_matrix.colab_pro.yaml --all
+```
+
+Options:
+
+- `--apply`: applique les suppressions (sinon dry-run)
+- `--all`: active toutes les purges supportees
+- `--purge-drive-runtime`: migration hash-verifiee Drive `jobs/` + `logs/pipeline/` -> runtime local puis purge source
+- `--purge-runtime-backup-streams`: suppression `events.jsonl` / `metrics.jsonl` dans `runtime_backup/jobs` (jobs actifs ignores)
+- `--purge-drive-raw`: suppression des `raw_dir` Drive deja migres/confirmes
+- `--purge-drive-label-cache`: suppression `data/label_cache/*` hors datasets conserves
+- `--purge-models`: suppression des artefacts modeles hors keep set puis resync `model_registry` + `promoted/best`
+- `--keep-model-id` / `--keep-model-ids`: ids modeles a conserver
+- `--keep-top-models`: nombre de top models (registry) a conserver
+- `--keep-dataset-id`: ids dataset a conserver pour le label cache
+- `--allow-purge-without-manifest`: autorise purge runtime Drive sans manifest de migration
 
 ## 5. Etats d'execution
 

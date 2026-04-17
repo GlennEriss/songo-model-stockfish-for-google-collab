@@ -39,12 +39,34 @@ runtime:
 storage:
   drive_root: /content/drive/MyDrive/songo-stockfish
   repo_root: /content/songo-model-stockfish-for-google-collab
+  jobs_root: /content/songo-stockfish-runtime/jobs
+  jobs_backup_root: /content/drive/MyDrive/songo-stockfish/runtime_backup/jobs
+  runtime_state_backup_mode: minimal
+  runtime_state_backup_events_enabled: false
+  runtime_state_backup_metrics_enabled: false
+  runtime_state_backup_artifact_patterns:
+    - "*_summary.json"
 
 job:
   run_type: train
   job_id: auto
   resume: true
   save_every_minutes: 5
+```
+
+Bloc Firestore recommande (reprise cross-Colab train/eval/benchmark incluse):
+
+```yaml
+firestore:
+  job_firestore_backend: firestore
+  job_firestore_enabled: true
+  job_firestore_strict: true
+  job_firestore_project_id: songo-model-ai
+  worker_checkpoints_firestore_collection: worker_checkpoints
+  job_firestore_credentials_path: /content/drive/MyDrive/songo-stockfish/secrets/service-account.json
+  job_firestore_api_key: ""
+  job_firestore_checkpoint_min_interval_seconds: 30
+  job_firestore_checkpoint_state_only_on_change: true
 ```
 
 ## 4. Config `dataset_generation`
@@ -83,8 +105,9 @@ dataset_generation:
   target_samples: 20000000
   sample_every_n_plies: 2
   max_moves: 400
-  output_raw_dir: data/raw_full_matrix_colab_pro
+  output_raw_dir: /content/songo-stockfish-runtime/data/raw_full_matrix_colab_pro
   output_sampled_dir: data/sampled_full_matrix_colab_pro
+  completed_game_detection_mode: sampled_only
   progress_update_every_n_games: 20
   max_pending_futures: 32
 
@@ -111,6 +134,11 @@ dataset_generation:
   #   counterfactual_include_exploration: true
   #   counterfactual_exploration_seed_offset: 17
 ```
+
+`completed_game_detection_mode`:
+- `raw_and_sampled` (defaut historique): une game est "complete" si raw + sampled existent.
+- `sampled_only` (recommande en Colab volatile): une game est "complete" si sampled existe.
+- `raw_only`: reserve au debug.
 
 ## 5. Config `dataset_build`
 
@@ -139,7 +167,7 @@ dataset_build:
   input_sampled_dir: data/sampled_full_matrix_colab_pro
   dataset_id: dataset_v2_full_matrix_colab_pro_insane_20m
   output_dir: data/datasets/dataset_v2_full_matrix_colab_pro_insane_20m
-  label_cache_dir: data/label_cache/dataset_v2_full_matrix_colab_pro_insane_20m
+  label_cache_dir: /content/songo-stockfish-runtime/data/label_cache/dataset_v2_full_matrix_colab_pro_insane_20m
   target_labeled_samples: 20000000
   follow_source_updates: true
   source_poll_interval_seconds: 45

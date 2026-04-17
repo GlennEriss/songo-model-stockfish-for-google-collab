@@ -47,6 +47,13 @@ def _resolve_storage_path(base: Path, configured: str | None, fallback: Path) ->
     return base / path
 
 
+def _normalize_completed_game_detection_mode(value: Any) -> str:
+    mode = str(value or "raw_and_sampled").strip().lower()
+    if mode not in {"raw_and_sampled", "sampled_only", "raw_only"}:
+        return "raw_and_sampled"
+    return mode
+
+
 def _default_raw_dir_name_for_dataset_source(dataset_source_id: str) -> str:
     if dataset_source_id.startswith("sampled_"):
         return "raw_" + dataset_source_id[len("sampled_") :]
@@ -3033,12 +3040,24 @@ def _merge_npz_splits_with_source_breakdown(
     return merged, summary, source_breakdown
 
 
-def _existing_game_numbers(raw_dir: Path, sampled_dir: Path, matchup_id: str) -> set[int]:
+def _existing_game_numbers(
+    raw_dir: Path,
+    sampled_dir: Path,
+    matchup_id: str,
+    *,
+    completion_mode: str = "raw_and_sampled",
+) -> set[int]:
     raw_matchup_dir = raw_dir / matchup_id
     sampled_matchup_dir = sampled_dir / matchup_id
     raw_stems = {path.stem for path in raw_matchup_dir.glob("*.json")} if raw_matchup_dir.exists() else set()
     sampled_stems = {path.stem for path in sampled_matchup_dir.glob("*.jsonl")} if sampled_matchup_dir.exists() else set()
-    completed = raw_stems & sampled_stems
+    normalized_mode = _normalize_completed_game_detection_mode(completion_mode)
+    if normalized_mode == "sampled_only":
+        completed = sampled_stems
+    elif normalized_mode == "raw_only":
+        completed = raw_stems
+    else:
+        completed = raw_stems & sampled_stems
     game_numbers: set[int] = set()
     prefix = f"{matchup_id}_game_"
     for stem in completed:
@@ -3057,8 +3076,15 @@ def _build_pending_incremental_games(
     games_to_add: int,
     seed_base: int,
     sample_every_n_plies: int = 1,
+    completion_mode: str = "raw_and_sampled",
 ) -> list[dict[str, Any]]:
-    existing_numbers = _existing_game_numbers(raw_dir, sampled_dir, matchup_id)
+    normalized_mode = _normalize_completed_game_detection_mode(completion_mode)
+    existing_numbers = _existing_game_numbers(
+        raw_dir,
+        sampled_dir,
+        matchup_id,
+        completion_mode=normalized_mode,
+    )
     pending: list[dict[str, Any]] = []
     sample_stride = max(1, int(sample_every_n_plies))
     candidate = 1
@@ -3066,7 +3092,13 @@ def _build_pending_incremental_games(
         game_id = f"{matchup_id}_game_{candidate:06d}"
         raw_game_path = raw_dir / matchup_id / f"{game_id}.json"
         sampled_game_path = sampled_dir / matchup_id / f"{game_id}.jsonl"
-        if candidate not in existing_numbers or not (raw_game_path.exists() and sampled_game_path.exists()):
+        if normalized_mode == "sampled_only":
+            completed_artifacts_exist = sampled_game_path.exists()
+        elif normalized_mode == "raw_only":
+            completed_artifacts_exist = raw_game_path.exists()
+        else:
+            completed_artifacts_exist = raw_game_path.exists() and sampled_game_path.exists()
+        if candidate not in existing_numbers or not completed_artifacts_exist:
             pending.append(
                 {
                     "game_index": candidate - 1,
@@ -5057,6 +5089,7 @@ def _run_dataset_generation_self_play_puct(
             games_to_add=games,
             seed_base=base_seed + (cycle_index * 1_000_000),
             sample_every_n_plies=sample_every_n_plies,
+            completion_mode=completed_game_detection_mode,
         )
         if not pending_games:
             job.logger.warning(
@@ -5516,6 +5549,9 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
         scope="dataset generation pool configuration",
     )
     target_samples = int(cfg.get("target_samples", 0))
+    completed_game_detection_mode = _normalize_completed_game_detection_mode(
+        cfg.get("completed_game_detection_mode", "raw_and_sampled")
+    )
     model_agent_device = str(cfg.get("model_agent_device", "cpu")).strip().lower() or "cpu"
     global_target_enabled = _as_bool(cfg.get("global_target_enabled", False), default=False)
     global_target_id = str(cfg.get("global_target_id", "")).strip() or dataset_source_id
@@ -5561,7 +5597,7 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
         )
 
     job.logger.info(
-        "dataset generation startup | source_mode=%s | dataset_source_id=%s | source_dataset_id=%s | source_dataset_ids=%s | target_samples=%s | output_raw_dir=%s | output_sampled_dir=%s | workers=%s | max_pending_futures=%s",
+        "dataset generation startup | source_mode=%s | dataset_source_id=%s | source_dataset_id=%s | source_dataset_ids=%s | target_samples=%s | output_raw_dir=%s | output_sampled_dir=%s | workers=%s | max_pending_futures=%s | completed_game_detection_mode=%s",
         source_mode,
         dataset_source_id,
         source_dataset_id or "<none>",
@@ -5571,6 +5607,7 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
         sampled_dir,
         num_workers,
         max_pending_futures,
+        completed_game_detection_mode,
     )
     if global_target_enabled and source_mode == "benchmatch":
         firestore_diag = _firestore_backend_diagnostics(global_progress_backend)
@@ -6132,7 +6169,12 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
             global_stop_requested = False
             pending_global_delta_samples = 0
             pending_global_delta_games = 0
-            existing_numbers = _existing_game_numbers(raw_dir, sampled_dir, matchup_id)
+            existing_numbers = _existing_game_numbers(
+                raw_dir,
+                sampled_dir,
+                matchup_id,
+                completion_mode=completed_game_detection_mode,
+            )
             existing_game_count = len(existing_numbers)
             job.logger.info(
                 "dataset matchup started | %s/%s | %s vs %s | add_games=%s | existing_games=%s | sample_every=%s | workers=%s | target_samples=%s",
@@ -6166,6 +6208,7 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
                 games_to_add=games,
                 seed_base=base_seed + (matchup_index * 1_000_000),
                 sample_every_n_plies=sample_every_n_plies,
+                completion_mode=completed_game_detection_mode,
             )
     
             def _update_benchmatch_progress(completed_game_id: str) -> None:

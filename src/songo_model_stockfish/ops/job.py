@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fnmatch
 import json
 import random
 import string
@@ -39,6 +40,13 @@ def _as_float(value: Any, default: float) -> float:
         return float(value)
     except Exception:
         return float(default)
+
+
+def _as_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
 
 
 def _truncate_text(value: Any, *, max_len: int = 256) -> str:
@@ -106,12 +114,15 @@ def _compact_firestore_state_payload(state_payload: dict[str, Any] | None) -> di
     return summary
 
 
-def _resolve_firestore_sync_config(config: dict[str, Any]) -> dict[str, Any]:
+def _resolve_firestore_sync_config(config: dict[str, Any], *, run_type: str | None = None) -> dict[str, Any]:
     firestore_cfg = config.get("firestore", {}) if isinstance(config.get("firestore"), dict) else {}
     dataset_gen_cfg = config.get("dataset_generation", {}) if isinstance(config.get("dataset_generation"), dict) else {}
     dataset_build_cfg = config.get("dataset_build", {}) if isinstance(config.get("dataset_build"), dict) else {}
     dataset_merge_cfg = config.get("dataset_merge_final", {}) if isinstance(config.get("dataset_merge_final"), dict) else {}
-    search_spaces = [firestore_cfg, dataset_gen_cfg, dataset_build_cfg, dataset_merge_cfg]
+    train_cfg = config.get("train", {}) if isinstance(config.get("train"), dict) else {}
+    eval_cfg = config.get("evaluation", {}) if isinstance(config.get("evaluation"), dict) else {}
+    benchmark_cfg = config.get("benchmark", {}) if isinstance(config.get("benchmark"), dict) else {}
+    search_spaces = [firestore_cfg, dataset_gen_cfg, dataset_build_cfg, dataset_merge_cfg, train_cfg, eval_cfg, benchmark_cfg]
 
     def pick(*keys: str) -> str:
         values: list[Any] = []
@@ -120,12 +131,19 @@ def _resolve_firestore_sync_config(config: dict[str, Any]) -> dict[str, Any]:
                 values.append(space.get(key))
         return _first_non_empty(values)
 
-    backend = pick("job_firestore_backend", "global_progress_backend", "global_target_progress_backend").lower() or "file"
+    backend = pick(
+        "job_firestore_backend",
+        "global_progress_backend",
+        "global_target_progress_backend",
+        "dataset_registry_backend",
+    ).lower() or "file"
     enabled_flag = pick("job_firestore_enabled").lower()
     enabled = backend == "firestore" or enabled_flag in {"1", "true", "yes", "on"}
 
+    normalized_run_type = str(run_type or "").strip().lower()
+    strict_default = normalized_run_type not in {"train", "evaluation", "benchmark"}
     strict_flag = pick("job_firestore_strict").lower()
-    strict = strict_flag in {"", "1", "true", "yes", "on"}
+    strict = _as_bool(strict_flag, default=strict_default)
     checkpoint_min_interval_seconds = max(
         0.0,
         _as_float(
@@ -137,21 +155,41 @@ def _resolve_firestore_sync_config(config: dict[str, Any]) -> dict[str, Any]:
         pick("job_firestore_checkpoint_state_only_on_change") or "1",
         default=True,
     )
+    retry_attempts_default = 1 if strict else 3
+    retry_attempts = max(
+        1,
+        _as_int(
+            pick("job_firestore_retry_attempts", "worker_checkpoints_retry_attempts") or retry_attempts_default,
+            retry_attempts_default,
+        ),
+    )
+    retry_backoff_seconds_default = 0.0 if strict else 1.0
+    retry_backoff_seconds = max(
+        0.0,
+        _as_float(
+            pick("job_firestore_retry_backoff_seconds", "worker_checkpoints_retry_backoff_seconds")
+            or retry_backoff_seconds_default,
+            retry_backoff_seconds_default,
+        ),
+    )
     project_id = pick(
         "job_firestore_project_id",
         "global_progress_firestore_project_id",
         "global_target_progress_firestore_project_id",
+        "dataset_registry_firestore_project_id",
     )
     collection = pick("worker_checkpoints_firestore_collection", "job_firestore_collection") or "worker_checkpoints"
     credentials_path = pick(
         "job_firestore_credentials_path",
         "global_progress_firestore_credentials_path",
         "global_target_progress_firestore_credentials_path",
+        "dataset_registry_firestore_credentials_path",
     )
     api_key = pick(
         "job_firestore_api_key",
         "global_progress_firestore_api_key",
         "global_target_progress_firestore_api_key",
+        "dataset_registry_firestore_api_key",
     )
     return {
         "enabled": bool(enabled),
@@ -162,6 +200,8 @@ def _resolve_firestore_sync_config(config: dict[str, Any]) -> dict[str, Any]:
         "api_key": api_key,
         "checkpoint_min_interval_seconds": checkpoint_min_interval_seconds,
         "checkpoint_state_only_on_change": checkpoint_state_only_on_change,
+        "retry_attempts": int(retry_attempts),
+        "retry_backoff_seconds": float(retry_backoff_seconds),
     }
 
 
@@ -188,6 +228,8 @@ def _firestore_sync_diag(sync: dict[str, Any]) -> dict[str, Any]:
         "api_key_set": bool(api_key),
         "checkpoint_min_interval_seconds": float(_as_float(sync.get("checkpoint_min_interval_seconds", 30.0), 30.0)),
         "checkpoint_state_only_on_change": bool(_as_bool(sync.get("checkpoint_state_only_on_change", True), default=True)),
+        "retry_attempts": int(max(1, _as_int(sync.get("retry_attempts", 1), 1))),
+        "retry_backoff_seconds": float(max(0.0, _as_float(sync.get("retry_backoff_seconds", 0.0), 0.0))),
     }
 
 
@@ -361,6 +403,41 @@ class JobContext:
         storage_cfg = self.config.get("storage", {}) if isinstance(self.config.get("storage"), dict) else {}
         return max(0.0, _as_float(storage_cfg.get("runtime_state_backup_force_interval_seconds", 300.0), 300.0))
 
+    def _runtime_backup_mode(self) -> str:
+        storage_cfg = self.config.get("storage", {}) if isinstance(self.config.get("storage"), dict) else {}
+        mode = str(storage_cfg.get("runtime_state_backup_mode", "full")).strip().lower()
+        if mode not in {"full", "minimal"}:
+            return "full"
+        return mode
+
+    def _runtime_backup_stream_enabled(self, *, kind: str) -> bool:
+        storage_cfg = self.config.get("storage", {}) if isinstance(self.config.get("storage"), dict) else {}
+        key = "runtime_state_backup_events_enabled" if kind == "events" else "runtime_state_backup_metrics_enabled"
+        raw_value = storage_cfg.get(key)
+        if raw_value is None:
+            # Backward compatible: full mode keeps streams, minimal mode disables them.
+            return self._runtime_backup_mode() == "full"
+        return _as_bool(raw_value, default=self._runtime_backup_mode() == "full")
+
+    def _runtime_backup_artifact_allowed(self, relative_name: str) -> bool:
+        rel = str(relative_name or "").strip().lstrip("/\\")
+        if not rel:
+            return False
+        storage_cfg = self.config.get("storage", {}) if isinstance(self.config.get("storage"), dict) else {}
+        patterns_raw = storage_cfg.get("runtime_state_backup_artifact_patterns")
+        patterns: list[str] = []
+        if isinstance(patterns_raw, str):
+            patterns = [item.strip() for item in patterns_raw.split(",") if item.strip()]
+        elif isinstance(patterns_raw, list):
+            patterns = [str(item).strip() for item in patterns_raw if str(item).strip()]
+
+        if not patterns:
+            if self._runtime_backup_mode() == "minimal":
+                patterns = ["*_summary.json"]
+            else:
+                patterns = ["*"]
+        return any(fnmatch.fnmatch(rel, pattern) for pattern in patterns)
+
     def _write_backup_json(self, relative_name: str, payload: dict[str, Any]) -> None:
         backup_path = self._backup_path_for(relative_name)
         if backup_path is None:
@@ -450,7 +527,8 @@ class JobContext:
             **extra,
         }
         self.events.write(payload)
-        self._append_backup_jsonl("events.jsonl", payload)
+        if self._runtime_backup_stream_enabled(kind="events"):
+            self._append_backup_jsonl("events.jsonl", payload)
 
     def write_metric(self, metric: dict[str, Any]) -> None:
         payload = {
@@ -459,7 +537,8 @@ class JobContext:
             **metric,
         }
         self.metrics.write(payload)
-        self._append_backup_jsonl("metrics.jsonl", payload)
+        if self._runtime_backup_stream_enabled(kind="metrics"):
+            self._append_backup_jsonl("metrics.jsonl", payload)
 
     def write_status(self, status: str, *, phase: str = "initializing", extra: dict[str, Any] | None = None) -> None:
         previous = self.read_status()
@@ -528,7 +607,8 @@ class JobContext:
         target_path = self.job_dir / rel
         target_path.parent.mkdir(parents=True, exist_ok=True)
         write_json_atomic(target_path, payload, ensure_ascii=ensure_ascii, indent=indent)
-        self._write_backup_json(rel, payload)
+        if self._runtime_backup_artifact_allowed(rel):
+            self._write_backup_json(rel, payload)
         return target_path
 
     def set_phase(self, phase: str) -> None:
@@ -571,67 +651,91 @@ class JobContext:
                 self._firestore_sync_stats["skipped_min_interval"] = int(self._firestore_sync_stats.get("skipped_min_interval", 0)) + 1
                 return
         self._firestore_sync_stats["attempted"] = int(self._firestore_sync_stats.get("attempted", 0)) + 1
-        try:
-            from google.cloud import firestore
-
-            client = _build_firestore_job_client(
-                project_id=str(sync.get("project_id", "")).strip(),
-                credentials_path=str(sync.get("credentials_path", "")).strip(),
-                api_key=str(sync.get("api_key", "")).strip(),
-            )
-            collection = str(sync.get("collection", "worker_checkpoints")).strip() or "worker_checkpoints"
-            doc_ref = client.collection(collection).document(self.job_id)
-            payload: dict[str, Any] = {}
-            payload["job_id"] = self.job_id
-            payload["run_type"] = self.run_type
-            payload["updated_at"] = utc_now_iso()
-            if status_payload is not None:
-                payload["status"] = dict(status_payload)
-                payload["phase"] = str(status_payload.get("phase", ""))
-            if state_payload is not None:
-                payload["state_summary"] = dict(compact_state_payload)
-            # Nettoyage defensif: retire l'ancien champ lourd `state` si present
-            # dans les documents historiques, sinon Firestore peut depasser 1 MiB.
-            payload["state"] = firestore.DELETE_FIELD
-            doc_ref.set(payload, merge=True)
-            self._last_firestore_checkpoint_write_ts = now_ts
-            if status_payload is not None:
-                self._last_firestore_status_signature = status_signature
-            if state_payload is not None:
-                self._last_firestore_state_signature = state_signature
-            self._firestore_sync_stats["written"] = int(self._firestore_sync_stats.get("written", 0)) + 1
-        except Exception as exc:
-            self._firestore_sync_stats["failed"] = int(self._firestore_sync_stats.get("failed", 0)) + 1
-            diag = _firestore_sync_diag(sync)
-            hint = _firestore_error_hint(exc, auth_mode=str(diag.get("auth_mode", "")))
-            self.logger.warning(
-                "firestore worker checkpoint sync failed | job_id=%s | strict=%s | project_id=%s | collection=%s | auth_mode=%s | credentials_path_exists=%s | api_key_set=%s | error=%s | hint=%s",
-                self.job_id,
-                strict,
-                str(diag.get("project_id", "")) or "<empty>",
-                str(diag.get("collection", "")) or "<empty>",
-                str(diag.get("auth_mode", "")) or "<unknown>",
-                bool(diag.get("credentials_path_exists", False)),
-                bool(diag.get("api_key_set", False)),
-                f"{type(exc).__name__}: {exc}",
-                hint or "<none>",
-            )
+        retry_attempts = max(1, _as_int(sync.get("retry_attempts", 1), 1))
+        retry_backoff_seconds = max(0.0, _as_float(sync.get("retry_backoff_seconds", 0.0), 0.0))
+        last_exc: Exception | None = None
+        for attempt_idx in range(retry_attempts):
             try:
-                self.write_event(
-                    "firestore_worker_checkpoint_sync_failed",
-                    strict=strict,
-                    project_id=str(diag.get("project_id", "")),
-                    collection=str(diag.get("collection", "")),
-                    auth_mode=str(diag.get("auth_mode", "")),
-                    credentials_path_exists=bool(diag.get("credentials_path_exists", False)),
-                    api_key_set=bool(diag.get("api_key_set", False)),
-                    error=f"{type(exc).__name__}: {exc}",
-                    hint=hint or "",
+                from google.cloud import firestore
+
+                client = _build_firestore_job_client(
+                    project_id=str(sync.get("project_id", "")).strip(),
+                    credentials_path=str(sync.get("credentials_path", "")).strip(),
+                    api_key=str(sync.get("api_key", "")).strip(),
                 )
-            except Exception:
-                pass
-            if strict:
-                raise
+                collection = str(sync.get("collection", "worker_checkpoints")).strip() or "worker_checkpoints"
+                doc_ref = client.collection(collection).document(self.job_id)
+                payload: dict[str, Any] = {}
+                payload["job_id"] = self.job_id
+                payload["run_type"] = self.run_type
+                payload["updated_at"] = utc_now_iso()
+                if status_payload is not None:
+                    payload["status"] = dict(status_payload)
+                    payload["phase"] = str(status_payload.get("phase", ""))
+                if state_payload is not None:
+                    payload["state_summary"] = dict(compact_state_payload)
+                # Nettoyage defensif: retire l'ancien champ lourd `state` si present
+                # dans les documents historiques, sinon Firestore peut depasser 1 MiB.
+                payload["state"] = firestore.DELETE_FIELD
+                doc_ref.set(payload, merge=True)
+                self._last_firestore_checkpoint_write_ts = time.time()
+                if status_payload is not None:
+                    self._last_firestore_status_signature = status_signature
+                if state_payload is not None:
+                    self._last_firestore_state_signature = state_signature
+                self._firestore_sync_stats["written"] = int(self._firestore_sync_stats.get("written", 0)) + 1
+                return
+            except Exception as exc:
+                last_exc = exc
+                is_last_attempt = (attempt_idx + 1) >= retry_attempts
+                if not is_last_attempt:
+                    backoff_seconds = retry_backoff_seconds * float(2**attempt_idx)
+                    self.logger.warning(
+                        "firestore worker checkpoint sync retry scheduled | job_id=%s | attempt=%s/%s | strict=%s | backoff_seconds=%.2f | error=%s",
+                        self.job_id,
+                        int(attempt_idx + 1),
+                        int(retry_attempts),
+                        strict,
+                        float(backoff_seconds),
+                        f"{type(exc).__name__}: {exc}",
+                    )
+                    if backoff_seconds > 0:
+                        time.sleep(backoff_seconds)
+
+        exc = last_exc if isinstance(last_exc, Exception) else RuntimeError("firestore checkpoint sync failed")
+        self._firestore_sync_stats["failed"] = int(self._firestore_sync_stats.get("failed", 0)) + 1
+        diag = _firestore_sync_diag(sync)
+        hint = _firestore_error_hint(exc, auth_mode=str(diag.get("auth_mode", "")))
+        self.logger.warning(
+            "firestore worker checkpoint sync failed | job_id=%s | strict=%s | retries=%s | project_id=%s | collection=%s | auth_mode=%s | credentials_path_exists=%s | api_key_set=%s | error=%s | hint=%s",
+            self.job_id,
+            strict,
+            int(retry_attempts),
+            str(diag.get("project_id", "")) or "<empty>",
+            str(diag.get("collection", "")) or "<empty>",
+            str(diag.get("auth_mode", "")) or "<unknown>",
+            bool(diag.get("credentials_path_exists", False)),
+            bool(diag.get("api_key_set", False)),
+            f"{type(exc).__name__}: {exc}",
+            hint or "<none>",
+        )
+        try:
+            self.write_event(
+                "firestore_worker_checkpoint_sync_failed",
+                strict=strict,
+                retries=int(retry_attempts),
+                project_id=str(diag.get("project_id", "")),
+                collection=str(diag.get("collection", "")),
+                auth_mode=str(diag.get("auth_mode", "")),
+                credentials_path_exists=bool(diag.get("credentials_path_exists", False)),
+                api_key_set=bool(diag.get("api_key_set", False)),
+                error=f"{type(exc).__name__}: {exc}",
+                hint=hint or "",
+            )
+        except Exception:
+            pass
+        if strict:
+            raise exc
 
     def _emit_firestore_sync_summary(self, *, status: str, phase: str) -> None:
         sync = self.firestore_sync if isinstance(self.firestore_sync, dict) else {}
@@ -745,11 +849,11 @@ def create_job_context(config: dict[str, Any], *, override_job_id: str | None = 
         metrics=metrics,
         status_path=status_path,
         state_path=state_path,
-        firestore_sync=_resolve_firestore_sync_config(config),
+        firestore_sync=_resolve_firestore_sync_config(config, run_type=run_type),
     )
     sync_diag = _firestore_sync_diag(context.firestore_sync)
     context.logger.info(
-        "firestore checkpoint sync config | enabled=%s | strict=%s | project_id=%s | collection=%s | auth_mode=%s | credentials_path_exists=%s | api_key_set=%s | checkpoint_min_interval_seconds=%.2f | checkpoint_state_only_on_change=%s",
+        "firestore checkpoint sync config | enabled=%s | strict=%s | project_id=%s | collection=%s | auth_mode=%s | credentials_path_exists=%s | api_key_set=%s | checkpoint_min_interval_seconds=%.2f | checkpoint_state_only_on_change=%s | retry_attempts=%s | retry_backoff_seconds=%.2f",
         bool(sync_diag.get("enabled", False)),
         bool(sync_diag.get("strict", True)),
         str(sync_diag.get("project_id", "")) or "<empty>",
@@ -759,6 +863,8 @@ def create_job_context(config: dict[str, Any], *, override_job_id: str | None = 
         bool(sync_diag.get("api_key_set", False)),
         float(sync_diag.get("checkpoint_min_interval_seconds", 0.0)),
         bool(sync_diag.get("checkpoint_state_only_on_change", True)),
+        int(sync_diag.get("retry_attempts", 1)),
+        float(sync_diag.get("retry_backoff_seconds", 0.0)),
     )
     context.write_event(
         "firestore_checkpoint_sync_config_resolved",
@@ -771,6 +877,8 @@ def create_job_context(config: dict[str, Any], *, override_job_id: str | None = 
         api_key_set=bool(sync_diag.get("api_key_set", False)),
         checkpoint_min_interval_seconds=float(sync_diag.get("checkpoint_min_interval_seconds", 0.0)),
         checkpoint_state_only_on_change=bool(sync_diag.get("checkpoint_state_only_on_change", True)),
+        retry_attempts=int(sync_diag.get("retry_attempts", 1)),
+        retry_backoff_seconds=float(sync_diag.get("retry_backoff_seconds", 0.0)),
     )
     if restored_from_backup:
         context.logger.info(

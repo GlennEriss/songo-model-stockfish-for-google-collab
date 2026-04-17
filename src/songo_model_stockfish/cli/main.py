@@ -288,6 +288,23 @@ def build_parser() -> argparse.ArgumentParser:
     dataset_list.add_argument("--config")
     dataset_list.add_argument("--kind", choices=["all", "sources", "built"], default="all")
     dataset_list.add_argument("--json", action="store_true")
+
+    storage_cleanup = subparsers.add_parser("storage-cleanup")
+    storage_cleanup.add_argument("--config", required=True)
+    storage_cleanup.add_argument("--apply", action="store_true")
+    storage_cleanup.add_argument("--all", action="store_true")
+    storage_cleanup.add_argument("--allow-purge-without-manifest", action="store_true")
+    storage_cleanup.add_argument("--purge-drive-runtime", action="store_true")
+    storage_cleanup.add_argument("--purge-runtime-backup-streams", action="store_true")
+    storage_cleanup.add_argument("--purge-drive-raw", action="store_true")
+    storage_cleanup.add_argument("--purge-drive-raw-include-inactive-partial", action="store_true")
+    storage_cleanup.add_argument("--purge-drive-raw-inactive-min-age-hours", type=float, default=24.0)
+    storage_cleanup.add_argument("--purge-drive-label-cache", action="store_true")
+    storage_cleanup.add_argument("--purge-models", action="store_true")
+    storage_cleanup.add_argument("--keep-model-id", action="append", default=[])
+    storage_cleanup.add_argument("--keep-model-ids")
+    storage_cleanup.add_argument("--keep-top-models", type=int, default=1)
+    storage_cleanup.add_argument("--keep-dataset-id", action="append", default=[])
     return parser
 
 
@@ -346,6 +363,33 @@ def main(argv: list[str] | None = None) -> int:
         return _status(args.job_id)
     if args.command == "dataset-list":
         return _dataset_list(args.config, kind=args.kind, output_json=args.json)
+    if args.command == "storage-cleanup":
+        from songo_model_stockfish.ops.storage_cleanup import run_storage_cleanup
+
+        config = load_yaml_config(args.config)
+        paths = build_project_paths(config)
+        keep_model_ids = list(args.keep_model_id or [])
+        if str(args.keep_model_ids or "").strip():
+            keep_model_ids.extend([item.strip() for item in str(args.keep_model_ids).split(",") if item.strip()])
+        cleanup_all = bool(args.all)
+        result = run_storage_cleanup(
+            config=config,
+            paths=paths,
+            apply=bool(args.apply),
+            cleanup_runtime_migration=bool(cleanup_all or args.purge_drive_runtime),
+            cleanup_runtime_backup_streams=bool(cleanup_all or args.purge_runtime_backup_streams),
+            cleanup_drive_raw_dirs=bool(cleanup_all or args.purge_drive_raw),
+            cleanup_drive_label_cache=bool(cleanup_all or args.purge_drive_label_cache),
+            cleanup_models=bool(cleanup_all or args.purge_models),
+            keep_model_ids=keep_model_ids,
+            keep_top_models=int(args.keep_top_models),
+            keep_dataset_ids=list(args.keep_dataset_id or []),
+            allow_purge_without_manifest=bool(args.allow_purge_without_manifest),
+            drive_raw_cleanup_include_inactive_partial=bool(args.purge_drive_raw_include_inactive_partial),
+            drive_raw_cleanup_inactive_min_age_seconds=max(0.0, float(args.purge_drive_raw_inactive_min_age_hours) * 3600.0),
+        )
+        print(json.dumps(result, indent=2, ensure_ascii=True))
+        return 0
     parser.error("Commande non supportee")
     return 2
 
