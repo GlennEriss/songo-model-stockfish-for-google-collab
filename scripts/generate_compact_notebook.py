@@ -1069,6 +1069,48 @@ cells = [
             print(json.dumps(summary, indent=2, ensure_ascii=True))
         """
     ),
+    md("## 3ter. Maintenance Hebdo (TTL + Purge Progressive)"),
+    code(
+        """
+        # Maintenance stockage hebdo:
+        # - retention TTL (events/metrics, quarantine, reports benchmark, checkpoints intermediaires)
+        # - purge raw inactif + label_cache + modeles non conserves
+        # Par defaut: DRY_RUN=True pour inspecter avant suppression reelle.
+
+        import shlex
+        import subprocess
+
+        STORAGE_CLEANUP_DRY_RUN = True
+        STORAGE_CLEANUP_KEEP_MODEL_ID = 'songo_policy_value_colab_pro_v12'
+        STORAGE_CLEANUP_CONFIG_PATH = str(TRAIN_CONTINUE_CONFIG_ACTIVE_PATH)
+
+        cleanup_cmd = (
+            f"cd {shlex.quote(WORKTREE)} && "
+            f"PYTHONPATH={shlex.quote(f'{WORKTREE}/src')} "
+            f"{shlex.quote(PYTHON_BIN)} -m songo_model_stockfish.cli.main storage-cleanup "
+            f"--config {shlex.quote(STORAGE_CLEANUP_CONFIG_PATH)} "
+            f"--retention "
+            f"--purge-runtime-backup-streams "
+            f"--purge-drive-raw "
+            f"--purge-drive-raw-include-inactive-partial "
+            f"--purge-drive-raw-inactive-min-age-hours 48 "
+            f"--purge-drive-label-cache "
+            f"--purge-models "
+            f"--keep-model-id {shlex.quote(STORAGE_CLEANUP_KEEP_MODEL_ID)} "
+            f"--keep-top-models 0 "
+            + ("" if STORAGE_CLEANUP_DRY_RUN else "--apply ")
+        )
+
+        print('Maintenance hebdo config:')
+        print('  dry_run          =', STORAGE_CLEANUP_DRY_RUN)
+        print('  keep_model_id    =', STORAGE_CLEANUP_KEEP_MODEL_ID)
+        print('  config_path      =', STORAGE_CLEANUP_CONFIG_PATH)
+        print('  command          =', cleanup_cmd)
+
+        subprocess.run(['/bin/bash', '-lc', cleanup_cmd], check=True)
+        print('Maintenance hebdo terminee.')
+        """
+    ),
     md("## 4. Generer les configs actives"),
     code(
         """

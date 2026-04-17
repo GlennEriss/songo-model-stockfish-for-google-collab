@@ -284,9 +284,9 @@ def run_storage_cleanup(
     drive_raw_cleanup_inactive_min_age_seconds: float = 0.0,
     retention_job_stream_ttl_seconds: float = 72.0 * 3600.0,
     retention_quarantine_ttl_seconds: float = 72.0 * 3600.0,
-    retention_benchmark_report_ttl_seconds: float = 30.0 * 86400.0,
-    retention_benchmark_keep_recent: int = 40,
-    retention_checkpoint_ttl_seconds: float = 21.0 * 86400.0,
+    retention_benchmark_report_ttl_seconds: float = 45.0 * 86400.0,
+    retention_benchmark_keep_recent: int = 60,
+    retention_checkpoint_ttl_seconds: float = 14.0 * 86400.0,
     retention_checkpoint_keep_recent_per_model: int = 2,
 ) -> dict[str, Any]:
     keep_model_ids = list(keep_model_ids or [])
