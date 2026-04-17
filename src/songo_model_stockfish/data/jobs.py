@@ -3056,9 +3056,11 @@ def _build_pending_incremental_games(
     matchup_id: str,
     games_to_add: int,
     seed_base: int,
+    sample_every_n_plies: int = 1,
 ) -> list[dict[str, Any]]:
     existing_numbers = _existing_game_numbers(raw_dir, sampled_dir, matchup_id)
     pending: list[dict[str, Any]] = []
+    sample_stride = max(1, int(sample_every_n_plies))
     candidate = 1
     while len(pending) < games_to_add:
         game_id = f"{matchup_id}_game_{candidate:06d}"
@@ -3070,6 +3072,7 @@ def _build_pending_incremental_games(
                     "game_index": candidate - 1,
                     "game_no": candidate,
                     "starter": (candidate - 1) % 2,
+                    "sample_ply_offset": (candidate - 1) % sample_stride,
                     "seed": seed_base + (candidate - 1),
                     "game_id": game_id,
                     "raw_game_path": raw_game_path,
@@ -3505,6 +3508,7 @@ def _play_and_sample_self_play_game(
     game_id: str,
     seed: int,
     sample_every_n_plies: int,
+    sample_ply_offset: int = 0,
     max_moves: int,
     num_simulations: int,
     c_puct: float,
@@ -3523,6 +3527,8 @@ def _play_and_sample_self_play_game(
     ply = 0
     rng = np.random.default_rng(int(seed))
     end_reason = "finished"
+    sample_stride = max(1, int(sample_every_n_plies))
+    sample_offset = int(sample_ply_offset) % sample_stride
 
     while not songo_ai_game.is_terminal(state) and ply < int(max_moves):
         legal_moves = list(songo_ai_game.legal_moves(state))
@@ -3545,7 +3551,7 @@ def _play_and_sample_self_play_game(
         if move is None or int(move) not in legal_moves:
             move = int(legal_moves[0])
 
-        if ply % int(sample_every_n_plies) == 0:
+        if ((int(ply) - int(sample_offset)) % int(sample_stride)) == 0:
             sample_index += 1
             sample = _sample_position(
                 game_id=game_id,
@@ -3626,6 +3632,8 @@ def _play_and_sample_self_play_game(
             "root_dirichlet_alpha": float(root_dirichlet_alpha),
             "root_dirichlet_epsilon": float(root_dirichlet_epsilon),
             "deterministic": bool(deterministic),
+            "sample_every_n_plies": int(sample_stride),
+            "sample_ply_offset": int(sample_offset),
         },
     }
     return raw_log, samples
@@ -3640,6 +3648,7 @@ def _play_and_sample_self_play_game_from_checkpoint(
     game_id: str,
     seed: int,
     sample_every_n_plies: int,
+    sample_ply_offset: int = 0,
     max_moves: int,
     num_simulations: int,
     c_puct: float,
@@ -3661,6 +3670,7 @@ def _play_and_sample_self_play_game_from_checkpoint(
         game_id=game_id,
         seed=int(seed),
         sample_every_n_plies=int(sample_every_n_plies),
+        sample_ply_offset=int(sample_ply_offset),
         max_moves=int(max_moves),
         num_simulations=int(num_simulations),
         c_puct=float(c_puct),
@@ -4590,6 +4600,7 @@ def _play_and_sample_game(
     seed: int,
     starter: int,
     sample_every_n_plies: int,
+    sample_ply_offset: int = 0,
     max_moves: int = 300,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     state = songo_ai_game.create_state()
@@ -4600,9 +4611,11 @@ def _play_and_sample_game(
     sample_index = 0
     started_at = utc_now_iso()
     end_reason = "finished"
+    sample_stride = max(1, int(sample_every_n_plies))
+    sample_offset = int(sample_ply_offset) % sample_stride
 
     while not songo_ai_game.is_terminal(state) and ply < max_moves:
-        if ply % sample_every_n_plies == 0:
+        if ((int(ply) - int(sample_offset)) % int(sample_stride)) == 0:
             sample_index += 1
             samples.append(
                 _sample_position(
@@ -4665,6 +4678,8 @@ def _play_and_sample_game(
         "matchup_id": matchup_id,
         "seed": seed,
         "starter": starter,
+        "sample_every_n_plies": int(sample_stride),
+        "sample_ply_offset": int(sample_offset),
         "player_a": agent_a.display_name,
         "player_b": agent_b.display_name,
         "winner": logical_winner,
@@ -4688,6 +4703,7 @@ def _play_and_sample_game_from_specs(
     seed: int,
     starter: int,
     sample_every_n_plies: int,
+    sample_ply_offset: int = 0,
     max_moves: int = 300,
     models_root: str = ".",
     model_agent_device: str = "cpu",
@@ -4703,6 +4719,7 @@ def _play_and_sample_game_from_specs(
         seed=seed,
         starter=starter,
         sample_every_n_plies=sample_every_n_plies,
+        sample_ply_offset=sample_ply_offset,
         max_moves=max_moves,
     )
 
@@ -4828,12 +4845,13 @@ def _run_pending_games_sequential(
     completed_samples = 0
     for pending in pending_games:
         job.logger.info(
-            "dataset game running | matchup=%s | game=%s/%s | seed=%s | starter=%s | mode=sequential",
+            "dataset game running | matchup=%s | game=%s/%s | seed=%s | starter=%s | sample_offset=%s | mode=sequential",
             matchup_id,
             pending["game_no"],
             games,
             pending["seed"],
             pending["starter"],
+            pending.get("sample_ply_offset", 0),
         )
         try:
             raw_payload, samples = _play_and_sample_game(
@@ -4844,6 +4862,7 @@ def _run_pending_games_sequential(
                 seed=int(pending["seed"]),
                 starter=int(pending["starter"]),
                 sample_every_n_plies=sample_every_n_plies,
+                sample_ply_offset=int(pending.get("sample_ply_offset", 0)),
                 max_moves=max_moves,
             )
         except Exception as exc:
@@ -5037,6 +5056,7 @@ def _run_dataset_generation_self_play_puct(
             matchup_id=matchup_id,
             games_to_add=games,
             seed_base=base_seed + (cycle_index * 1_000_000),
+            sample_every_n_plies=sample_every_n_plies,
         )
         if not pending_games:
             job.logger.warning(
@@ -5128,6 +5148,7 @@ def _run_dataset_generation_self_play_puct(
                 game_id=str(pending["game_id"]),
                 seed=int(pending["seed"]),
                 sample_every_n_plies=sample_every_n_plies,
+                sample_ply_offset=int(pending.get("sample_ply_offset", 0)),
                 max_moves=max_moves,
                 num_simulations=search_simulations,
                 c_puct=search_c_puct,
@@ -5205,6 +5226,7 @@ def _run_dataset_generation_self_play_puct(
                                 game_id=str(pending["game_id"]),
                                 seed=int(pending["seed"]),
                                 sample_every_n_plies=sample_every_n_plies,
+                                sample_ply_offset=int(pending.get("sample_ply_offset", 0)),
                                 max_moves=max_moves,
                                 num_simulations=search_simulations,
                                 c_puct=search_c_puct,
@@ -6143,6 +6165,7 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
                 matchup_id=matchup_id,
                 games_to_add=games,
                 seed_base=base_seed + (matchup_index * 1_000_000),
+                sample_every_n_plies=sample_every_n_plies,
             )
     
             def _update_benchmatch_progress(completed_game_id: str) -> None:
@@ -6450,12 +6473,13 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
                                     break
                                 pending = pending_queue.pop(0)
                                 job.logger.info(
-                                    "dataset game scheduled | matchup=%s | game=%s/%s | seed=%s | starter=%s | mode=parallel",
+                                    "dataset game scheduled | matchup=%s | game=%s/%s | seed=%s | starter=%s | sample_offset=%s | mode=parallel",
                                     matchup_id,
                                     pending["game_no"],
                                     games,
                                     pending["seed"],
                                     pending["starter"],
+                                    pending.get("sample_ply_offset", 0),
                                 )
                                 future = executor.submit(
                                     _play_and_sample_game_from_specs,
@@ -6466,6 +6490,7 @@ def run_dataset_generation(job: JobContext) -> dict[str, object]:
                                     seed=int(pending["seed"]),
                                     starter=int(pending["starter"]),
                                     sample_every_n_plies=sample_every_n_plies,
+                                    sample_ply_offset=int(pending.get("sample_ply_offset", 0)),
                                     max_moves=max_moves,
                                     models_root=str(job.paths.models_root),
                                     model_agent_device=model_agent_device,
