@@ -4768,6 +4768,22 @@ cells = [
             if (not eval_summary) and resolved_eval_job_id:
                 eval_summary, eval_job_dir = _read_job_summary(str(resolved_eval_job_id), 'evaluation_summary.json')
             registry_row = _load_model_registry_record(model_id)
+            if not eval_summary:
+                eval_summary_path = Path(str(registry_row.get('evaluation_summary_path', '')).strip())
+                if eval_summary_path.exists():
+                    eval_summary = _load_json_dict(eval_summary_path, default={})
+                    if eval_summary:
+                        eval_job_dir = eval_summary_path.parent
+                if not eval_summary:
+                    model_card_path = Path(str(registry_row.get('model_card_path', '')).strip())
+                    model_card = _load_json_dict(model_card_path, default={}) if model_card_path.exists() else {}
+                    model_card_eval_path = Path(str(model_card.get('evaluation_summary_path', '')).strip())
+                    if model_card_eval_path.exists():
+                        eval_summary = _load_json_dict(model_card_eval_path, default={})
+                        if eval_summary:
+                            eval_job_dir = model_card_eval_path.parent
+            if eval_summary and not str(eval_summary.get('job_id', '')).strip():
+                eval_summary['job_id'] = str(resolved_eval_job_id or eval_job_id or '<none>')
             promoted = _load_promoted_best_metadata()
             benchmark_row = _load_latest_benchmark_for_model(model_id)
             promoted_model_id = str(promoted.get('model_id', '')).strip()

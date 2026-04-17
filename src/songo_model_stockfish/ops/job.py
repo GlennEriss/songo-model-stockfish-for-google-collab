@@ -514,6 +514,23 @@ class JobContext:
             self._runtime_backup_state_dirty = False
         self._write_worker_checkpoint_firestore(status_payload=None, state_payload=payload, force=False)
 
+    def write_artifact_json(
+        self,
+        relative_name: str,
+        payload: dict[str, Any],
+        *,
+        ensure_ascii: bool = True,
+        indent: int = 2,
+    ) -> Path:
+        rel = str(relative_name or "").strip().lstrip("/\\")
+        if not rel:
+            raise ValueError("relative_name vide pour write_artifact_json")
+        target_path = self.job_dir / rel
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        write_json_atomic(target_path, payload, ensure_ascii=ensure_ascii, indent=indent)
+        self._write_backup_json(rel, payload)
+        return target_path
+
     def set_phase(self, phase: str) -> None:
         current = read_json_dict(self.status_path, default={})
         current.update({"phase": phase, "updated_at": utc_now_iso()})

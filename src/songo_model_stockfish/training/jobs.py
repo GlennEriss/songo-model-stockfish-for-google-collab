@@ -1113,7 +1113,7 @@ def run_train(job: JobContext) -> dict[str, object]:
         "best_checkpoint_path": str(best_checkpoint_path),
         "history": history,
     }
-    _write_json(job.job_dir / "training_summary.json", training_summary)
+    job.write_artifact_json("training_summary.json", training_summary, ensure_ascii=True, indent=2)
 
     model_card = {
         "model_id": model_id,

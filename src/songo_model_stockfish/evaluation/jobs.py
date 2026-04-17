@@ -434,7 +434,7 @@ def run_evaluation(job: JobContext) -> dict[str, object]:
     report_path = output_dir / f"{model_id}_evaluation_summary.json"
     _write_json(report_path, summary)
     summary["evaluation_summary_path"] = str(report_path)
-    _write_json(job.job_dir / "evaluation_summary.json", summary)
+    job.write_artifact_json("evaluation_summary.json", summary, ensure_ascii=True, indent=2)
     _update_model_card_after_evaluation(job.paths.models_root, model_id, summary)
     registry = load_registry(job.paths.models_root)
     existing = next((item for item in registry.get("models", []) if str(item.get("model_id")) == model_id), {})
