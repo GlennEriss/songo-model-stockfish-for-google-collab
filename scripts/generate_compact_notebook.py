@@ -4229,6 +4229,74 @@ cells = [
         print('anomalies.nan_features =', nan_count)
         print('anomalies.inf_features =', inf_count)
 
+        print('')
+        print('=== Diagnostic First/Second Player (dataset) ===')
+        if x.ndim == 2 and int(x.shape[1]) >= 17 and total > 0:
+            # encode_raw_state: [board(14), player_to_move(1), south_score(1), north_score(1)]
+            player_to_move = x[:, 14].astype(np.float32)
+            south_mask = player_to_move < 0.5
+            north_mask = np.logical_not(south_mask)
+            south_count = int(np.sum(south_mask))
+            north_count = int(np.sum(north_mask))
+            south_ratio = float(south_count / total) if total > 0 else 0.0
+            north_ratio = float(north_count / total) if total > 0 else 0.0
+            print('samples_south_to_move  =', south_count, f'({south_ratio:.4f})')
+            print('samples_north_to_move  =', north_count, f'({north_ratio:.4f})')
+            print('side_imbalance_abs     =', round(abs(south_ratio - north_ratio), 6))
+
+            south_scores = x[:, 15].astype(np.float32)
+            north_scores = x[:, 16].astype(np.float32)
+            score_sum = south_scores + north_scores
+            opening_mask = score_sum <= 2.0  # proxy debut de partie
+            opening_total = int(np.sum(opening_mask))
+            opening_south = int(np.sum(np.logical_and(opening_mask, south_mask)))
+            opening_north = int(np.sum(np.logical_and(opening_mask, north_mask)))
+            print('opening_proxy_samples  =', opening_total)
+            print('opening_proxy_south    =', opening_south)
+            print('opening_proxy_north    =', opening_north)
+
+            def _side_stats(mask: np.ndarray) -> dict[str, object]:
+                count = int(np.sum(mask))
+                if count <= 0:
+                    return {
+                        'count': 0,
+                        'value_mean': 0.0,
+                        'value_std': 0.0,
+                        'policy_conf_mean': 0.0,
+                        'top1_hist': {str(move): 0 for move in range(1, 8)},
+                    }
+                side_values = value_target[mask].astype(np.float32)
+                side_policy = policy_target_full[mask].astype(np.float32)
+                top1 = np.argmax(side_policy, axis=1) + 1
+                top1_hist = {str(move): int(np.sum(top1 == move)) for move in range(1, 8)}
+                top1_prob = np.max(side_policy, axis=1)
+                return {
+                    'count': count,
+                    'value_mean': float(np.mean(side_values)),
+                    'value_std': float(np.std(side_values)),
+                    'policy_conf_mean': float(np.mean(top1_prob)),
+                    'top1_hist': top1_hist,
+                }
+
+            south_stats = _side_stats(south_mask)
+            north_stats = _side_stats(north_mask)
+            print('south.value_mean/std   =', round(float(south_stats['value_mean']), 6), '/', round(float(south_stats['value_std']), 6))
+            print('north.value_mean/std   =', round(float(north_stats['value_mean']), 6), '/', round(float(north_stats['value_std']), 6))
+            print('south.policy_conf_mean =', round(float(south_stats['policy_conf_mean']), 6))
+            print('north.policy_conf_mean =', round(float(north_stats['policy_conf_mean']), 6))
+            print('south.top1_move_hist   =', south_stats['top1_hist'])
+            print('north.top1_move_hist   =', north_stats['top1_hist'])
+
+            if abs(south_ratio - north_ratio) >= 0.15:
+                print('warning.side_imbalance = important (>= 15%)')
+            else:
+                print('warning.side_imbalance = non (distribution plutot equilibree)')
+        else:
+            print(
+                'Diagnostic indisponible: input_dim < 17 ou dataset vide '
+                f'(input_dim={(int(x.shape[1]) if x.ndim == 2 else 0)}, total={total}).'
+            )
+
         if total <= 0:
             raise ValueError(f'Dataset vide pour split={split_name}: {npz_path}')
 
@@ -5976,6 +6044,135 @@ cells = [
     code(
         """
         !bash -lc "cd $WORKTREE && PYTHONPATH=$WORKTREE/src $PYTHON_BIN -m songo_model_stockfish.cli.main benchmark --config $BENCHMARK_CONFIG_ACTIVE --job-id $BENCHMARK_JOB_ID"
+        """
+    ),
+    code(
+        """
+        # Diagnostic first/second player (dernier benchmark)
+        import json
+        from pathlib import Path
+
+        def _bench_job_prefix(job_id: str) -> str:
+            text = str(job_id or '').strip()
+            if not text:
+                return text
+            parts = text.rsplit('_', 1)
+            if len(parts) == 2 and parts[1].isdigit():
+                return parts[0]
+            return text
+
+        def _load_json_dict(path: Path) -> dict:
+            if not path.exists():
+                return {}
+            try:
+                payload = json.loads(path.read_text(encoding='utf-8'))
+            except Exception:
+                return {}
+            return payload if isinstance(payload, dict) else {}
+
+        def _is_backup_jobs_root(path: Path) -> bool:
+            text = str(path).replace('\\\\', '/')
+            return '/runtime_backup/jobs' in text
+
+        roots = []
+        for raw in [
+            str(JOBS_ROOT),
+            str(globals().get('RUNTIME_HYBRID_BACKUP_JOBS_ROOT', '')).strip(),
+            '/content/songo-stockfish-runtime/jobs',
+            '/content/drive/MyDrive/songo-stockfish/jobs',
+        ]:
+            text = str(raw or '').strip()
+            if not text:
+                continue
+            root = Path(text)
+            if root not in roots:
+                roots.append(root)
+
+        requested_job_id = str(BENCHMARK_JOB_ID).strip()
+        prefix = _bench_job_prefix(requested_job_id)
+        candidates = []
+        for root in roots:
+            if not root.exists():
+                continue
+            for path in root.iterdir():
+                if not path.is_dir():
+                    continue
+                name = path.name
+                if not (
+                    name == requested_job_id
+                    or name == prefix
+                    or (prefix and name.startswith(prefix + '_'))
+                ):
+                    continue
+                summary_path = path / 'benchmark' / 'benchmark_summary.json'
+                if not summary_path.exists():
+                    continue
+                candidates.append(
+                    {
+                        'job_dir': path,
+                        'summary_path': summary_path,
+                        'mtime': float(summary_path.stat().st_mtime),
+                        'is_backup': _is_backup_jobs_root(path),
+                    }
+                )
+
+        if not candidates:
+            print('Aucun benchmark summary trouve pour', requested_job_id)
+        else:
+            candidates = sorted(
+                candidates,
+                key=lambda item: (
+                    not bool(item.get('is_backup', False)),
+                    float(item.get('mtime', 0.0)),
+                ),
+                reverse=True,
+            )
+            best = candidates[0]
+            summary = _load_json_dict(Path(str(best['summary_path'])))
+            print('=== Benchmark First/Second Diagnostic ===')
+            print('job_dir              =', best['job_dir'])
+            print('summary_path         =', best['summary_path'])
+            print('job_id               =', summary.get('job_id', '<none>'))
+            print('engine               =', summary.get('engine', '<none>'))
+            print('benchmark_score      =', summary.get('benchmark_score', '<none>'))
+            print('benchmark_weighted   =', summary.get('benchmark_score_weighted', '<none>'))
+            print('benchmark_elo        =', summary.get('benchmark_elo_estimate', '<none>'))
+
+            matchups = summary.get('matchups', [])
+            if not isinstance(matchups, list) or not matchups:
+                print('Aucun matchup detaille dans le summary.')
+            else:
+                for row in matchups:
+                    if not isinstance(row, dict):
+                        continue
+                    opp = str(row.get('opponent', '<none>'))
+                    as_first = row.get('as_first_player', {}) if isinstance(row.get('as_first_player', {}), dict) else {}
+                    as_second = row.get('as_second_player', {}) if isinstance(row.get('as_second_player', {}), dict) else {}
+                    side_diag = row.get('side_diagnostics', {}) if isinstance(row.get('side_diagnostics', {}), dict) else {}
+                    first_diag = row.get('first_player_diagnostics', {}) if isinstance(row.get('first_player_diagnostics', {}), dict) else {}
+                    second_diag = row.get('second_player_diagnostics', {}) if isinstance(row.get('second_player_diagnostics', {}), dict) else {}
+
+                    first_winrate = float(as_first.get('winrate', 0.0) or 0.0)
+                    second_winrate = float(as_second.get('winrate', 0.0) or 0.0)
+                    gap = float(side_diag.get('winrate_gap_second_minus_first', second_winrate - first_winrate) or 0.0)
+                    opening_hist = first_diag.get('opening_move_hist', {})
+                    reply_hist = second_diag.get('first_reply_move_hist', {})
+                    top_lines = first_diag.get('top_opening_lines', [])
+                    top_lines_short = top_lines[:3] if isinstance(top_lines, list) else []
+
+                    print('-' * 120)
+                    print('matchup               =', opp)
+                    print('as_first_winrate      =', round(first_winrate, 6))
+                    print('as_second_winrate     =', round(second_winrate, 6))
+                    print('gap(second-first)     =', round(gap, 6))
+                    print('first_opening_hist    =', opening_hist if isinstance(opening_hist, dict) else {})
+                    print('first_opening_top3    =', top_lines_short)
+                    print('second_reply_hist     =', reply_hist if isinstance(reply_hist, dict) else {})
+                    if abs(gap) >= 0.25:
+                        print('warning.side_gap      = important (|gap| >= 0.25)')
+                    else:
+                        print('warning.side_gap      = non')
+                print('-' * 120)
         """
     ),
     md("## 9. Tournoi Inter-Modeles (3/1/0)"),

@@ -24,6 +24,9 @@ class MatchResult:
     scores: tuple[int, int]
     think_ms: tuple[float, float]
     choose_fallbacks: tuple[int, int]
+    opening_plies: tuple[int, ...]
+    first_move_agent_a: int | None
+    first_move_agent_b: int | None
     reason: str
     starter: int
 
@@ -32,6 +35,7 @@ class MatchResult:
         payload["scores"] = list(self.scores)
         payload["think_ms"] = list(self.think_ms)
         payload["choose_fallbacks"] = list(self.choose_fallbacks)
+        payload["opening_plies"] = list(self.opening_plies)
         return payload
 
 
@@ -41,6 +45,8 @@ def play_match(agent_a: AgentLike, agent_b: AgentLike, *, max_moves: int = 300, 
     agents = [agent_a, agent_b] if starter == 0 else [agent_b, agent_a]
     moves = 0
     end_reason = "finished"
+    move_history: list[int] = []
+    first_move_by_logical_agent: dict[int, int | None] = {0: None, 1: None}
 
     while not songo_ai_game.is_terminal(state) and moves < max_moves:
         legal = songo_ai_game.legal_moves(state)
@@ -65,6 +71,11 @@ def play_match(agent_a: AgentLike, agent_b: AgentLike, *, max_moves: int = 300, 
                 f"player={player} | starter={starter} | agent={agents[player].display_name} | "
                 f"move={move} | legal={legal}"
             )
+        move_int = int(move)
+        move_history.append(move_int)
+        logical_agent = int(player) if int(starter) == 0 else int(1 - int(player))
+        if first_move_by_logical_agent.get(logical_agent) is None:
+            first_move_by_logical_agent[logical_agent] = move_int
         state = songo_ai_game.simulate_move(state, move)
         moves += 1
 
@@ -85,6 +96,9 @@ def play_match(agent_a: AgentLike, agent_b: AgentLike, *, max_moves: int = 300, 
         scores=songo_ai_game.scores(state),
         think_ms=(round(think[0], 2), round(think[1], 2)),
         choose_fallbacks=(0, 0),
+        opening_plies=tuple(int(m) for m in move_history[:8]),
+        first_move_agent_a=(None if first_move_by_logical_agent.get(0) is None else int(first_move_by_logical_agent[0])),
+        first_move_agent_b=(None if first_move_by_logical_agent.get(1) is None else int(first_move_by_logical_agent[1])),
         reason="finished" if songo_ai_game.is_terminal(state) else (end_reason if end_reason != "finished" else f"max_moves_reached:{max_moves}"),
         starter=starter,
     )

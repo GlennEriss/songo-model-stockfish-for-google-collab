@@ -124,6 +124,30 @@ def _record_by_role(stats: dict[str, int], winner: object) -> None:
         stats["draws"] += 1
 
 
+def _record_wld(stats: dict[str, int], winner: object) -> None:
+    if winner == 0:
+        stats["wins"] += 1
+    elif winner == 1:
+        stats["losses"] += 1
+    else:
+        stats["draws"] += 1
+
+
+def _with_rates(stats: dict[str, int]) -> dict[str, object]:
+    games = int(stats.get("games", 0))
+    wins = int(stats.get("wins", 0))
+    draws = int(stats.get("draws", 0))
+    payload: dict[str, object] = {
+        "games": games,
+        "wins": wins,
+        "losses": int(stats.get("losses", 0)),
+        "draws": draws,
+    }
+    payload["winrate"] = (wins / games) if games > 0 else 0.0
+    payload["score_rate"] = ((wins + (0.5 * draws)) / games) if games > 0 else 0.0
+    return payload
+
+
 def _compute_weighted_benchmark_score(matchups: list[dict[str, object]]) -> float:
     if not matchups:
         return 0.0
@@ -281,6 +305,17 @@ def run_benchmark_job(job: JobContext) -> dict[str, object]:
         as_second = {"wins": 0, "losses": 0, "draws": 0}
         as_first_choose_fallbacks_target = 0
         as_second_choose_fallbacks_target = 0
+        first_player_opening_move_hist = {str(move): 0 for move in range(1, 8)}
+        first_player_opening_move_wld = {
+            str(move): {"games": 0, "wins": 0, "losses": 0, "draws": 0}
+            for move in range(1, 8)
+        }
+        first_player_opening_lines: dict[str, int] = {}
+        second_player_first_reply_hist = {str(move): 0 for move in range(1, 8)}
+        second_player_first_reply_wld = {
+            str(move): {"games": 0, "wins": 0, "losses": 0, "draws": 0}
+            for move in range(1, 8)
+        }
         game_results: dict[int, dict[str, object]] = {}
         pending_game_indices: list[int] = []
         for game_index in range(games):
@@ -429,9 +464,51 @@ def run_benchmark_job(job: JobContext) -> dict[str, object]:
             if int(game_payload.get("starter", starter)) == 0:
                 _record_by_role(as_first, winner)
                 as_first_choose_fallbacks_target += target_fallbacks
+                opening_move = game_payload.get("first_move_agent_a")
+                try:
+                    opening_move_int = int(opening_move)
+                except Exception:
+                    opening_move_int = 0
+                if 1 <= opening_move_int <= 7:
+                    key = str(opening_move_int)
+                    first_player_opening_move_hist[key] = int(first_player_opening_move_hist.get(key, 0)) + 1
+                    move_stats = first_player_opening_move_wld.setdefault(
+                        key,
+                        {"games": 0, "wins": 0, "losses": 0, "draws": 0},
+                    )
+                    move_stats["games"] = int(move_stats.get("games", 0)) + 1
+                    _record_wld(move_stats, winner)
+
+                opening_plies = game_payload.get("opening_plies", [])
+                if isinstance(opening_plies, (list, tuple)):
+                    normalized = []
+                    for move in opening_plies[:4]:
+                        try:
+                            move_int = int(move)
+                        except Exception:
+                            continue
+                        if 1 <= move_int <= 7:
+                            normalized.append(str(move_int))
+                    if normalized:
+                        line_key = "-".join(normalized)
+                        first_player_opening_lines[line_key] = int(first_player_opening_lines.get(line_key, 0)) + 1
             else:
                 _record_by_role(as_second, winner)
                 as_second_choose_fallbacks_target += target_fallbacks
+                first_reply = game_payload.get("first_move_agent_a")
+                try:
+                    first_reply_int = int(first_reply)
+                except Exception:
+                    first_reply_int = 0
+                if 1 <= first_reply_int <= 7:
+                    key = str(first_reply_int)
+                    second_player_first_reply_hist[key] = int(second_player_first_reply_hist.get(key, 0)) + 1
+                    reply_stats = second_player_first_reply_wld.setdefault(
+                        key,
+                        {"games": 0, "wins": 0, "losses": 0, "draws": 0},
+                    )
+                    reply_stats["games"] = int(reply_stats.get("games", 0)) + 1
+                    _record_wld(reply_stats, winner)
             total_moves += int(game_payload["moves"])
             winner_label = _winner_label(winner, target_agent.display_name, opponent.display_name)
             job.logger.info(
@@ -447,6 +524,28 @@ def run_benchmark_job(job: JobContext) -> dict[str, object]:
                 target_fallbacks,
                 opponent_fallbacks,
             )
+
+        top_first_openings = sorted(
+            first_player_opening_lines.items(),
+            key=lambda item: int(item[1]),
+            reverse=True,
+        )[:10]
+        first_side_games = int(sum(as_first.values()))
+        second_side_games = int(sum(as_second.values()))
+        first_side_winrate = (int(as_first.get("wins", 0)) / first_side_games) if first_side_games > 0 else 0.0
+        second_side_winrate = (int(as_second.get("wins", 0)) / second_side_games) if second_side_games > 0 else 0.0
+        side_gap = second_side_winrate - first_side_winrate
+        job.logger.info(
+            "benchmark first-player diagnostic | matchup=%s | first_games=%s | second_games=%s | first_winrate=%.4f | second_winrate=%.4f | side_gap(second-first)=%.4f | first_move_hist=%s | second_reply_hist=%s",
+            matchup_key,
+            first_side_games,
+            second_side_games,
+            first_side_winrate,
+            second_side_winrate,
+            side_gap,
+            first_player_opening_move_hist,
+            second_player_first_reply_hist,
+        )
         payload = {
             "opponent": str(opponent_spec),
             "engine": target_agent.display_name,
@@ -474,6 +573,31 @@ def run_benchmark_job(job: JobContext) -> dict[str, object]:
                 "games": sum(as_second.values()),
                 "winrate": (as_second["wins"] / sum(as_second.values())) if sum(as_second.values()) else 0.0,
                 "score_rate": ((as_second["wins"] + 0.5 * as_second["draws"]) / sum(as_second.values())) if sum(as_second.values()) else 0.0,
+            },
+            "first_player_diagnostics": {
+                "opening_move_hist": {key: int(value) for key, value in first_player_opening_move_hist.items()},
+                "opening_move_stats": {
+                    key: _with_rates(stats)
+                    for key, stats in first_player_opening_move_wld.items()
+                },
+                "top_opening_lines": [
+                    {"line": str(line), "games": int(count)}
+                    for line, count in top_first_openings
+                ],
+            },
+            "second_player_diagnostics": {
+                "first_reply_move_hist": {key: int(value) for key, value in second_player_first_reply_hist.items()},
+                "first_reply_move_stats": {
+                    key: _with_rates(stats)
+                    for key, stats in second_player_first_reply_wld.items()
+                },
+            },
+            "side_diagnostics": {
+                "first_player_games": int(first_side_games),
+                "second_player_games": int(second_side_games),
+                "first_player_winrate": float(first_side_winrate),
+                "second_player_winrate": float(second_side_winrate),
+                "winrate_gap_second_minus_first": float(side_gap),
             },
         }
         _write_json(benchmark_dir / f"{matchup_key}_summary.json", payload)
