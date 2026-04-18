@@ -1305,12 +1305,33 @@ cells = [
                 return 9
 
             unique_candidates = sorted(unique_candidates, key=lambda p: (_candidate_priority(p), len(p.parts), str(p)))
-
-            selected = []
-            for candidate in unique_candidates:
-                if any(_path_within(candidate, parent) for parent in selected):
-                    continue
-                selected.append(candidate)
+            # Optimisation: en depth=0 (cas par defaut), il n'y a pas de relation parent/enfant
+            # entre candidats roots; on evite donc la verification couteuse O(n^2).
+            if max_depth == 0 and not explicit_targets:
+                selected = list(unique_candidates)
+            else:
+                selected = []
+                selected_dir_prefixes = []
+                for idx, candidate in enumerate(unique_candidates, start=1):
+                    candidate_text = str(candidate)
+                    skip_child = False
+                    for parent_prefix in selected_dir_prefixes:
+                        if candidate_text.startswith(parent_prefix):
+                            skip_child = True
+                            break
+                    if skip_child:
+                        continue
+                    selected.append(candidate)
+                    try:
+                        if candidate.is_dir():
+                            selected_dir_prefixes.append(candidate_text.rstrip('/') + '/')
+                    except Exception:
+                        pass
+                    if idx % 2000 == 0:
+                        print(
+                            '[cleanup_external_artifacts_targeted] '
+                            f'selecting={idx}/{len(unique_candidates)} | kept={len(selected)}'
+                        )
             report['matched'] = [str(p) for p in selected]
             print(
                 '[cleanup_external_artifacts_targeted] '
@@ -1318,6 +1339,10 @@ cells = [
             )
 
             processed_count = 0
+            print(
+                '[cleanup_external_artifacts_targeted] '
+                f'move_start | limit={move_max} | total_selected={len(selected)}'
+            )
             for src in selected:
                 if processed_count >= move_max:
                     report['skipped'].append(
