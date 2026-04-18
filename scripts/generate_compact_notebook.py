@@ -62,9 +62,13 @@ cells = [
 
         GIT_REPO_URL = 'https://github.com/GlennEriss/songo-model-stockfish-for-google-collab.git'
         GIT_BRANCH = 'main'
-        PROJECT_NAME = 'songo-model-stockfish-for-google-collab'
-        DRIVE_ROOT = '/content/drive/MyDrive/songo-stockfish'
-        DEFAULT_WORKTREE = f'/content/{PROJECT_NAME}'
+        # REPO_NAME / WORKTREE = dossier code local VM Colab (ephemere).
+        REPO_NAME = 'songo-model-stockfish-for-google-collab'
+        # DRIVE_PROJECT_NAME / DRIVE_ROOT = dossier persistant Google Drive.
+        DRIVE_PROJECT_NAME = 'songo-stockfish'
+        PROJECT_NAME = REPO_NAME  # compat notebook existant
+        DRIVE_ROOT = f'/content/drive/MyDrive/{DRIVE_PROJECT_NAME}'
+        DEFAULT_WORKTREE = f'/content/{REPO_NAME}'
 
         WORKTREE = os.environ.get('WORKTREE', DEFAULT_WORKTREE)
         PYTHON_BIN = sys.executable or 'python3'
@@ -93,9 +97,12 @@ cells = [
         subprocess.run([PYTHON_BIN, '-m', 'pip', 'install', '--upgrade', 'pip'], check=True)
         subprocess.run([PYTHON_BIN, '-m', 'pip', 'install', '-r', f'{WORKTREE}/requirements.txt'], check=True)
 
-        print('DRIVE_ROOT =', DRIVE_ROOT)
-        print('WORKTREE   =', WORKTREE)
-        print('PYTHON_BIN =', PYTHON_BIN)
+        print('REPO_NAME          =', REPO_NAME)
+        print('DRIVE_PROJECT_NAME =', DRIVE_PROJECT_NAME)
+        print('DRIVE_ROOT         =', DRIVE_ROOT)
+        print('WORKTREE           =', WORKTREE)
+        print('PYTHON_BIN         =', PYTHON_BIN)
+        print('Note: WORKTREE (VM) != DRIVE_ROOT (Drive persistant)')
         print('Repo et dependances prets')
         """
     ),
@@ -1095,6 +1102,11 @@ cells = [
         STORAGE_CLEANUP_ALLOW_MODEL_PURGE = False  # Double garde-fou explicite
         STORAGE_CLEANUP_KEEP_MODEL_ID = 'songo_policy_value_colab_pro_v12'
         STORAGE_CLEANUP_HEARTBEAT_SECONDS = 20
+        STORAGE_CLEANUP_STEP_TIMEOUT_SECONDS = 1800
+        STORAGE_CLEANUP_EXTERNAL_SCAN_MAX_SECONDS = 300
+        STORAGE_CLEANUP_EXTERNAL_SCAN_MAX_DEPTH = 6
+        STORAGE_CLEANUP_EXTERNAL_FORCE_FULL_SCAN = False
+        STORAGE_CLEANUP_EXTERNAL_MOVE_MAX_ITEMS = 500
         STORAGE_CLEANUP_CONFIG_PATH = str(
             globals().get(
                 'TRAIN_CONTINUE_CONFIG_ACTIVE_PATH',
@@ -1104,6 +1116,12 @@ cells = [
 
         env = dict(os.environ)
         env['PYTHONPATH'] = str(Path(WORKTREE) / 'src')
+        env['SONGO_EXTERNAL_ARTIFACT_SCAN_MAX_SECONDS'] = str(float(STORAGE_CLEANUP_EXTERNAL_SCAN_MAX_SECONDS))
+        env['SONGO_EXTERNAL_ARTIFACT_SCAN_MAX_DEPTH'] = str(int(STORAGE_CLEANUP_EXTERNAL_SCAN_MAX_DEPTH))
+        env['SONGO_EXTERNAL_ARTIFACT_FORCE_FULL_SCAN'] = (
+            '1' if bool(STORAGE_CLEANUP_EXTERNAL_FORCE_FULL_SCAN) else '0'
+        )
+        env['SONGO_EXTERNAL_ARTIFACT_MOVE_MAX_ITEMS'] = str(int(STORAGE_CLEANUP_EXTERNAL_MOVE_MAX_ITEMS))
 
         def _parse_json_payload(raw_text):
             text = str(raw_text or '').strip()
@@ -1136,7 +1154,7 @@ cells = [
                 cmd.append('--apply')
             return cmd
 
-        def _run_cleanup_step(step_name, extra_args):
+        def _run_cleanup_step(step_name, extra_args, *, timeout_seconds=None, continue_on_timeout=False):
             cmd = _build_cleanup_cmd(extra_args)
             print(f'\\n=== {step_name} ===')
             print('command =', cmd)
@@ -1152,6 +1170,7 @@ cells = [
             )
             heartbeat = max(5, int(STORAGE_CLEANUP_HEARTBEAT_SECONDS))
             last_beat = started
+            timed_out = False
             while proc.poll() is None:
                 now = time.time()
                 if now - last_beat >= heartbeat:
@@ -1160,6 +1179,18 @@ cells = [
                         f'{int(now - started)}s | dry_run={STORAGE_CLEANUP_DRY_RUN}'
                     )
                     last_beat = now
+                if timeout_seconds is not None and (now - started) >= float(timeout_seconds):
+                    timed_out = True
+                    print(
+                        f'[{step_name}] timeout atteint ({int(timeout_seconds)}s): '
+                        'arret du process pour eviter un blocage infini.'
+                    )
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=20)
+                    except Exception:
+                        proc.kill()
+                    break
                 time.sleep(1.0)
             return_code = int(proc.wait())
             stdout_text = ''
@@ -1169,6 +1200,18 @@ cells = [
                 except Exception:
                     stdout_text = ''
             print(f'[{step_name}] log_file = {log_path}')
+            if timed_out:
+                print(f'[{step_name}] timeout | returncode={return_code}')
+                if continue_on_timeout:
+                    return {
+                        '_step_status': 'timeout',
+                        '_step_name': step_name,
+                        '_return_code': return_code,
+                        '_log_file': str(log_path),
+                    }
+                raise RuntimeError(
+                    f'{step_name} interrompu apres timeout={int(timeout_seconds)}s (voir {log_path})'
+                )
             if return_code != 0:
                 print(f'[{step_name}] echec | returncode={return_code}')
                 if stdout_text and stdout_text.strip():
@@ -1182,6 +1225,12 @@ cells = [
             return report
 
         def _print_external_summary(report):
+            if str(report.get('_step_status', '')).strip().lower() == 'timeout':
+                print('External artifacts summary:')
+                print('  status  = timeout')
+                print('  note    = relance la cellule, ou augmente STORAGE_CLEANUP_STEP_TIMEOUT_SECONDS')
+                print('  log_file =', report.get('_log_file', '<none>'))
+                return
             step = dict(report.get('steps', {}).get('external_artifacts_cleanup', {}) or {})
             moved = list(step.get('moved', []) or [])
             skipped = list(step.get('skipped', []) or [])
@@ -1190,6 +1239,10 @@ cells = [
             print('  moved   =', len(moved))
             print('  skipped =', len(skipped))
             print('  errors  =', len(errors))
+            print('  scan_entries   =', step.get('scan_entries', 0))
+            print('  selected_items =', step.get('selected_candidates', 0))
+            print('  scan_truncated =', bool(step.get('scan_truncated', False)))
+            print('  move_truncated =', bool(step.get('move_truncated', False)))
             for item in moved[:10]:
                 if isinstance(item, dict):
                     print('   -', item.get('src', '<none>'), '=>', item.get('dst', '<none>'))
@@ -1215,6 +1268,11 @@ cells = [
         print('  dry_run              =', STORAGE_CLEANUP_DRY_RUN)
         print('  scope                =', STORAGE_CLEANUP_SCOPE)
         print('  heartbeat_seconds    =', STORAGE_CLEANUP_HEARTBEAT_SECONDS)
+        print('  step_timeout_seconds =', STORAGE_CLEANUP_STEP_TIMEOUT_SECONDS)
+        print('  external_scan_max_s  =', STORAGE_CLEANUP_EXTERNAL_SCAN_MAX_SECONDS)
+        print('  external_scan_depth  =', STORAGE_CLEANUP_EXTERNAL_SCAN_MAX_DEPTH)
+        print('  external_force_full  =', STORAGE_CLEANUP_EXTERNAL_FORCE_FULL_SCAN)
+        print('  external_move_max    =', STORAGE_CLEANUP_EXTERNAL_MOVE_MAX_ITEMS)
         print('  purge_models         =', STORAGE_CLEANUP_PURGE_MODELS)
         print('  allow_model_purge    =', STORAGE_CLEANUP_ALLOW_MODEL_PURGE)
         print('  keep_model_id        =', STORAGE_CLEANUP_KEEP_MODEL_ID)
@@ -1225,7 +1283,12 @@ cells = [
             raise ValueError(f'STORAGE_CLEANUP_SCOPE invalide: {STORAGE_CLEANUP_SCOPE}')
 
         # Etape 1: corriger les artefacts externes (hors songo-stockfish).
-        external_report = _run_cleanup_step('cleanup_external_artifacts', ['--fix-external-artifacts'])
+        external_report = _run_cleanup_step(
+            'cleanup_external_artifacts',
+            ['--fix-external-artifacts'],
+            timeout_seconds=float(STORAGE_CLEANUP_STEP_TIMEOUT_SECONDS),
+            continue_on_timeout=True,
+        )
         _print_external_summary(external_report)
 
         # Etape 2: purge non critique.
@@ -1238,7 +1301,11 @@ cells = [
                 '--purge-pipeline-manifests',
                 '--purge-completed-job-dirs',
             ]
-            safe_report = _run_cleanup_step('cleanup_safe_noncritical', safe_args)
+            safe_report = _run_cleanup_step(
+                'cleanup_safe_noncritical',
+                safe_args,
+                timeout_seconds=float(STORAGE_CLEANUP_STEP_TIMEOUT_SECONDS),
+            )
             _print_safe_summary(safe_report)
 
         if scope_value == 'full':
@@ -1266,7 +1333,11 @@ cells = [
                         '0',
                     ]
                 )
-            full_report = _run_cleanup_step('cleanup_full', full_args)
+            full_report = _run_cleanup_step(
+                'cleanup_full',
+                full_args,
+                timeout_seconds=float(STORAGE_CLEANUP_STEP_TIMEOUT_SECONDS),
+            )
             print('Full cleanup summary keys =', list(dict(full_report.get('steps', {}) or {}).keys()))
 
         print('\\nMaintenance hebdo terminee.')

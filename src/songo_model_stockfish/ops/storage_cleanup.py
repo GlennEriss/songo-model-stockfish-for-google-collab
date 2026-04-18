@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import os
 import json
 import re
 import shutil
+import sys
 import time
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -179,11 +182,33 @@ def _cleanup_external_drive_artifacts(*, drive_root: Path, apply: bool, now_epoc
         "moved": [],
         "skipped": [],
         "errors": [],
+        "scan_entries": 0,
+        "scan_candidates": 0,
+        "scan_truncated": False,
+        "move_truncated": False,
     }
     if not mydrive_root.exists():
         return step
     session_root = recovered_root / str(int(now_ts))
     known_file_names = {"_dataset_source_metadata.json", "bench_models_20m_global.json"}
+    scan_max_depth = max(1, _as_int(os.environ.get("SONGO_EXTERNAL_ARTIFACT_SCAN_MAX_DEPTH", "6"), 6))
+    scan_max_seconds = max(30.0, _as_float(os.environ.get("SONGO_EXTERNAL_ARTIFACT_SCAN_MAX_SECONDS", "300"), 300.0))
+    force_full_scan = _as_bool(os.environ.get("SONGO_EXTERNAL_ARTIFACT_FORCE_FULL_SCAN", "0"), default=False)
+    scan_progress_every = max(
+        500,
+        _as_int(os.environ.get("SONGO_EXTERNAL_ARTIFACT_SCAN_PROGRESS_EVERY", "20000"), 20000),
+    )
+    move_progress_every = max(
+        10,
+        _as_int(os.environ.get("SONGO_EXTERNAL_ARTIFACT_MOVE_PROGRESS_EVERY", "100"), 100),
+    )
+    move_max_items = max(0, _as_int(os.environ.get("SONGO_EXTERNAL_ARTIFACT_MOVE_MAX_ITEMS", "0"), 0))
+    step["scan_max_depth"] = int(scan_max_depth)
+    step["scan_max_seconds"] = float(scan_max_seconds)
+    step["scan_force_full"] = bool(force_full_scan)
+    step["scan_progress_every"] = int(scan_progress_every)
+    step["move_progress_every"] = int(move_progress_every)
+    step["move_max_items"] = int(move_max_items)
 
     def _is_suspicious_path(path: Path) -> bool:
         name = path.name
@@ -196,6 +221,26 @@ def _cleanup_external_drive_artifacts(*, drive_root: Path, apply: bool, now_epoc
         if name.startswith("bench_models_") and name.endswith(".json"):
             return True
         return False
+
+    def _is_interesting_dir_name(name: str) -> bool:
+        text = str(name or "").strip().lower()
+        if not text:
+            return False
+        if text.startswith(".quarantine_"):
+            return True
+        interesting_tokens = (
+            "songo",
+            "stockfish",
+            "runtime",
+            "benchmark",
+            "dataset",
+            "model",
+            "train",
+            "eval",
+            "jobs",
+            "logs",
+        )
+        return any(token in text for token in interesting_tokens)
 
     def _resolve_available_target(path: Path) -> Path:
         if not path.exists():
@@ -219,15 +264,68 @@ def _cleanup_external_drive_artifacts(*, drive_root: Path, apply: bool, now_epoc
         return parent / f"{base_name}__dup_{int(now_ts)}"
 
     raw_candidates: list[Path] = []
+    scan_started = time.time()
+    queue: deque[tuple[Path, int, bool]] = deque()
+    queue.append((mydrive_root, 0, False))
     try:
-        for entry in sorted(mydrive_root.rglob("*")):
-            if not entry.exists():
+        while queue:
+            if (time.time() - scan_started) > scan_max_seconds:
+                step["scan_truncated"] = True
+                step["errors"].append(
+                    {
+                        "scan": str(mydrive_root),
+                        "warning": (
+                            "scan_timeout_reached; "
+                            f"max_seconds={scan_max_seconds}. "
+                            "Relance avec SONGO_EXTERNAL_ARTIFACT_FORCE_FULL_SCAN=1 "
+                            "et/ou un timeout plus eleve si necessaire."
+                        ),
+                    }
+                )
+                break
+            current_dir, depth, branch_interesting = queue.popleft()
+            try:
+                iterator = os.scandir(current_dir)
+            except Exception as exc:
+                step["errors"].append(
+                    {"scan": str(current_dir), "error": f"{type(exc).__name__}: {exc}"}
+                )
                 continue
-            if _path_within(entry, drive_root):
-                continue
-            if not _is_suspicious_path(entry):
-                continue
-            raw_candidates.append(entry)
+            with iterator as it:
+                for entry in it:
+                    step["scan_entries"] = int(step["scan_entries"]) + 1
+                    scan_entries = int(step["scan_entries"])
+                    if scan_entries > 0 and (scan_entries % int(scan_progress_every) == 0):
+                        print(
+                            (
+                                "[storage-cleanup][external-scan] "
+                                f"scanned={scan_entries} | candidates={len(raw_candidates)} "
+                                f"| queue={len(queue)} | elapsed={int(time.time() - scan_started)}s"
+                            ),
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    path = Path(entry.path)
+                    if _path_within(path, drive_root):
+                        continue
+                    if _is_suspicious_path(path):
+                        raw_candidates.append(path)
+                        step["scan_candidates"] = len(raw_candidates)
+                        continue
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    if depth >= scan_max_depth:
+                        continue
+                    name_interesting = _is_interesting_dir_name(entry.name)
+                    if force_full_scan:
+                        queue.append((path, depth + 1, True))
+                        continue
+                    if depth == 0:
+                        if name_interesting:
+                            queue.append((path, depth + 1, True))
+                        continue
+                    if branch_interesting or name_interesting:
+                        queue.append((path, depth + 1, bool(branch_interesting or name_interesting)))
     except Exception as exc:
         step["errors"].append({"scan": str(mydrive_root), "error": f"{type(exc).__name__}: {exc}"})
         return step
@@ -239,19 +337,73 @@ def _cleanup_external_drive_artifacts(*, drive_root: Path, apply: bool, now_epoc
         if any(_path_within(candidate, parent) for parent in selected):
             continue
         selected.append(candidate)
+    step["selected_candidates"] = len(selected)
 
+    if selected:
+        print(
+            (
+                "[storage-cleanup][external-scan] "
+                f"scan_done | scanned={int(step['scan_entries'])} "
+                f"| selected={len(selected)} | scan_truncated={bool(step['scan_truncated'])}"
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
+
+    processed_count = 0
     for entry in selected:
+        if move_max_items > 0 and processed_count >= move_max_items:
+            remaining = max(0, len(selected) - processed_count)
+            step["move_truncated"] = True
+            step["skipped"].append(
+                {
+                    "src": "<multiple>",
+                    "reason": "move_limit_reached",
+                    "limit": int(move_max_items),
+                    "remaining": int(remaining),
+                }
+            )
+            print(
+                (
+                    "[storage-cleanup][external-move] "
+                    f"limit_reached | limit={move_max_items} | remaining={remaining}"
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
+            break
         rel_hint = str(entry.relative_to(mydrive_root))
         target = _resolve_available_target(session_root / rel_hint)
         if not apply:
             step["moved"].append({"src": str(entry), "dst": str(target), "mode": "dry_run"})
+            processed_count += 1
+            if processed_count % int(move_progress_every) == 0:
+                print(
+                    (
+                        "[storage-cleanup][external-move] "
+                        f"planned={processed_count}/{len(selected)}"
+                    ),
+                    file=sys.stderr,
+                    flush=True,
+                )
             continue
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(entry), str(target))
             step["moved"].append({"src": str(entry), "dst": str(target), "mode": "moved"})
+            processed_count += 1
+            if processed_count % int(move_progress_every) == 0:
+                print(
+                    (
+                        "[storage-cleanup][external-move] "
+                        f"moved={processed_count}/{len(selected)}"
+                    ),
+                    file=sys.stderr,
+                    flush=True,
+                )
         except Exception as exc:
             step["errors"].append({"src": str(entry), "error": f"{type(exc).__name__}: {exc}"})
+    step["processed_candidates"] = int(processed_count)
     return step
 
 
