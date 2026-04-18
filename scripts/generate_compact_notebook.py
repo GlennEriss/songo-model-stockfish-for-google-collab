@@ -1104,6 +1104,23 @@ cells = [
         env = dict(os.environ)
         env['PYTHONPATH'] = str(Path(WORKTREE) / 'src')
 
+        def _parse_json_payload(raw_text):
+            text = str(raw_text or '').strip()
+            if not text:
+                return {}
+            try:
+                return json.loads(text)
+            except Exception:
+                pass
+            lines = [line for line in text.splitlines() if str(line).strip()]
+            for idx in range(len(lines) - 1, -1, -1):
+                candidate = '\\n'.join(lines[idx:])
+                try:
+                    return json.loads(candidate)
+                except Exception:
+                    continue
+            return {}
+
         def _build_cleanup_cmd(extra_args):
             cmd = [
                 str(PYTHON_BIN),
@@ -1123,44 +1140,50 @@ cells = [
             print(f'\\n=== {step_name} ===')
             print('command =', cmd)
             started = time.time()
+            log_path = Path('/tmp') / f'{step_name}.storage_cleanup.log'
             proc = subprocess.Popen(
                 cmd,
                 cwd=str(WORKTREE),
                 env=env,
                 text=True,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                bufsize=1,
             )
             heartbeat = max(5, int(STORAGE_CLEANUP_HEARTBEAT_SECONDS))
             last_beat = started
-            while proc.poll() is None:
-                now = time.time()
-                if now - last_beat >= heartbeat:
-                    print(
-                        f'[{step_name}] en cours... elapsed='
-                        f'{int(now - started)}s | dry_run={STORAGE_CLEANUP_DRY_RUN}'
-                    )
-                    last_beat = now
-                time.sleep(2.0)
-            stdout_text, stderr_text = proc.communicate()
-            if stderr_text and stderr_text.strip():
-                print(f'[{step_name}][stderr]')
-                print(stderr_text.strip())
-            if proc.returncode != 0:
-                print(f'[{step_name}] echec | returncode={proc.returncode}')
+            output_lines = []
+            with log_path.open('w', encoding='utf-8') as log_handle:
+                while True:
+                    line = proc.stdout.readline() if proc.stdout is not None else ''
+                    if line:
+                        output_lines.append(line)
+                        log_handle.write(line)
+                        log_handle.flush()
+                        print(f'[{step_name}] {line.rstrip()}')
+                    else:
+                        if proc.poll() is not None:
+                            break
+                        now = time.time()
+                        if now - last_beat >= heartbeat:
+                            print(
+                                f'[{step_name}] en cours... elapsed='
+                                f'{int(now - started)}s | dry_run={STORAGE_CLEANUP_DRY_RUN}'
+                            )
+                            last_beat = now
+                        time.sleep(1.0)
+            return_code = int(proc.wait())
+            stdout_text = ''.join(output_lines).strip()
+            print(f'[{step_name}] log_file = {log_path}')
+            if return_code != 0:
+                print(f'[{step_name}] echec | returncode={return_code}')
                 if stdout_text and stdout_text.strip():
                     print(f'[{step_name}][stdout]')
                     print(stdout_text.strip())
-                raise RuntimeError(f'{step_name} a echoue (rc={proc.returncode})')
-            report = {}
-            stdout_clean = (stdout_text or '').strip()
-            if stdout_clean:
-                try:
-                    report = json.loads(stdout_clean)
-                except Exception:
-                    print(f'[{step_name}] sortie non-JSON brute:')
-                    print(stdout_clean)
-                    report = {}
+                raise RuntimeError(f'{step_name} a echoue (rc={return_code})')
+            report = _parse_json_payload(stdout_text)
+            if not report:
+                print(f'[{step_name}] warning: sortie JSON non parsee, voir log_file.')
             print(f'[{step_name}] termine en {int(time.time() - started)}s')
             return report
 
