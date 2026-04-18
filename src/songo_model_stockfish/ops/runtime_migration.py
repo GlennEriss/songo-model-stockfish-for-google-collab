@@ -236,6 +236,30 @@ def load_manifest_prefer_local(local_manifest_path: Path, *, firestore_manifest:
     return {}, "none"
 
 
+def _build_quarantine_path(src_path: Path, quarantine_root: Path | None) -> Path:
+    stem = f".quarantine_{src_path.name}_{int(time.time())}"
+    if quarantine_root is None:
+        candidate = src_path.with_name(stem)
+        if not candidate.exists():
+            return candidate
+        suffix = 1
+        while True:
+            alt = src_path.with_name(f"{stem}_{suffix}")
+            if not alt.exists():
+                return alt
+            suffix += 1
+    quarantine_root.mkdir(parents=True, exist_ok=True)
+    candidate = quarantine_root / stem
+    if not candidate.exists():
+        return candidate
+    suffix = 1
+    while True:
+        alt = quarantine_root / f"{stem}_{suffix}"
+        if not alt.exists():
+            return alt
+        suffix += 1
+
+
 def run_drive_to_local_runtime_migration(
     *,
     drive_jobs_root: Path,
@@ -252,6 +276,7 @@ def run_drive_to_local_runtime_migration(
     lock_poll_seconds: float = 0.25,
     hash_chunk_size: int = 1024 * 1024,
     pid_check_fn: Callable[[int], bool] = is_pid_alive,
+    quarantine_root: Path | None = None,
 ) -> dict[str, Any]:
     lock_acquired = False
     if lock_dir is not None:
@@ -320,9 +345,9 @@ def run_drive_to_local_runtime_migration(
                     detail = {"job_id": job_id, "status": "migrated", "result": result}
 
                     if purge_after_verify:
-                        quarantine_path = src_job_dir.with_name(f".quarantine_{src_job_dir.name}_{int(time.time())}")
+                        quarantine_path = _build_quarantine_path(src_job_dir, quarantine_root)
                         try:
-                            src_job_dir.rename(quarantine_path)
+                            shutil.move(str(src_job_dir), str(quarantine_path))
                             active_after, reasons_after = is_job_active(
                                 quarantine_path,
                                 pid_candidates=pid_candidates,
@@ -330,7 +355,7 @@ def run_drive_to_local_runtime_migration(
                                 pid_check_fn=pid_check_fn,
                             )
                             if active_after:
-                                quarantine_path.rename(src_job_dir)
+                                shutil.move(str(quarantine_path), str(src_job_dir))
                                 summary["jobs"]["skipped_active_recheck"] = int(summary["jobs"]["skipped_active_recheck"]) + 1
                                 detail["status"] = "purge_skipped_active_recheck"
                                 detail["reasons_after"] = list(reasons_after)
@@ -367,12 +392,10 @@ def run_drive_to_local_runtime_migration(
                             summary["pipeline_logs"]["purge_skipped_active"] = 1
                             summary["pipeline_logs"]["details"].append({"status": "purge_skipped_active_manifest_pid"})
                         else:
-                            quarantine_logs = drive_pipeline_logs_root.with_name(
-                                f".quarantine_{drive_pipeline_logs_root.name}_{int(time.time())}"
-                            )
-                            drive_pipeline_logs_root.rename(quarantine_logs)
+                            quarantine_logs = _build_quarantine_path(drive_pipeline_logs_root, quarantine_root)
+                            shutil.move(str(drive_pipeline_logs_root), str(quarantine_logs))
                             if any_manifest_pid_alive(resolved_manifest, pid_check_fn=pid_check_fn):
-                                quarantine_logs.rename(drive_pipeline_logs_root)
+                                shutil.move(str(quarantine_logs), str(drive_pipeline_logs_root))
                                 summary["pipeline_logs"]["purge_skipped_active"] = 1
                                 summary["pipeline_logs"]["details"].append({"status": "purge_skipped_active_recheck"})
                             else:
@@ -391,6 +414,7 @@ def run_drive_to_local_runtime_migration(
                 "purge_after_verify": bool(purge_after_verify),
                 "skip_active_job_dirs": bool(skip_active_job_dirs),
                 "active_updated_max_age_seconds": float(active_updated_max_age_seconds),
+                "quarantine_root": str(quarantine_root) if quarantine_root is not None else "",
             }
     finally:
         if lock_dir is not None and lock_acquired:

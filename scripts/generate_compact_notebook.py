@@ -1008,6 +1008,7 @@ cells = [
         MIGRATE_HASH_CHUNK_SIZE = 1024 * 1024
         MIGRATE_VERBOSE = True
         MIGRATE_LOCK_DIR = Path(DRIVE_ROOT) / 'runtime_migration' / 'locks' / 'drive_to_local'
+        MIGRATE_QUARANTINE_ROOT = Path(DRIVE_ROOT) / 'runtime_migration' / 'quarantine'
         MIGRATE_LOCK_TIMEOUT_SECONDS = 60.0
 
         drive_jobs_root = Path(DRIVE_ROOT) / 'jobs'
@@ -1033,6 +1034,7 @@ cells = [
         print('  active_updated_max_age_s   =', MIGRATE_ACTIVE_UPDATED_MAX_AGE_SECONDS)
         print('  hash_chunk_size            =', MIGRATE_HASH_CHUNK_SIZE)
         print('  lock_dir                   =', MIGRATE_LOCK_DIR)
+        print('  quarantine_root            =', MIGRATE_QUARANTINE_ROOT)
         print('  lock_timeout_seconds       =', MIGRATE_LOCK_TIMEOUT_SECONDS)
         print('  drive_jobs_root            =', drive_jobs_root)
         print('  drive_pipeline_logs_root   =', drive_pipeline_logs_root)
@@ -1060,6 +1062,7 @@ cells = [
                 active_updated_max_age_seconds=float(MIGRATE_ACTIVE_UPDATED_MAX_AGE_SECONDS),
                 verbose=bool(MIGRATE_VERBOSE),
                 lock_dir=MIGRATE_LOCK_DIR,
+                quarantine_root=MIGRATE_QUARANTINE_ROOT,
                 lock_timeout_seconds=float(MIGRATE_LOCK_TIMEOUT_SECONDS),
                 hash_chunk_size=int(MIGRATE_HASH_CHUNK_SIZE),
             )
@@ -1090,6 +1093,7 @@ cells = [
             f"{shlex.quote(PYTHON_BIN)} -m songo_model_stockfish.cli.main storage-cleanup "
             f"--config {shlex.quote(STORAGE_CLEANUP_CONFIG_PATH)} "
             f"--retention "
+            f"--fix-external-artifacts "
             f"--purge-runtime-backup-streams "
             f"--purge-drive-raw "
             f"--purge-drive-raw-include-inactive-partial "

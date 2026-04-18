@@ -166,6 +166,59 @@ def _infer_checkpoint_model_id(stem: str) -> str:
     return text
 
 
+def _cleanup_external_drive_artifacts(*, drive_root: Path, apply: bool, now_epoch: float | None = None) -> dict[str, Any]:
+    # Nettoie des artefacts connus ecrits par erreur hors de drive_root,
+    # mais strictement sous /content/drive/MyDrive pour eviter tout effet de bord.
+    now_ts = float(now_epoch) if now_epoch is not None else time.time()
+    mydrive_root = drive_root.parent
+    recovered_root = drive_root / "runtime_migration" / "recovered_external"
+    step: dict[str, Any] = {
+        "mydrive_root": str(mydrive_root),
+        "drive_root": str(drive_root),
+        "recovered_root": str(recovered_root),
+        "moved": [],
+        "skipped": [],
+        "errors": [],
+    }
+    if not mydrive_root.exists():
+        return step
+    session_root = recovered_root / str(int(now_ts))
+    known_file_names = {"_dataset_source_metadata.json", "bench_models_20m_global.json"}
+
+    def _is_suspicious_path(path: Path) -> bool:
+        name = path.name
+        if name.startswith(".quarantine_"):
+            return True
+        if name.startswith("model_songo_policy"):
+            return True
+        if name in known_file_names:
+            return True
+        if name.startswith("bench_models_") and name.endswith("_global.json"):
+            return True
+        return False
+
+    for entry in sorted(mydrive_root.iterdir()):
+        if _path_within(entry, drive_root):
+            continue
+        if not _is_suspicious_path(entry):
+            continue
+        rel_hint = str(entry.relative_to(mydrive_root))
+        target = session_root / rel_hint
+        if not apply:
+            step["moved"].append({"src": str(entry), "dst": str(target), "mode": "dry_run"})
+            continue
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists():
+                step["skipped"].append({"src": str(entry), "reason": "target_exists", "dst": str(target)})
+                continue
+            shutil.move(str(entry), str(target))
+            step["moved"].append({"src": str(entry), "dst": str(target), "mode": "moved"})
+        except Exception as exc:
+            step["errors"].append({"src": str(entry), "error": f"{type(exc).__name__}: {exc}"})
+    return step
+
+
 def _sort_model_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ranked = sorted(
         records,
@@ -276,6 +329,7 @@ def run_storage_cleanup(
     cleanup_drive_label_cache: bool,
     cleanup_models: bool,
     cleanup_retention: bool = False,
+    cleanup_external_artifacts: bool = False,
     keep_model_ids: list[str] | None = None,
     keep_top_models: int = 1,
     keep_dataset_ids: list[str] | None = None,
@@ -299,6 +353,7 @@ def run_storage_cleanup(
         "cleanup_drive_label_cache": bool(cleanup_drive_label_cache),
         "cleanup_models": bool(cleanup_models),
         "cleanup_retention": bool(cleanup_retention),
+        "cleanup_external_artifacts": bool(cleanup_external_artifacts),
         "drive_raw_cleanup_include_inactive_partial": bool(drive_raw_cleanup_include_inactive_partial),
         "drive_raw_cleanup_inactive_min_age_seconds": float(max(0.0, drive_raw_cleanup_inactive_min_age_seconds)),
         "steps": {},
@@ -373,6 +428,7 @@ def run_storage_cleanup(
             active_updated_max_age_seconds=300.0,
             verbose=True,
             lock_dir=drive_root / "runtime_migration" / "locks" / "drive_to_local",
+            quarantine_root=drive_root / "runtime_migration" / "quarantine",
         )
         migration_summary["manifest_source"] = str(manifest_source)
         migration_summary["purge_requested"] = bool(apply)
@@ -674,6 +730,13 @@ def run_storage_cleanup(
                     if _remove_file(path, apply=apply):
                         retention_step["old_checkpoints_removed"].append(str(path))
         report["steps"]["retention_cleanup"] = retention_step
+
+    if cleanup_external_artifacts:
+        report["steps"]["external_artifacts_cleanup"] = _cleanup_external_drive_artifacts(
+            drive_root=drive_root,
+            apply=bool(apply),
+            now_epoch=now_epoch,
+        )
 
     report["created_at_epoch"] = time.time()
     return report

@@ -302,6 +302,7 @@ def build_parser() -> argparse.ArgumentParser:
     storage_cleanup.add_argument("--purge-drive-label-cache", action="store_true")
     storage_cleanup.add_argument("--purge-models", action="store_true")
     storage_cleanup.add_argument("--retention", action="store_true")
+    storage_cleanup.add_argument("--fix-external-artifacts", action="store_true")
     storage_cleanup.add_argument("--retention-job-stream-ttl-hours", type=float, default=72.0)
     storage_cleanup.add_argument("--retention-quarantine-ttl-hours", type=float, default=72.0)
     storage_cleanup.add_argument("--retention-benchmark-report-ttl-days", type=float, default=45.0)
@@ -389,6 +390,7 @@ def main(argv: list[str] | None = None) -> int:
             cleanup_drive_label_cache=bool(cleanup_all or args.purge_drive_label_cache),
             cleanup_models=bool(cleanup_all or args.purge_models),
             cleanup_retention=bool(cleanup_all or args.retention),
+            cleanup_external_artifacts=bool(cleanup_all or args.fix_external_artifacts),
             keep_model_ids=keep_model_ids,
             keep_top_models=int(args.keep_top_models),
             keep_dataset_ids=list(args.keep_dataset_id or []),

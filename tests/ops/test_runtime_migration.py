@@ -97,3 +97,35 @@ def test_run_migration_copies_and_purges_inactive_job(tmp_path: Path) -> None:
 
     verify = sync_tree_with_hash_verify(local_jobs_root / inactive_job_id, local_jobs_root / inactive_job_id)
     assert verify["verified"] is True
+
+
+def test_run_migration_accepts_dedicated_quarantine_root(tmp_path: Path) -> None:
+    drive_jobs_root = tmp_path / "drive_jobs"
+    drive_logs_root = tmp_path / "drive_logs_pipeline"
+    local_jobs_root = tmp_path / "local_jobs"
+    local_logs_root = tmp_path / "local_logs_pipeline"
+    quarantine_root = tmp_path / "drive_root" / "runtime_migration" / "quarantine"
+
+    inactive_job_id = "dataset_job_done_002"
+    inactive_job_dir = drive_jobs_root / inactive_job_id
+    inactive_job_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(
+        inactive_job_dir / "run_status.json",
+        {"status": "completed", "updated_at": "2026-04-13T12:00:00Z"},
+    )
+    (inactive_job_dir / "state.json").write_text('{"samples": 24}', encoding="utf-8")
+
+    summary = run_drive_to_local_runtime_migration(
+        drive_jobs_root=drive_jobs_root,
+        drive_pipeline_logs_root=drive_logs_root,
+        local_jobs_root=local_jobs_root,
+        local_pipeline_logs_root=local_logs_root,
+        manifest={},
+        purge_after_verify=True,
+        skip_active_job_dirs=True,
+        pid_check_fn=lambda _pid: False,
+        quarantine_root=quarantine_root,
+    )
+
+    assert int(summary["jobs"]["purged"]) == 1
+    assert summary.get("runtime", {}).get("quarantine_root") == str(quarantine_root)

@@ -42,7 +42,14 @@ def _resolve_storage_path(base: Path, configured: str | None, fallback: Path) ->
     if not configured:
         return fallback
     path = Path(configured)
+    mydrive_root = base.parent
     if path.is_absolute():
+        # Garde-fou: toute cible absolue sous MyDrive doit rester dans drive_root.
+        try:
+            if path.resolve().is_relative_to(mydrive_root.resolve()) and not path.resolve().is_relative_to(base.resolve()):
+                return base / path.name
+        except Exception:
+            pass
         return path
     return base / path
 

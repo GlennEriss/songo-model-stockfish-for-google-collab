@@ -207,3 +207,37 @@ def test_retention_cleanup_removes_old_quarantine_dirs(tmp_path: Path) -> None:
     retention_step = report["steps"]["retention_cleanup"]
     removed = set(str(item) for item in retention_step.get("quarantine_removed", []))
     assert str(quarantine_dir) in removed
+
+
+def test_external_artifacts_cleanup_moves_known_items_outside_drive_root(tmp_path: Path) -> None:
+    mydrive_root = tmp_path / "MyDrive"
+    drive_root = mydrive_root / "songo-stockfish"
+    drive_root.mkdir(parents=True, exist_ok=True)
+    cfg = _make_config(drive_root)
+    paths = build_project_paths(cfg)
+
+    external_quarantine = mydrive_root / ".quarantine_benchmark_x"
+    external_quarantine.mkdir(parents=True, exist_ok=True)
+    external_progress = mydrive_root / "bench_models_20m_global.json"
+    external_progress.write_text("{}", encoding="utf-8")
+
+    report = run_storage_cleanup(
+        config=cfg,
+        paths=paths,
+        apply=False,
+        cleanup_runtime_migration=False,
+        cleanup_runtime_backup_streams=False,
+        cleanup_drive_raw_dirs=False,
+        cleanup_drive_label_cache=False,
+        cleanup_models=False,
+        cleanup_retention=False,
+        cleanup_external_artifacts=True,
+        keep_model_ids=[],
+        keep_top_models=0,
+        keep_dataset_ids=[],
+    )
+
+    step = report["steps"]["external_artifacts_cleanup"]
+    moved_sources = {str(item.get("src", "")) for item in step.get("moved", []) if isinstance(item, dict)}
+    assert str(external_quarantine) in moved_sources
+    assert str(external_progress) in moved_sources
