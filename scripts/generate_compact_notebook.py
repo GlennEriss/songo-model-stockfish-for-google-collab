@@ -1112,7 +1112,8 @@ cells = [
         STORAGE_CLEANUP_EXTERNAL_SCAN_MAX_DEPTH = 6
         STORAGE_CLEANUP_EXTERNAL_FORCE_FULL_SCAN = False
         STORAGE_CLEANUP_EXTERNAL_MOVE_MAX_ITEMS = 500
-        STORAGE_CLEANUP_EXTERNAL_TARGET_MAX_DEPTH = 2
+        STORAGE_CLEANUP_EXTERNAL_TARGET_MAX_DEPTH = 0
+        STORAGE_CLEANUP_EXTERNAL_TARGET_SCAN_PROGRESS_EVERY = 2000
         STORAGE_CLEANUP_EXTERNAL_TARGET_GLOBS = [
             '.quarantine*',
             '_dataset*',
@@ -1183,6 +1184,8 @@ cells = [
                 explicit_paths.append(Path(text))
             max_depth = max(0, int(STORAGE_CLEANUP_EXTERNAL_TARGET_MAX_DEPTH))
             move_max = max(1, int(STORAGE_CLEANUP_EXTERNAL_MOVE_MAX_ITEMS))
+            scan_max_seconds = max(30.0, float(STORAGE_CLEANUP_EXTERNAL_SCAN_MAX_SECONDS))
+            scan_progress_every = max(200, int(STORAGE_CLEANUP_EXTERNAL_TARGET_SCAN_PROGRESS_EVERY))
             session_root = (
                 drive_root_path
                 / 'runtime_migration'
@@ -1200,7 +1203,10 @@ cells = [
                 'target_names': sorted(target_names),
                 'target_paths': [str(p) for p in explicit_paths],
                 'scan_max_depth': max_depth,
+                'scan_max_seconds': scan_max_seconds,
+                'scan_progress_every': scan_progress_every,
                 'scan_entries': 0,
+                'scan_truncated': False,
                 'matched': [],
                 'processed': [],
                 'skipped': [],
@@ -1230,11 +1236,32 @@ cells = [
                 explicit_targets.append(Path(resolved))
 
             while queue:
+                if (time.time() - started) >= float(scan_max_seconds):
+                    report['scan_truncated'] = True
+                    report['errors'].append(
+                        {
+                            'scan': str(mydrive_root),
+                            'warning': (
+                                'scan_timeout_reached; '
+                                f'max_seconds={scan_max_seconds}. '
+                                'Augmente STORAGE_CLEANUP_EXTERNAL_SCAN_MAX_SECONDS '
+                                'si tu veux une passe plus profonde.'
+                            ),
+                        }
+                    )
+                    break
                 current, depth = queue.popleft()
                 try:
                     with os.scandir(current) as it:
                         for entry in it:
                             report['scan_entries'] = int(report['scan_entries']) + 1
+                            scan_entries = int(report['scan_entries'])
+                            if scan_entries % int(scan_progress_every) == 0:
+                                print(
+                                    '[cleanup_external_artifacts_targeted] '
+                                    f'scan={scan_entries} | matched={len(raw_candidates)} '
+                                    f'| queue={len(queue)} | elapsed={int(time.time() - started)}s'
+                                )
                             path = Path(entry.path)
                             if _path_within(path, drive_root_path):
                                 continue
@@ -1457,6 +1484,7 @@ cells = [
         print('  external_target_names =', STORAGE_CLEANUP_EXTERNAL_TARGET_NAMES)
         print('  external_target_paths =', STORAGE_CLEANUP_EXTERNAL_TARGET_PATHS)
         print('  external_target_depth =', STORAGE_CLEANUP_EXTERNAL_TARGET_MAX_DEPTH)
+        print('  external_target_scan_progress_every =', STORAGE_CLEANUP_EXTERNAL_TARGET_SCAN_PROGRESS_EVERY)
         print('  heartbeat_seconds    =', STORAGE_CLEANUP_HEARTBEAT_SECONDS)
         print('  step_timeout_seconds =', STORAGE_CLEANUP_STEP_TIMEOUT_SECONDS)
         print('  external_scan_max_s  =', STORAGE_CLEANUP_EXTERNAL_SCAN_MAX_SECONDS)
@@ -1485,6 +1513,7 @@ cells = [
             print('  processed    =', len(external_report.get('processed', []) or []))
             print('  skipped      =', len(external_report.get('skipped', []) or []))
             print('  errors       =', len(external_report.get('errors', []) or []))
+            print('  scan_truncated =', bool(external_report.get('scan_truncated', False)))
             preview = list(external_report.get('processed', []) or [])[:20]
             if preview:
                 print('  processed_preview =')
