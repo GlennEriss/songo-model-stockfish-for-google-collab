@@ -7,6 +7,10 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
+_MYDRIVE_ROOT = Path("/content/drive/MyDrive")
+_DEFAULT_DRIVE_ROOT = _MYDRIVE_ROOT / "songo-stockfish"
+
+
 def _path_within(path: Path, base: Path) -> bool:
     try:
         path.resolve().relative_to(base.resolve())
@@ -15,21 +19,38 @@ def _path_within(path: Path, base: Path) -> bool:
         return False
 
 
+def resolve_allowed_drive_root() -> Path:
+    configured_root = str(os.environ.get("SONGO_DRIVE_ROOT", "")).strip()
+    if not configured_root:
+        return _DEFAULT_DRIVE_ROOT
+    candidate = Path(configured_root)
+    if not _path_within(candidate, _MYDRIVE_ROOT):
+        return candidate
+    # Hard guardrail: when operating under MyDrive, all writes must stay
+    # under MyDrive/songo-stockfish even if environment is misconfigured.
+    if candidate == _MYDRIVE_ROOT:
+        return _DEFAULT_DRIVE_ROOT
+    if _path_within(candidate, _DEFAULT_DRIVE_ROOT):
+        return _DEFAULT_DRIVE_ROOT
+    return _DEFAULT_DRIVE_ROOT
+
+
 def _guard_drive_root_write(path: Path) -> None:
     enforce_text = str(os.environ.get("SONGO_ENFORCE_DRIVE_ROOT_WRITES", "1")).strip().lower()
     if enforce_text in {"0", "false", "no", "off", "n"}:
         return
-    mydrive_root = Path("/content/drive/MyDrive")
-    configured_root = str(os.environ.get("SONGO_DRIVE_ROOT", "/content/drive/MyDrive/songo-stockfish")).strip()
-    allowed_drive_root = Path(configured_root or "/content/drive/MyDrive/songo-stockfish")
-    if not _path_within(path, mydrive_root):
+    allowed_drive_root = resolve_allowed_drive_root()
+    if not _path_within(path, _MYDRIVE_ROOT):
         return
     if _path_within(path, allowed_drive_root):
         return
+    timestamp_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    cwd_text = str(Path.cwd())
     raise ValueError(
         "Refus ecriture hors drive_root autorise. "
         f"path={path} | allowed_root={allowed_drive_root}. "
-        "Corrige le chemin cible pour ecrire sous MyDrive/songo-stockfish."
+        "Corrige le chemin cible pour ecrire sous MyDrive/songo-stockfish. "
+        f"timestamp_utc={timestamp_utc} | cwd={cwd_text}"
     )
 
 

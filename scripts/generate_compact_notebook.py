@@ -75,6 +75,13 @@ cells = [
         os.environ['SONGO_DRIVE_ROOT'] = str(DRIVE_ROOT)
         os.environ.setdefault('SONGO_ENFORCE_DRIVE_ROOT_WRITES', '1')
 
+        expected_drive_root = Path('/content/drive/MyDrive/songo-stockfish')
+        if Path(DRIVE_ROOT) != expected_drive_root:
+            raise RuntimeError(
+                f'DRIVE_ROOT invalide: {DRIVE_ROOT}. '
+                f'Valeur autorisee: {expected_drive_root}'
+            )
+
         for relative in [
             'jobs',
             'data',
@@ -96,6 +103,8 @@ cells = [
             subprocess.run(['git', '-C', WORKTREE, 'checkout', GIT_BRANCH], check=True)
             subprocess.run(['git', '-C', WORKTREE, 'pull', '--ff-only', 'origin', GIT_BRANCH], check=True)
 
+        os.chdir(WORKTREE)
+
         subprocess.run([PYTHON_BIN, '-m', 'pip', 'install', '--upgrade', 'pip'], check=True)
         subprocess.run([PYTHON_BIN, '-m', 'pip', 'install', '-r', f'{WORKTREE}/requirements.txt'], check=True)
 
@@ -103,6 +112,7 @@ cells = [
         print('DRIVE_PROJECT_NAME =', DRIVE_PROJECT_NAME)
         print('DRIVE_ROOT         =', DRIVE_ROOT)
         print('WORKTREE           =', WORKTREE)
+        print('CWD                =', Path.cwd())
         print('PYTHON_BIN         =', PYTHON_BIN)
         print('SONGO_DRIVE_ROOT   =', os.environ.get('SONGO_DRIVE_ROOT', '<none>'))
         print('WRITE_GUARD        =', os.environ.get('SONGO_ENFORCE_DRIVE_ROOT_WRITES', '<none>'))
@@ -341,6 +351,36 @@ cells = [
         os.environ['SONGO_JOBS_ROOT'] = str(JOBS_ROOT)
         os.environ['SONGO_LOGS_ROOT'] = str(LOGS_ROOT)
         os.environ['SONGO_JOBS_BACKUP_ROOT'] = str(RUNTIME_HYBRID_BACKUP_JOBS_ROOT) if RUNTIME_HYBRID_BACKUP_ENABLED else ''
+
+        _MYDRIVE_ROOT = Path('/content/drive/MyDrive')
+        _EXPECTED_DRIVE_ROOT = Path('/content/drive/MyDrive/songo-stockfish')
+        if Path(DRIVE_ROOT) != _EXPECTED_DRIVE_ROOT:
+            raise RuntimeError(
+                f'DRIVE_ROOT invalide: {DRIVE_ROOT}. '
+                f'Valeur autorisee: {_EXPECTED_DRIVE_ROOT}'
+            )
+
+        def _path_within(path: Path, base: Path) -> bool:
+            try:
+                path.resolve().relative_to(base.resolve())
+                return True
+            except Exception:
+                return False
+
+        def _assert_mydrive_scoped(path_like: str | Path, *, label: str) -> Path:
+            path = Path(str(path_like)).expanduser()
+            if not path.is_absolute():
+                return path
+            if _path_within(path, _MYDRIVE_ROOT) and not _path_within(path, _EXPECTED_DRIVE_ROOT):
+                raise RuntimeError(
+                    f'Chemin refuse hors { _EXPECTED_DRIVE_ROOT }: {path} (label={label})'
+                )
+            return path
+
+        _assert_mydrive_scoped(DRIVE_ROOT, label='DRIVE_ROOT')
+        _assert_mydrive_scoped(JOBS_ROOT, label='JOBS_ROOT')
+        _assert_mydrive_scoped(LOGS_ROOT, label='LOGS_ROOT')
+        _assert_mydrive_scoped(RUNTIME_HYBRID_BACKUP_JOBS_ROOT, label='RUNTIME_HYBRID_BACKUP_JOBS_ROOT')
 
         DATASET_GENERATE_WORKERS = 16
         DATASET_GENERATE_MAX_PENDING_FUTURES = 32
@@ -1144,11 +1184,15 @@ cells = [
         STORAGE_CLEANUP_RETENTION_RECOVERED_EXTERNAL_HARD_MAX_AGE_DAYS = 30.0
         STORAGE_CLEANUP_EXTERNAL_TARGET_GLOBS = [
             '.quarantine*',
+            'quarantine*',
             '.dataset*',
             '_dataset*',
+            'dataset*',
             '.model*',
             '*.model',
+            'model_songo*',
             'model_songo_policy*',
+            'labeled_positions*',
             'songo_policy_value*.pt',
             'songo_policy_value*.model_card.json',
             '*_evaluation_summary*.json',
@@ -1165,6 +1209,7 @@ cells = [
             'tournament_progress*.jsonl',
             'tournament_progress*.latest.json',
             'metadata*.json',
+            'mcts*',
             'mcts_*.json',
             'mcts_*.jsonl',
             'mcts*.json',
@@ -1172,6 +1217,7 @@ cells = [
             'mcts*summary*.json',
             'mcts*game*.json',
             'mcts*game*.jsonl',
+            'minimax*',
             'minimax_*.json',
             'minimax_*.jsonl',
             'minimax*.json',
@@ -2143,6 +2189,7 @@ cells = [
 
         def _write_yaml(payload: dict, target_path_str: str) -> str:
             target_path = Path(target_path_str)
+            _assert_mydrive_scoped(target_path, label='generated_config_target')
             target_path.parent.mkdir(parents=True, exist_ok=True)
             normalized_payload = _apply_runtime_storage_cfg(dict(payload or {}))
             normalized_payload = _apply_runtime_firestore_cfg(normalized_payload)
@@ -2450,6 +2497,8 @@ cells = [
             output_sampled_dir = f'data/{DATASET_SOURCE_ID}'
         # Strategie stockage: raw volatils en runtime local, sampled durables sur Drive.
         output_raw_dir = str(Path(RUNTIME_STATE_ROOT) / 'data' / raw_dir_name)
+        _assert_mydrive_scoped(output_raw_dir, label='dataset_generation.output_raw_dir')
+        _assert_mydrive_scoped(output_sampled_dir, label='dataset_generation.output_sampled_dir')
         pipeline_mode = str(DATASET_PIPELINE_MODE).strip().lower() or 'single_pass'
         pipeline_pass = str(DATASET_PIPELINE_ACTIVE_PASS).strip().upper() or 'A'
         generate_source_mode_requested = str(DATASET_GENERATE_SOURCE_MODE).strip().lower() or 'benchmatch'
@@ -2564,6 +2613,7 @@ cells = [
         build_block['input_sampled_dir'] = f'data/{DATASET_SOURCE_ID}'
         build_block['dataset_id'] = DATASET_BUILD_ID
         build_block['label_cache_dir'] = str(Path(RUNTIME_STATE_ROOT) / 'data' / 'label_cache' / DATASET_BUILD_ID)
+        _assert_mydrive_scoped(build_block['label_cache_dir'], label='dataset_build.label_cache_dir')
         build_block['target_labeled_samples'] = int(TARGET_LABELED_SAMPLES)
         build_block['value_target_mix_teacher_weight'] = float(VALUE_TARGET_MIX_TEACHER_WEIGHT)
         build_block['hard_examples_enabled'] = bool(HARD_EXAMPLES_ENABLED)

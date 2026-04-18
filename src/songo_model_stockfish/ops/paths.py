@@ -5,6 +5,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+_MYDRIVE_ROOT = Path("/content/drive/MyDrive")
+_EXPECTED_DRIVE_ROOT = _MYDRIVE_ROOT / "songo-stockfish"
+
+
 @dataclass
 class ProjectPaths:
     repo_root: Path
@@ -25,9 +29,12 @@ def _resolve_root(*, base_root: Path, configured: object, default_relative: str)
     if path.is_absolute():
         # Garde-fou Colab/Drive: toute cible absolue sous MyDrive doit rester
         # dans drive_root (base_root) pour eviter les artefacts eparpilles.
-        mydrive_root = Path("/content/drive/MyDrive")
-        if _is_within(base_root, mydrive_root) and _is_within(path, mydrive_root) and not _is_within(path, base_root):
-            return base_root / path.name
+        if _is_within(base_root, _MYDRIVE_ROOT) and _is_within(path, _MYDRIVE_ROOT) and not _is_within(path, base_root):
+            raise RuntimeError(
+                "Configuration storage invalide: cible absolue sous MyDrive mais hors drive_root. "
+                f"base_root={base_root} | configured={path}. "
+                "Utilise uniquement des chemins sous /content/drive/MyDrive/songo-stockfish."
+            )
         return path
     return base_root / path
 
@@ -53,6 +60,12 @@ def build_project_paths(config: dict) -> ProjectPaths:
         raise RuntimeError(
             "Configuration invalide: `storage.drive_root` est requis. "
             "Exemple attendu: /content/drive/MyDrive/songo-stockfish"
+        )
+    if _is_within(drive_root, _MYDRIVE_ROOT) and drive_root != _EXPECTED_DRIVE_ROOT:
+        raise RuntimeError(
+            "Configuration invalide: `storage.drive_root` doit etre exactement "
+            "/content/drive/MyDrive/songo-stockfish pour eviter toute ecriture hors dossier projet. "
+            f"Valeur recue: {drive_root}"
         )
     if not drive_root.exists():
         raise RuntimeError(

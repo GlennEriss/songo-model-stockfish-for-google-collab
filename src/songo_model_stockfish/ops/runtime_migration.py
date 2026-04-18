@@ -252,9 +252,16 @@ def _resolve_allowed_drive_root() -> Path:
         configured = Path(configured_text)
     else:
         configured = mydrive_root / "songo-stockfish"
+    expected = mydrive_root / "songo-stockfish"
     if configured == mydrive_root:
-        return mydrive_root / "songo-stockfish"
-    return configured
+        return expected
+    if _path_within(configured, mydrive_root) and not _path_within(configured, expected):
+        return expected
+    if _path_within(configured, expected):
+        return expected
+    if not _path_within(configured, mydrive_root):
+        return configured
+    return expected
 
 
 def _resolve_quarantine_root_for_src(src_path: Path, quarantine_root: Path | None) -> Path | None:

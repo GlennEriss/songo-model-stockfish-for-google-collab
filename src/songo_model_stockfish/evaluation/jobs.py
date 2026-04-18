@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch.amp import autocast
 
-from songo_model_stockfish.ops.io_utils import read_json_dict, write_json_atomic
+from songo_model_stockfish.ops.io_utils import read_json_dict, resolve_allowed_drive_root, write_json_atomic
 from songo_model_stockfish.ops.job import JobContext
 from songo_model_stockfish.ops.logging import utc_now_iso
 from songo_model_stockfish.ops.model_registry import (
@@ -31,20 +31,31 @@ from songo_model_stockfish.training.model import PolicyValueMLP
 def _resolve_storage_path(base: Path, configured: str | None, fallback: Path) -> Path:
     if not configured:
         return fallback
-    path = Path(configured)
+    path = Path(configured).expanduser()
     mydrive_root = Path("/content/drive/MyDrive")
-    if path.is_absolute():
+    allowed_drive_root = resolve_allowed_drive_root()
+
+    def _path_within(path_value: Path, base_value: Path) -> bool:
         try:
-            if (
-                base.resolve().is_relative_to(mydrive_root.resolve())
-                and path.resolve().is_relative_to(mydrive_root.resolve())
-                and not path.resolve().is_relative_to(base.resolve())
-            ):
-                return base / path.name
+            path_value.resolve().relative_to(base_value.resolve())
+            return True
         except Exception:
-            pass
+            return False
+
+    if path.is_absolute():
+        if _path_within(path, mydrive_root) and not _path_within(path, allowed_drive_root):
+            raise ValueError(
+                "Chemin storage absolu refuse (hors drive_root autorise). "
+                f"configured={path} | allowed_drive_root={allowed_drive_root}"
+            )
         return path
-    return base / path
+    resolved = base / path
+    if _path_within(resolved, mydrive_root) and not _path_within(resolved, allowed_drive_root):
+        raise ValueError(
+            "Chemin storage relatif refuse (resolution hors drive_root autorise). "
+            f"configured={configured} | resolved={resolved} | allowed_drive_root={allowed_drive_root}"
+        )
+    return resolved
 
 
 def _write_json(path: Path, payload: dict) -> None:

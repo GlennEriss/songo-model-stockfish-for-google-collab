@@ -230,7 +230,19 @@ def _cleanup_external_drive_artifacts(*, drive_root: Path, apply: bool, now_epoc
         lower_name = str(name or "").lower()
         if name.startswith(".quarantine"):
             return True
+        if name.startswith("quarantine"):
+            return True
         if name.startswith("model_songo_policy"):
+            return True
+        if name.startswith("model_songo"):
+            return True
+        if name.startswith("dataset_"):
+            return True
+        if name.startswith("dataset"):
+            return True
+        if name.startswith("dataset") and path.is_dir():
+            return True
+        if name.startswith("labeled_positions"):
             return True
         if name.startswith("songo_policy_value") and name.endswith(".pt"):
             return True
@@ -248,9 +260,9 @@ def _cleanup_external_drive_artifacts(*, drive_root: Path, apply: bool, now_epoc
             return True
         if name.startswith("metadata") and name.endswith(".json"):
             return True
-        if name.startswith("mcts") and (name.endswith(".json") or name.endswith(".jsonl")):
+        if name.startswith("mcts"):
             return True
-        if name.startswith("minimax") and (name.endswith(".json") or name.endswith(".jsonl")):
+        if name.startswith("minimax"):
             return True
         if name.startswith("_dataset"):
             return True

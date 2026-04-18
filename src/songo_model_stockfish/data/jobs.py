@@ -22,6 +22,7 @@ from songo_model_stockfish.ops.io_utils import (
     guard_write_path,
     read_json_dict,
     release_lock_dir,
+    resolve_allowed_drive_root,
     write_json_atomic,
     write_jsonl_atomic,
 )
@@ -39,24 +40,34 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
     write_json_atomic(path, payload, ensure_ascii=True, indent=2)
 
 
+def _path_within(path: Path, base: Path) -> bool:
+    try:
+        path.resolve().relative_to(base.resolve())
+        return True
+    except Exception:
+        return False
+
+
 def _resolve_storage_path(base: Path, configured: str | None, fallback: Path) -> Path:
     if not configured:
         return fallback
-    path = Path(configured)
+    path = Path(configured).expanduser()
     mydrive_root = Path("/content/drive/MyDrive")
+    allowed_drive_root = resolve_allowed_drive_root()
     if path.is_absolute():
-        # Garde-fou: toute cible absolue sous MyDrive doit rester dans drive_root.
-        try:
-            if (
-                base.resolve().is_relative_to(mydrive_root.resolve())
-                and path.resolve().is_relative_to(mydrive_root.resolve())
-                and not path.resolve().is_relative_to(base.resolve())
-            ):
-                return base / path.name
-        except Exception:
-            pass
+        if _path_within(path, mydrive_root) and not _path_within(path, allowed_drive_root):
+            raise ValueError(
+                "Chemin storage absolu refuse (hors drive_root autorise). "
+                f"configured={path} | allowed_drive_root={allowed_drive_root}"
+            )
         return path
-    return base / path
+    resolved = base / path
+    if _path_within(resolved, mydrive_root) and not _path_within(resolved, allowed_drive_root):
+        raise ValueError(
+            "Chemin storage relatif refuse (resolution hors drive_root autorise). "
+            f"configured={configured} | resolved={resolved} | allowed_drive_root={allowed_drive_root}"
+        )
+    return resolved
 
 
 def _normalize_completed_game_detection_mode(value: Any) -> str:
@@ -1567,7 +1578,7 @@ def _resolve_dataset_source(job: JobContext, dataset_source_id: str) -> dict[str
     registry = _read_dataset_registry(job)
     for entry in registry.get("dataset_sources", []):
         if str(entry.get("dataset_source_id", "")) == dataset_source_id:
-            return entry
+            return _normalize_dataset_source_entry_paths(job, entry)
     job.logger.info(
         "dataset source missing from registry, probing legacy paths | dataset_source_id=%s",
         dataset_source_id,
@@ -1588,6 +1599,72 @@ def _resolve_dataset_source(job: JobContext, dataset_source_id: str) -> dict[str
         )
         return legacy_entry
     raise FileNotFoundError(f"Dataset source introuvable dans le registre: {dataset_source_id}")
+
+
+def _normalize_dataset_source_entry_paths(job: JobContext, entry: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(entry, dict):
+        return {}
+    dataset_source_id = str(entry.get("dataset_source_id", "")).strip()
+    if not dataset_source_id:
+        return dict(entry)
+
+    mydrive_root = Path("/content/drive/MyDrive")
+    drive_root = job.paths.drive_root
+    fallback_sampled_dir = job.paths.data_root / dataset_source_id
+    fallback_raw_dir = job.paths.data_root / _default_raw_dir_name_for_dataset_source(dataset_source_id)
+
+    normalized = dict(entry)
+    changed = False
+
+    def _normalize_key(key: str, fallback_path: Path) -> None:
+        nonlocal changed
+        raw_value = str(normalized.get(key, "")).strip()
+        if not raw_value:
+            normalized[key] = str(fallback_path)
+            changed = True
+            return
+        candidate = Path(raw_value).expanduser()
+        if not candidate.is_absolute():
+            candidate = drive_root / candidate
+        # Hard guard: refuse legacy MyDrive paths outside drive_root.
+        if _path_within(candidate, mydrive_root) and not _path_within(candidate, drive_root):
+            normalized[key] = str(fallback_path)
+            changed = True
+            return
+        normalized_text = str(candidate)
+        if normalized_text != raw_value:
+            normalized[key] = normalized_text
+            changed = True
+
+    _normalize_key("sampled_dir", fallback_sampled_dir)
+    _normalize_key("raw_dir", fallback_raw_dir)
+    if not changed:
+        return normalized
+
+    normalized["updated_at"] = utc_now_iso()
+
+    def _upsert_normalized(registry_payload: dict[str, Any]) -> None:
+        _upsert_registry_entry(
+            registry_payload["dataset_sources"],
+            key="dataset_source_id",
+            value=dataset_source_id,
+            payload=normalized,
+        )
+
+    _mutate_dataset_registry(job, _upsert_normalized)
+    job.logger.warning(
+        "dataset source path normalized to drive_root | dataset_source_id=%s | sampled_dir=%s | raw_dir=%s",
+        dataset_source_id,
+        str(normalized.get("sampled_dir", "")),
+        str(normalized.get("raw_dir", "")),
+    )
+    job.write_event(
+        "dataset_source_path_normalized",
+        dataset_source_id=dataset_source_id,
+        sampled_dir=str(normalized.get("sampled_dir", "")),
+        raw_dir=str(normalized.get("raw_dir", "")),
+    )
+    return normalized
 
 
 def _discover_legacy_dataset_source(job: JobContext, dataset_source_id: str) -> dict[str, Any] | None:
@@ -1620,7 +1697,7 @@ def _discover_legacy_dataset_source(job: JobContext, dataset_source_id: str) -> 
                 )
 
             _mutate_dataset_registry(job, _upsert_metadata)
-            return payload
+            return _normalize_dataset_source_entry_paths(job, payload)
 
         raw_dir_name = dataset_source_id
         if dataset_source_id.startswith("sampled_"):
@@ -1662,7 +1739,7 @@ def _discover_legacy_dataset_source(job: JobContext, dataset_source_id: str) -> 
         _write_json(sampled_dir / "_dataset_source_metadata.json", payload)
         if raw_dir.exists():
             _write_json(raw_dir / "_dataset_source_metadata.json", payload)
-        return payload
+        return _normalize_dataset_source_entry_paths(job, payload)
     return None
 
 
