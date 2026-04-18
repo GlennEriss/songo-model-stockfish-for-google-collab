@@ -814,6 +814,12 @@ def _is_drive_root_operational_artifact_name(file_name: str) -> bool:
         return True
     if name.startswith("bench_models") and name.endswith(".json"):
         return True
+    if name.startswith("model_songo"):
+        return True
+    if name.startswith("labeled_positions"):
+        return True
+    if name.startswith("dataset"):
+        return True
     if name.startswith("latest_dataset_pipeline"):
         return True
     if name.startswith("tournament_progress") and (
@@ -824,9 +830,9 @@ def _is_drive_root_operational_artifact_name(file_name: str) -> bool:
         return True
     if name.startswith("metrics") and name.endswith(".jsonl"):
         return True
-    if name.startswith("mcts") and (name.endswith(".json") or name.endswith(".jsonl")):
+    if name.startswith("mcts"):
         return True
-    if name.startswith("minimax") and (name.endswith(".json") or name.endswith(".jsonl")):
+    if name.startswith("minimax"):
         return True
     if name.startswith("metadata") and name.endswith(".json"):
         return True
@@ -864,6 +870,12 @@ def _drive_root_operational_artifact_group_key(file_name: str) -> str:
         return "dataset_benchmatch"
     if name.startswith("bench_models") and name.endswith(".json"):
         return "bench_models.json"
+    if name.startswith("model_songo"):
+        return "model_songo"
+    if name.startswith("labeled_positions"):
+        return "labeled_positions"
+    if name.startswith("dataset"):
+        return "dataset"
     if name.startswith("latest_dataset_pipeline"):
         return "latest_dataset_pipeline.json"
     if name.startswith("tournament_progress"):
