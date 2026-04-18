@@ -1127,7 +1127,14 @@ cells = [
             'model_songo_policy*',
             'bench_models*.json',
             'build_dataset*.log',
-            'dataset_registry.json',
+            'dataset_registry*.json',
+            'config*.yaml',
+            'dataset_generation_summary.json',
+            'dataset_build_summary.json',
+            'training_summary.json',
+            'evaluation_summary.json',
+            'benchmark_summary.json',
+            '*dataset*_summary.json',
             'config.yaml',
             'run_status.json',
             'state.json',
@@ -1137,10 +1144,16 @@ cells = [
             '._dataset*.tmp.*',
             '.model*.tmp.*',
             '._model*.tmp.*',
+            '.config*.yaml.tmp.*',
             '.config.yaml.tmp.*',
             '.run_status.json.tmp.*',
             '.state.json.tmp.*',
             '.dataset_registry.json.tmp.*',
+            '.dataset_generation_summary.json.tmp.*',
+            '.dataset_build_summary.json.tmp.*',
+            '.training_summary.json.tmp.*',
+            '.evaluation_summary.json.tmp.*',
+            '.benchmark_summary.json.tmp.*',
             '._dataset_source_metadata.json.tmp.*',
             '.bench_models*.tmp.*',
         ]
@@ -1323,12 +1336,35 @@ cells = [
                     return 0
                 if name.startswith('.quarantine'):
                     return 1
-                if name.startswith('_dataset'):
+                if name in {
+                    'config.yaml',
+                    'run_status.json',
+                    'state.json',
+                    'dataset_registry.json',
+                    'dataset_generation_summary.json',
+                    'dataset_build_summary.json',
+                    'training_summary.json',
+                    'evaluation_summary.json',
+                    'benchmark_summary.json',
+                    '_dataset_source_metadata.json',
+                }:
                     return 2
-                if name.startswith('bench_models') and name.endswith('.json'):
+                if name.startswith('config') and name.endswith('.yaml'):
+                    return 2
+                if name.startswith('dataset_registry') and name.endswith('.json'):
+                    return 2
+                if name.endswith('_summary.json') and (
+                    'dataset' in name or 'train' in name or 'evaluation' in name or 'benchmark' in name
+                ):
+                    return 2
+                if name.startswith('_dataset'):
                     return 3
-                if name.startswith('model_songo_policy') or name.endswith('.model'):
+                if name.startswith('.dataset') or name.startswith('._dataset'):
+                    return 3
+                if name.startswith('bench_models') and name.endswith('.json'):
                     return 4
+                if name.startswith('model_songo_policy') or name.endswith('.model'):
+                    return 5
                 return 9
 
             unique_candidates = sorted(unique_candidates, key=lambda p: (_candidate_priority(p), len(p.parts), str(p)))

@@ -194,6 +194,11 @@ def _cleanup_external_drive_artifacts(*, drive_root: Path, apply: bool, now_epoc
         "_dataset_source_metadata.json",
         "bench_models_20m_global.json",
         "dataset_registry.json",
+        "dataset_generation_summary.json",
+        "dataset_build_summary.json",
+        "training_summary.json",
+        "evaluation_summary.json",
+        "benchmark_summary.json",
         "config.yaml",
         "run_status.json",
         "state.json",
@@ -232,6 +237,17 @@ def _cleanup_external_drive_artifacts(*, drive_root: Path, apply: bool, now_epoc
             return True
         if name in known_file_names:
             return True
+        if lower_name.startswith("config") and lower_name.endswith(".yaml"):
+            return True
+        if lower_name.startswith("dataset_registry") and lower_name.endswith(".json"):
+            return True
+        if lower_name.endswith("_summary.json") and (
+            "dataset" in lower_name
+            or "train" in lower_name
+            or "evaluation" in lower_name
+            or "benchmark" in lower_name
+        ):
+            return True
         if name.startswith("bench_models_") and name.endswith(".json"):
             return True
         if lower_name.startswith("build_dataset") and lower_name.endswith(".log"):
@@ -246,9 +262,18 @@ def _cleanup_external_drive_artifacts(*, drive_root: Path, apply: bool, now_epoc
                 or lower_name.startswith("._model")
                 or lower_name.startswith(".bench_models")
                 or "config.yaml.tmp." in lower_name
+                or (
+                    ("config" in lower_name or lower_name.startswith(".config") or lower_name.startswith("._config"))
+                    and ".yaml.tmp." in lower_name
+                )
                 or "run_status.json.tmp." in lower_name
                 or "state.json.tmp." in lower_name
                 or "dataset_registry.json.tmp." in lower_name
+                or "dataset_generation_summary.json.tmp." in lower_name
+                or "dataset_build_summary.json.tmp." in lower_name
+                or "training_summary.json.tmp." in lower_name
+                or "evaluation_summary.json.tmp." in lower_name
+                or "benchmark_summary.json.tmp." in lower_name
                 or "_dataset_source_metadata.json.tmp" in lower_name
             ):
                 return True
