@@ -1077,42 +1077,255 @@ cells = [
         """
         # Maintenance stockage hebdo:
         # - retention TTL (events/metrics, quarantine, reports benchmark, checkpoints intermediaires)
-        # - purge raw inactif + label_cache + modeles non conserves
-        # Par defaut: DRY_RUN=True pour inspecter avant suppression reelle.
+        # - correction artefacts ecrits hors dossier principal Drive (MyDrive/songo-stockfish)
+        # - purge artefacts non critiques en doublon (quarantine, streams, metadata dupliquees)
+        # - sans toucher aux datasets finaux ni aux modeles par defaut
+        # Workflow recommande: d'abord DRY_RUN, puis APPLY.
 
-        import shlex
+        import json
+        import os
         import subprocess
+        from pathlib import Path
 
-        STORAGE_CLEANUP_DRY_RUN = True
+        STORAGE_CLEANUP_DRY_RUN = True  # False => ajoute --apply
+        STORAGE_CLEANUP_SCOPE = 'safe_noncritical'  # 'external_only' | 'safe_noncritical' | 'full'
+        STORAGE_CLEANUP_PURGE_MODELS = False  # True seulement si tu veux vraiment purger les modeles
+        STORAGE_CLEANUP_ALLOW_MODEL_PURGE = False  # Double garde-fou explicite
         STORAGE_CLEANUP_KEEP_MODEL_ID = 'songo_policy_value_colab_pro_v12'
-        STORAGE_CLEANUP_CONFIG_PATH = str(TRAIN_CONTINUE_CONFIG_ACTIVE_PATH)
-
-        cleanup_cmd = (
-            f"cd {shlex.quote(WORKTREE)} && "
-            f"PYTHONPATH={shlex.quote(f'{WORKTREE}/src')} "
-            f"{shlex.quote(PYTHON_BIN)} -m songo_model_stockfish.cli.main storage-cleanup "
-            f"--config {shlex.quote(STORAGE_CLEANUP_CONFIG_PATH)} "
-            f"--retention "
-            f"--fix-external-artifacts "
-            f"--purge-runtime-backup-streams "
-            f"--purge-drive-raw "
-            f"--purge-drive-raw-include-inactive-partial "
-            f"--purge-drive-raw-inactive-min-age-hours 48 "
-            f"--purge-drive-label-cache "
-            f"--purge-models "
-            f"--keep-model-id {shlex.quote(STORAGE_CLEANUP_KEEP_MODEL_ID)} "
-            f"--keep-top-models 0 "
-            + ("" if STORAGE_CLEANUP_DRY_RUN else "--apply ")
+        STORAGE_CLEANUP_CONFIG_PATH = str(
+            globals().get(
+                'TRAIN_CONTINUE_CONFIG_ACTIVE_PATH',
+                globals().get('TRAIN_CONTINUE_CONFIG_ACTIVE', 'config/train.full_matrix.colab_pro.yaml'),
+            )
         )
+
+        cleanup_cmd = [
+            str(PYTHON_BIN),
+            '-m',
+            'songo_model_stockfish.cli.main',
+            'storage-cleanup',
+            '--config',
+            str(STORAGE_CLEANUP_CONFIG_PATH),
+            '--fix-external-artifacts',
+        ]
+        scope_value = str(STORAGE_CLEANUP_SCOPE).strip().lower()
+        if scope_value in {'safe_noncritical', 'full'}:
+            cleanup_cmd.extend(
+                [
+                    '--purge-runtime-backup-streams',
+                    '--purge-quarantine',
+                    '--purge-duplicate-source-metadata',
+                    '--purge-global-progress-mirrors',
+                    '--purge-pipeline-manifests',
+                    '--purge-completed-job-dirs',
+                ]
+            )
+        if scope_value == 'full':
+            cleanup_cmd.extend(
+                [
+                    '--retention',
+                    '--purge-drive-raw',
+                    '--purge-drive-raw-include-inactive-partial',
+                    '--purge-drive-raw-inactive-min-age-hours',
+                    '48',
+                    '--purge-drive-label-cache',
+                ]
+            )
+            if bool(STORAGE_CLEANUP_PURGE_MODELS):
+                if not bool(STORAGE_CLEANUP_ALLOW_MODEL_PURGE):
+                    raise RuntimeError(
+                        'Refus de purge modeles: active aussi STORAGE_CLEANUP_ALLOW_MODEL_PURGE=True '
+                        'pour confirmer explicitement.'
+                    )
+                cleanup_cmd.extend(
+                    [
+                        '--purge-models',
+                        '--allow-model-purge',
+                        '--keep-model-id',
+                        str(STORAGE_CLEANUP_KEEP_MODEL_ID),
+                        '--keep-top-models',
+                        '0',
+                    ]
+                )
+        if not bool(STORAGE_CLEANUP_DRY_RUN):
+            cleanup_cmd.append('--apply')
+
+        env = dict(os.environ)
+        env['PYTHONPATH'] = str(Path(WORKTREE) / 'src')
 
         print('Maintenance hebdo config:')
         print('  dry_run          =', STORAGE_CLEANUP_DRY_RUN)
+        print('  scope            =', STORAGE_CLEANUP_SCOPE)
+        print('  purge_models     =', STORAGE_CLEANUP_PURGE_MODELS)
+        print('  allow_model_purge =', STORAGE_CLEANUP_ALLOW_MODEL_PURGE)
         print('  keep_model_id    =', STORAGE_CLEANUP_KEEP_MODEL_ID)
         print('  config_path      =', STORAGE_CLEANUP_CONFIG_PATH)
         print('  command          =', cleanup_cmd)
 
-        subprocess.run(['/bin/bash', '-lc', cleanup_cmd], check=True)
+        proc = subprocess.run(
+            cleanup_cmd,
+            cwd=str(WORKTREE),
+            env=env,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        if proc.stderr.strip():
+            print('[stderr]')
+            print(proc.stderr.strip())
+        stdout_text = proc.stdout.strip()
+        if stdout_text:
+            print('[stdout]')
+            print(stdout_text)
+        cleanup_report = {}
+        try:
+            cleanup_report = json.loads(stdout_text) if stdout_text else {}
+        except Exception:
+            cleanup_report = {}
+
+        ext_step = dict(cleanup_report.get('steps', {}).get('external_artifacts_cleanup', {}) or {})
+        moved_count = len(ext_step.get('moved', []) or [])
+        skipped_count = len(ext_step.get('skipped', []) or [])
+        errors_count = len(ext_step.get('errors', []) or [])
+        print('External artifacts summary:')
+        print('  moved   =', moved_count)
+        print('  skipped =', skipped_count)
+        print('  errors  =', errors_count)
+        if moved_count:
+            preview = (ext_step.get('moved') or [])[:10]
+            print('  moved_preview =')
+            for item in preview:
+                if isinstance(item, dict):
+                    print('   -', item.get('src', '<none>'), '=>', item.get('dst', '<none>'))
+
         print('Maintenance hebdo terminee.')
+        """
+    ),
+    md("## 3quater. Audit Usage Datasets (Train)"),
+    code(
+        """
+        # Historique datasets utilises par les jobs train:
+        # - top des datasets les plus utilises
+        # - dataset primaire recommande (objectif: dataset final unique)
+        # - candidats purge (sans suppression automatique)
+        import json
+        import os
+        import subprocess
+        from pathlib import Path
+
+        DATASET_USAGE_CONFIG_PATH = str(
+            globals().get(
+                'TRAIN_CONTINUE_CONFIG_ACTIVE_PATH',
+                globals().get('TRAIN_CONTINUE_CONFIG_ACTIVE', 'config/train.full_matrix.colab_pro.yaml'),
+            )
+        )
+        DATASET_USAGE_SYNC_FROM_JOBS = True
+        DATASET_USAGE_INCLUDE_JOB_SCAN = True
+        DATASET_USAGE_PURGE_MIN_AGE_DAYS = 7.0
+        DATASET_USAGE_TOP = 12
+        DATASET_USAGE_MAX_PURGE = 20
+        DATASET_USAGE_KEEP_DATASET_IDS = []
+
+        usage_cmd = [
+            str(PYTHON_BIN),
+            '-m',
+            'songo_model_stockfish.cli.main',
+            'dataset-usage',
+            '--config',
+            str(DATASET_USAGE_CONFIG_PATH),
+            '--json',
+            '--top',
+            str(int(DATASET_USAGE_TOP)),
+            '--max-purge-candidates',
+            str(int(DATASET_USAGE_MAX_PURGE)),
+            '--purge-min-age-days',
+            str(float(DATASET_USAGE_PURGE_MIN_AGE_DAYS)),
+        ]
+        if not bool(DATASET_USAGE_SYNC_FROM_JOBS):
+            usage_cmd.append('--no-sync-history-from-jobs')
+        if not bool(DATASET_USAGE_INCLUDE_JOB_SCAN):
+            usage_cmd.append('--no-include-job-scan')
+        for dataset_id in DATASET_USAGE_KEEP_DATASET_IDS:
+            text = str(dataset_id or '').strip()
+            if not text:
+                continue
+            usage_cmd.extend(['--keep-dataset-id', text])
+
+        env = dict(os.environ)
+        env['PYTHONPATH'] = str(Path(WORKTREE) / 'src')
+
+        print('Dataset usage audit config:')
+        print('  config_path             =', DATASET_USAGE_CONFIG_PATH)
+        print('  include_job_scan        =', DATASET_USAGE_INCLUDE_JOB_SCAN)
+        print('  sync_history_from_jobs  =', DATASET_USAGE_SYNC_FROM_JOBS)
+        print('  purge_min_age_days      =', DATASET_USAGE_PURGE_MIN_AGE_DAYS)
+        print('  top                     =', DATASET_USAGE_TOP)
+        print('  max_purge_candidates    =', DATASET_USAGE_MAX_PURGE)
+        print('  keep_dataset_ids        =', DATASET_USAGE_KEEP_DATASET_IDS)
+        print('  command                 =', usage_cmd)
+
+        usage_proc = subprocess.run(
+            usage_cmd,
+            cwd=str(WORKTREE),
+            env=env,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        if usage_proc.stderr.strip():
+            print('[stderr]')
+            print(usage_proc.stderr.strip())
+        usage_stdout = usage_proc.stdout.strip()
+        usage_report = json.loads(usage_stdout) if usage_stdout else {}
+        print('Dataset usage summary:')
+        print('  history_entries_total       =', usage_report.get('history_entries_total', 0))
+        print('  history_entries_from_scan   =', usage_report.get('history_entries_from_scan', 0))
+        print('  history_synced_from_jobs    =', usage_report.get('history_synced_from_jobs', False))
+        print('  recommended_primary_dataset =', usage_report.get('recommended_primary_dataset_id', '<none>'))
+        print('  most_used_dataset           =', usage_report.get('most_used_dataset_id', '<none>'))
+        print('  keep_dataset_ids            =', usage_report.get('keep_dataset_ids', []))
+
+        print('\\nTop datasets:')
+        top_rows = usage_report.get('top_datasets', []) if isinstance(usage_report, dict) else []
+        if not top_rows:
+            print('  - none')
+        else:
+            for row in top_rows:
+                if not isinstance(row, dict):
+                    continue
+                print(
+                    '  -',
+                    row.get('dataset_id', '<none>'),
+                    '| completed_runs=',
+                    row.get('completed_runs', 0),
+                    '| train_runs=',
+                    row.get('train_runs', 0),
+                    '| labeled_samples=',
+                    row.get('labeled_samples', 0),
+                    '| last_used_at=',
+                    row.get('last_used_at', '<none>'),
+                )
+
+        print('\\nPurge candidates:')
+        purge_rows = usage_report.get('purge_candidates', []) if isinstance(usage_report, dict) else []
+        if not purge_rows:
+            print('  - none')
+        else:
+            for row in purge_rows:
+                if not isinstance(row, dict):
+                    continue
+                print(
+                    '  -',
+                    row.get('dataset_id', '<none>'),
+                    '| reason=',
+                    row.get('reason', '<none>'),
+                    '| completed_runs=',
+                    row.get('completed_runs', 0),
+                    '| labeled_samples=',
+                    row.get('labeled_samples', 0),
+                    '| last_used_age_s=',
+                    row.get('last_used_age_seconds', 0),
+                )
         """
     ),
     md("## 4. Generer les configs actives"),

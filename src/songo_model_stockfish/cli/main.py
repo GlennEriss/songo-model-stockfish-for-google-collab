@@ -225,6 +225,80 @@ def _dataset_list(config_path: str | None, *, kind: str, output_json: bool) -> i
     return 0
 
 
+def _dataset_usage(
+    config_path: str,
+    *,
+    output_json: bool,
+    include_job_scan: bool,
+    sync_history_from_jobs: bool,
+    keep_dataset_ids: list[str],
+    purge_min_age_days: float,
+    max_purge_candidates: int,
+    top_n: int,
+) -> int:
+    from songo_model_stockfish.ops.dataset_usage_history import build_dataset_usage_report
+
+    config = load_yaml_config(config_path)
+    paths = build_project_paths(config)
+    report = build_dataset_usage_report(
+        paths=paths,
+        config=config,
+        include_job_scan=bool(include_job_scan),
+        sync_history_from_jobs=bool(sync_history_from_jobs),
+        keep_dataset_ids=list(keep_dataset_ids or []),
+        purge_min_age_seconds=max(0.0, float(purge_min_age_days) * 86400.0),
+        max_purge_candidates=max(0, int(max_purge_candidates)),
+        top_n=max(1, int(top_n)),
+    )
+    if output_json:
+        print(json.dumps(report, indent=2, ensure_ascii=True))
+        return 0
+
+    print("Dataset usage history")
+    print(
+        f"- history_entries={report.get('history_entries_total', 0)} "
+        f"| from_job_scan={report.get('history_entries_from_scan', 0)} "
+        f"| synced={report.get('history_synced_from_jobs', False)}"
+    )
+    print(
+        f"- recommended_primary_dataset_id={report.get('recommended_primary_dataset_id', '<none>')} "
+        f"| most_used_dataset_id={report.get('most_used_dataset_id', '<none>')} "
+        f"| largest_built_dataset_id={report.get('largest_built_dataset_id', '<none>')}"
+    )
+    print(f"- keep_dataset_ids={report.get('keep_dataset_ids', [])}")
+    print("")
+    print("Top datasets:")
+    top_rows = report.get("top_datasets", [])
+    if isinstance(top_rows, list) and top_rows:
+        for row in top_rows:
+            if not isinstance(row, dict):
+                continue
+            print(
+                f"- {row.get('dataset_id')} | completed_runs={row.get('completed_runs', 0)} | "
+                f"train_runs={row.get('train_runs', 0)} | "
+                f"last_used_at={row.get('last_used_at', '<none>')} | "
+                f"labeled_samples={row.get('labeled_samples', 0)} | keep={row.get('is_keep', False)}"
+            )
+    else:
+        print("- none")
+    print("")
+    print("Purge candidates:")
+    purge_rows = report.get("purge_candidates", [])
+    if isinstance(purge_rows, list) and purge_rows:
+        for row in purge_rows:
+            if not isinstance(row, dict):
+                continue
+            print(
+                f"- {row.get('dataset_id')} | reason={row.get('reason')} | "
+                f"completed_runs={row.get('completed_runs', 0)} | "
+                f"last_used_age_s={row.get('last_used_age_seconds', 0)} | "
+                f"labeled_samples={row.get('labeled_samples', 0)}"
+            )
+    else:
+        print("- none")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="songo_model_stockfish")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -289,6 +363,16 @@ def build_parser() -> argparse.ArgumentParser:
     dataset_list.add_argument("--kind", choices=["all", "sources", "built"], default="all")
     dataset_list.add_argument("--json", action="store_true")
 
+    dataset_usage = subparsers.add_parser("dataset-usage")
+    dataset_usage.add_argument("--config", required=True)
+    dataset_usage.add_argument("--json", action="store_true")
+    dataset_usage.add_argument("--include-job-scan", action=argparse.BooleanOptionalAction, default=True)
+    dataset_usage.add_argument("--sync-history-from-jobs", action=argparse.BooleanOptionalAction, default=True)
+    dataset_usage.add_argument("--keep-dataset-id", action="append", default=[])
+    dataset_usage.add_argument("--purge-min-age-days", type=float, default=7.0)
+    dataset_usage.add_argument("--max-purge-candidates", type=int, default=25)
+    dataset_usage.add_argument("--top", type=int, default=10)
+
     storage_cleanup = subparsers.add_parser("storage-cleanup")
     storage_cleanup.add_argument("--config", required=True)
     storage_cleanup.add_argument("--apply", action="store_true")
@@ -301,14 +385,27 @@ def build_parser() -> argparse.ArgumentParser:
     storage_cleanup.add_argument("--purge-drive-raw-inactive-min-age-hours", type=float, default=48.0)
     storage_cleanup.add_argument("--purge-drive-label-cache", action="store_true")
     storage_cleanup.add_argument("--purge-models", action="store_true")
+    storage_cleanup.add_argument("--allow-model-purge", action="store_true")
     storage_cleanup.add_argument("--retention", action="store_true")
     storage_cleanup.add_argument("--fix-external-artifacts", action="store_true")
+    storage_cleanup.add_argument("--purge-quarantine", action="store_true")
+    storage_cleanup.add_argument("--purge-duplicate-source-metadata", action="store_true")
+    storage_cleanup.add_argument("--purge-global-progress-mirrors", action="store_true")
+    storage_cleanup.add_argument("--purge-pipeline-manifests", action="store_true")
+    storage_cleanup.add_argument("--purge-completed-job-dirs", action="store_true")
     storage_cleanup.add_argument("--retention-job-stream-ttl-hours", type=float, default=72.0)
     storage_cleanup.add_argument("--retention-quarantine-ttl-hours", type=float, default=72.0)
     storage_cleanup.add_argument("--retention-benchmark-report-ttl-days", type=float, default=45.0)
     storage_cleanup.add_argument("--retention-benchmark-keep-recent", type=int, default=60)
     storage_cleanup.add_argument("--retention-checkpoint-ttl-days", type=float, default=14.0)
     storage_cleanup.add_argument("--retention-checkpoint-keep-recent-per-model", type=int, default=2)
+    storage_cleanup.add_argument("--retention-global-progress-ttl-days", type=float, default=14.0)
+    storage_cleanup.add_argument("--retention-global-progress-keep-recent", type=int, default=3)
+    storage_cleanup.add_argument("--retention-pipeline-manifest-ttl-days", type=float, default=14.0)
+    storage_cleanup.add_argument("--retention-pipeline-manifest-keep-recent", type=int, default=60)
+    storage_cleanup.add_argument("--retention-completed-job-dir-ttl-days", type=float, default=14.0)
+    storage_cleanup.add_argument("--retention-completed-job-dir-keep-recent-per-run-type", type=int, default=8)
+    storage_cleanup.add_argument("--retention-source-metadata-raw-ttl-hours", type=float, default=24.0)
     storage_cleanup.add_argument("--keep-model-id", action="append", default=[])
     storage_cleanup.add_argument("--keep-model-ids")
     storage_cleanup.add_argument("--keep-top-models", type=int, default=1)
@@ -371,6 +468,17 @@ def main(argv: list[str] | None = None) -> int:
         return _status(args.job_id)
     if args.command == "dataset-list":
         return _dataset_list(args.config, kind=args.kind, output_json=args.json)
+    if args.command == "dataset-usage":
+        return _dataset_usage(
+            args.config,
+            output_json=bool(args.json),
+            include_job_scan=bool(args.include_job_scan),
+            sync_history_from_jobs=bool(args.sync_history_from_jobs),
+            keep_dataset_ids=list(args.keep_dataset_id or []),
+            purge_min_age_days=float(args.purge_min_age_days),
+            max_purge_candidates=int(args.max_purge_candidates),
+            top_n=int(args.top),
+        )
     if args.command == "storage-cleanup":
         from songo_model_stockfish.ops.storage_cleanup import run_storage_cleanup
 
@@ -380,6 +488,21 @@ def main(argv: list[str] | None = None) -> int:
         if str(args.keep_model_ids or "").strip():
             keep_model_ids.extend([item.strip() for item in str(args.keep_model_ids).split(",") if item.strip()])
         cleanup_all = bool(args.all)
+        requested_model_cleanup = bool(cleanup_all or args.purge_models)
+        allow_model_purge = bool(args.allow_model_purge)
+        effective_model_cleanup = bool(requested_model_cleanup and allow_model_purge)
+        if requested_model_cleanup and not allow_model_purge:
+            print(
+                json.dumps(
+                    {
+                        "warning": (
+                            "model_cleanup_blocked_by_safety: ajoute --allow-model-purge "
+                            "pour autoriser une purge des modeles."
+                        )
+                    },
+                    ensure_ascii=True,
+                )
+            )
         result = run_storage_cleanup(
             config=config,
             paths=paths,
@@ -388,9 +511,14 @@ def main(argv: list[str] | None = None) -> int:
             cleanup_runtime_backup_streams=bool(cleanup_all or args.purge_runtime_backup_streams),
             cleanup_drive_raw_dirs=bool(cleanup_all or args.purge_drive_raw),
             cleanup_drive_label_cache=bool(cleanup_all or args.purge_drive_label_cache),
-            cleanup_models=bool(cleanup_all or args.purge_models),
+            cleanup_models=bool(effective_model_cleanup),
             cleanup_retention=bool(cleanup_all or args.retention),
             cleanup_external_artifacts=bool(cleanup_all or args.fix_external_artifacts),
+            cleanup_quarantine_dirs=bool(cleanup_all or args.purge_quarantine),
+            cleanup_duplicate_source_metadata=bool(cleanup_all or args.purge_duplicate_source_metadata),
+            cleanup_global_progress_mirrors=bool(cleanup_all or args.purge_global_progress_mirrors),
+            cleanup_pipeline_manifests=bool(cleanup_all or args.purge_pipeline_manifests),
+            cleanup_completed_job_dirs=bool(cleanup_all or args.purge_completed_job_dirs),
             keep_model_ids=keep_model_ids,
             keep_top_models=int(args.keep_top_models),
             keep_dataset_ids=list(args.keep_dataset_id or []),
@@ -403,6 +531,15 @@ def main(argv: list[str] | None = None) -> int:
             retention_benchmark_keep_recent=max(0, int(args.retention_benchmark_keep_recent)),
             retention_checkpoint_ttl_seconds=max(0.0, float(args.retention_checkpoint_ttl_days) * 86400.0),
             retention_checkpoint_keep_recent_per_model=max(0, int(args.retention_checkpoint_keep_recent_per_model)),
+            retention_global_progress_ttl_seconds=max(0.0, float(args.retention_global_progress_ttl_days) * 86400.0),
+            retention_global_progress_keep_recent=max(0, int(args.retention_global_progress_keep_recent)),
+            retention_pipeline_manifest_ttl_seconds=max(0.0, float(args.retention_pipeline_manifest_ttl_days) * 86400.0),
+            retention_pipeline_manifest_keep_recent=max(0, int(args.retention_pipeline_manifest_keep_recent)),
+            retention_job_dir_ttl_seconds=max(0.0, float(args.retention_completed_job_dir_ttl_days) * 86400.0),
+            retention_job_dir_keep_recent_per_run_type=max(
+                0, int(args.retention_completed_job_dir_keep_recent_per_run_type)
+            ),
+            retention_source_metadata_raw_ttl_seconds=max(0.0, float(args.retention_source_metadata_raw_ttl_hours) * 3600.0),
         )
         print(json.dumps(result, indent=2, ensure_ascii=True))
         return 0

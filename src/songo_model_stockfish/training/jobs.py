@@ -11,6 +11,7 @@ from torch.amp import GradScaler, autocast
 
 from songo_model_stockfish.ops.io_utils import read_json_dict, write_json_atomic
 from songo_model_stockfish.ops.job import JobContext
+from songo_model_stockfish.ops.dataset_usage_history import record_training_dataset_usage
 from songo_model_stockfish.ops.logging import utc_now_iso
 from songo_model_stockfish.ops.model_registry import next_model_version, promote_best_model, promoted_best_dir, upsert_model_record
 from songo_model_stockfish.training.data import build_dataloader
@@ -1120,6 +1121,44 @@ def run_train(job: JobContext) -> dict[str, object]:
         "history": history,
     }
     job.write_artifact_json("training_summary.json", training_summary, ensure_ascii=True, indent=2)
+    try:
+        dataset_usage_update = record_training_dataset_usage(
+            paths=job.paths,
+            job_id=job.job_id,
+            dataset_id=dataset_id,
+            dataset_selection_mode=dataset_selection_mode,
+            model_id=model_id,
+            status="completed",
+            completed_at=utc_now_iso(),
+            completed_epochs=int(training_summary.get("completed_epochs", 0)),
+            requested_epochs=int(training_summary.get("epochs", 0)),
+            best_validation_metric=float(training_summary.get("best_validation_metric", 0.0)),
+            job_dir=str(job.job_dir),
+            training_summary_path=str(job.job_dir / "training_summary.json"),
+            keep_entries=max(100, int(cfg.get("dataset_usage_history_max_entries", 4000))),
+        )
+        job.write_event(
+            "dataset_usage_history_updated",
+            history_path=str(dataset_usage_update.get("history_path", "")),
+            entries_total=int(dataset_usage_update.get("entries_total", 0)),
+            dataset_id=str(dataset_usage_update.get("dataset_id", dataset_id)),
+            dataset_train_runs=int(dataset_usage_update.get("dataset_train_runs", 0)),
+            dataset_completed_runs=int(dataset_usage_update.get("dataset_completed_runs", 0)),
+        )
+    except Exception as exc:
+        job.logger.warning(
+            "dataset usage history update failed | job=%s | dataset=%s | cause=%s: %s",
+            job.job_id,
+            dataset_id,
+            type(exc).__name__,
+            exc,
+        )
+        job.write_event(
+            "dataset_usage_history_update_failed",
+            error=f"{type(exc).__name__}: {exc}",
+            dataset_id=dataset_id,
+            model_id=model_id,
+        )
 
     model_card = {
         "model_id": model_id,

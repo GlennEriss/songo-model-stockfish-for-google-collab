@@ -241,3 +241,258 @@ def test_external_artifacts_cleanup_moves_known_items_outside_drive_root(tmp_pat
     moved_sources = {str(item.get("src", "")) for item in step.get("moved", []) if isinstance(item, dict)}
     assert str(external_quarantine) in moved_sources
     assert str(external_progress) in moved_sources
+
+
+def test_duplicate_source_metadata_cleanup_removes_raw_copy_when_identical(tmp_path: Path) -> None:
+    drive_root = tmp_path / "drive"
+    drive_root.mkdir(parents=True, exist_ok=True)
+    cfg = _make_config(drive_root)
+    paths = build_project_paths(cfg)
+
+    raw_dir = paths.drive_root / "data" / "raw_meta_source"
+    sampled_dir = paths.drive_root / "data" / "sampled_meta_source"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    sampled_dir.mkdir(parents=True, exist_ok=True)
+    payload = {"dataset_source_id": "sampled_meta_source", "status": "completed"}
+    _write_json(raw_dir / "_dataset_source_metadata.json", payload)
+    _write_json(sampled_dir / "_dataset_source_metadata.json", payload)
+    _write_json(
+        paths.data_root / "dataset_registry.json",
+        {
+            "dataset_sources": [
+                {
+                    "dataset_source_id": "sampled_meta_source",
+                    "raw_dir": str(raw_dir),
+                    "sampled_dir": str(sampled_dir),
+                }
+            ],
+            "built_datasets": [],
+        },
+    )
+
+    report = run_storage_cleanup(
+        config=cfg,
+        paths=paths,
+        apply=False,
+        cleanup_runtime_migration=False,
+        cleanup_runtime_backup_streams=False,
+        cleanup_drive_raw_dirs=False,
+        cleanup_drive_label_cache=False,
+        cleanup_models=False,
+        cleanup_retention=False,
+        cleanup_external_artifacts=False,
+        cleanup_duplicate_source_metadata=True,
+        keep_model_ids=[],
+        keep_top_models=0,
+        keep_dataset_ids=[],
+    )
+
+    step = report["steps"]["duplicate_source_metadata_cleanup"]
+    removed = set(str(item) for item in step.get("removed_raw_metadata", []))
+    assert str(raw_dir / "_dataset_source_metadata.json") in removed
+
+
+def test_global_progress_cleanup_removes_old_unprotected_targets(tmp_path: Path) -> None:
+    drive_root = tmp_path / "drive"
+    drive_root.mkdir(parents=True, exist_ok=True)
+    cfg = _make_config(drive_root)
+    cfg["dataset_generation"] = {"global_target_id": "bench_models_20m_global"}
+    paths = build_project_paths(cfg)
+
+    progress_root = paths.data_root / "global_generation_progress"
+    progress_root.mkdir(parents=True, exist_ok=True)
+
+    protected_progress = progress_root / "bench_models_20m_global.json"
+    legacy_progress = progress_root / "bench_models_legacy_global.json"
+    recent_progress = progress_root / "bench_models_recent_global.json"
+    protected_progress.write_text("{}", encoding="utf-8")
+    legacy_progress.write_text("{}", encoding="utf-8")
+    recent_progress.write_text("{}", encoding="utf-8")
+
+    legacy_workers = progress_root / "bench_models_legacy_global.workers"
+    legacy_workers.mkdir(parents=True, exist_ok=True)
+    (legacy_workers / "worker_a.json").write_text("{}", encoding="utf-8")
+
+    old_epoch = time.time() - 30.0 * 86400.0
+    os.utime(legacy_progress, (old_epoch, old_epoch))
+    os.utime(legacy_workers, (old_epoch, old_epoch))
+    os.utime(legacy_workers / "worker_a.json", (old_epoch, old_epoch))
+
+    report = run_storage_cleanup(
+        config=cfg,
+        paths=paths,
+        apply=False,
+        cleanup_runtime_migration=False,
+        cleanup_runtime_backup_streams=False,
+        cleanup_drive_raw_dirs=False,
+        cleanup_drive_label_cache=False,
+        cleanup_models=False,
+        cleanup_retention=False,
+        cleanup_external_artifacts=False,
+        cleanup_global_progress_mirrors=True,
+        keep_model_ids=[],
+        keep_top_models=0,
+        keep_dataset_ids=[],
+        retention_global_progress_ttl_seconds=7.0 * 86400.0,
+        retention_global_progress_keep_recent=0,
+    )
+
+    step = report["steps"]["global_progress_cleanup"]
+    removed_progress_files = set(str(item) for item in step.get("removed_progress_files", []))
+    removed_workers_dirs = set(str(item) for item in step.get("removed_workers_dirs", []))
+
+    assert str(legacy_progress) in removed_progress_files
+    assert str(protected_progress) not in removed_progress_files
+    assert str(recent_progress) not in removed_progress_files
+    assert str(legacy_workers) in removed_workers_dirs
+
+
+def test_pipeline_manifest_cleanup_respects_keep_recent_and_ttl(tmp_path: Path) -> None:
+    drive_root = tmp_path / "drive"
+    drive_root.mkdir(parents=True, exist_ok=True)
+    cfg = _make_config(drive_root)
+    paths = build_project_paths(cfg)
+
+    pipeline_root = paths.drive_root / "logs" / "pipeline"
+    pipeline_root.mkdir(parents=True, exist_ok=True)
+
+    old_manifest = pipeline_root / "dataset_pipeline_old.json"
+    mid_manifest = pipeline_root / "dataset_pipeline_mid.json"
+    latest_manifest = pipeline_root / "latest_dataset_pipeline_w1.json"
+    old_manifest.write_text("{}", encoding="utf-8")
+    mid_manifest.write_text("{}", encoding="utf-8")
+    latest_manifest.write_text("{}", encoding="utf-8")
+
+    old_epoch = time.time() - 30.0 * 86400.0
+    mid_epoch = time.time() - 20.0 * 86400.0
+    fresh_epoch = time.time() - 1.0 * 86400.0
+    os.utime(old_manifest, (old_epoch, old_epoch))
+    os.utime(mid_manifest, (mid_epoch, mid_epoch))
+    os.utime(latest_manifest, (fresh_epoch, fresh_epoch))
+
+    report = run_storage_cleanup(
+        config=cfg,
+        paths=paths,
+        apply=False,
+        cleanup_runtime_migration=False,
+        cleanup_runtime_backup_streams=False,
+        cleanup_drive_raw_dirs=False,
+        cleanup_drive_label_cache=False,
+        cleanup_models=False,
+        cleanup_pipeline_manifests=True,
+        keep_model_ids=[],
+        keep_top_models=0,
+        keep_dataset_ids=[],
+        retention_pipeline_manifest_ttl_seconds=7.0 * 86400.0,
+        retention_pipeline_manifest_keep_recent=1,
+    )
+
+    step = report["steps"]["pipeline_manifest_cleanup"]
+    removed = set(str(item) for item in step.get("removed", []))
+    assert str(old_manifest) in removed
+    assert str(mid_manifest) in removed
+    assert str(latest_manifest) not in removed
+
+
+def test_completed_job_dirs_cleanup_keeps_recent_and_protected(tmp_path: Path) -> None:
+    drive_root = tmp_path / "drive"
+    drive_root.mkdir(parents=True, exist_ok=True)
+    cfg = _make_config(drive_root)
+    cfg["train"] = {"job_id": "train_protected_job"}
+    paths = build_project_paths(cfg)
+
+    drive_jobs_root = paths.drive_root / "jobs"
+    backup_jobs_root = paths.drive_root / "runtime_backup" / "jobs"
+    drive_jobs_root.mkdir(parents=True, exist_ok=True)
+    backup_jobs_root.mkdir(parents=True, exist_ok=True)
+
+    train_old = drive_jobs_root / "train_old_job"
+    train_recent = drive_jobs_root / "train_recent_job"
+    train_protected = backup_jobs_root / "train_protected_job"
+    for job_dir in [train_old, train_recent, train_protected]:
+        job_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(train_old / "run_status.json", {"run_type": "train", "status": "completed", "updated_at": "2026-01-01T00:00:00Z"})
+    _write_json(
+        train_recent / "run_status.json",
+        {"run_type": "train", "status": "completed", "updated_at": "2026-04-17T00:00:00Z"},
+    )
+    _write_json(
+        train_protected / "run_status.json",
+        {"run_type": "train", "status": "completed", "updated_at": "2026-01-01T00:00:00Z"},
+    )
+
+    report = run_storage_cleanup(
+        config=cfg,
+        paths=paths,
+        apply=False,
+        cleanup_runtime_migration=False,
+        cleanup_runtime_backup_streams=False,
+        cleanup_drive_raw_dirs=False,
+        cleanup_drive_label_cache=False,
+        cleanup_models=False,
+        cleanup_completed_job_dirs=True,
+        keep_model_ids=[],
+        keep_top_models=0,
+        keep_dataset_ids=[],
+        retention_job_dir_ttl_seconds=7.0 * 86400.0,
+        retention_job_dir_keep_recent_per_run_type=1,
+    )
+
+    step = report["steps"]["completed_job_dirs_cleanup"]
+    removed = {str(item.get("job_dir", "")) for item in step.get("removed", []) if isinstance(item, dict)}
+    assert str(train_old) in removed
+    assert str(train_recent) not in removed
+    assert str(train_protected) not in removed
+
+
+def test_duplicate_source_metadata_cleanup_uses_ttl_for_completed_mismatch(tmp_path: Path) -> None:
+    drive_root = tmp_path / "drive"
+    drive_root.mkdir(parents=True, exist_ok=True)
+    cfg = _make_config(drive_root)
+    paths = build_project_paths(cfg)
+
+    raw_dir = paths.drive_root / "data" / "raw_meta_ttl_source"
+    sampled_dir = paths.drive_root / "data" / "sampled_meta_ttl_source"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    sampled_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(raw_dir / "_dataset_source_metadata.json", {"dataset_source_id": "sampled_meta_ttl_source", "status": "partial"})
+    _write_json(sampled_dir / "_dataset_source_metadata.json", {"dataset_source_id": "sampled_meta_ttl_source", "status": "completed"})
+    _write_json(
+        paths.data_root / "dataset_registry.json",
+        {
+            "dataset_sources": [
+                {
+                    "dataset_source_id": "sampled_meta_ttl_source",
+                    "source_status": "completed",
+                    "raw_dir": str(raw_dir),
+                    "sampled_dir": str(sampled_dir),
+                }
+            ],
+            "built_datasets": [],
+        },
+    )
+    old_epoch = time.time() - 3.0 * 86400.0
+    raw_meta = raw_dir / "_dataset_source_metadata.json"
+    os.utime(raw_meta, (old_epoch, old_epoch))
+
+    report = run_storage_cleanup(
+        config=cfg,
+        paths=paths,
+        apply=False,
+        cleanup_runtime_migration=False,
+        cleanup_runtime_backup_streams=False,
+        cleanup_drive_raw_dirs=False,
+        cleanup_drive_label_cache=False,
+        cleanup_models=False,
+        cleanup_duplicate_source_metadata=True,
+        keep_model_ids=[],
+        keep_top_models=0,
+        keep_dataset_ids=[],
+        retention_source_metadata_raw_ttl_seconds=24.0 * 3600.0,
+    )
+
+    step = report["steps"]["duplicate_source_metadata_cleanup"]
+    removed = set(str(item) for item in step.get("removed_raw_metadata", []))
+    removed_due_to_ttl = set(str(item) for item in step.get("removed_raw_metadata_due_to_ttl", []))
+    assert str(raw_meta) in removed
+    assert str(raw_meta) in removed_due_to_ttl

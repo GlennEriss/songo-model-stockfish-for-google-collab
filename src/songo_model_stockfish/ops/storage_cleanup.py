@@ -193,15 +193,33 @@ def _cleanup_external_drive_artifacts(*, drive_root: Path, apply: bool, now_epoc
             return True
         if name in known_file_names:
             return True
-        if name.startswith("bench_models_") and name.endswith("_global.json"):
+        if name.startswith("bench_models_") and name.endswith(".json"):
             return True
         return False
 
-    for entry in sorted(mydrive_root.iterdir()):
-        if _path_within(entry, drive_root):
+    raw_candidates: list[Path] = []
+    try:
+        for entry in sorted(mydrive_root.rglob("*")):
+            if not entry.exists():
+                continue
+            if _path_within(entry, drive_root):
+                continue
+            if not _is_suspicious_path(entry):
+                continue
+            raw_candidates.append(entry)
+    except Exception as exc:
+        step["errors"].append({"scan": str(mydrive_root), "error": f"{type(exc).__name__}: {exc}"})
+        return step
+
+    # Si un dossier parent est deja candidat, ne pas traiter ses enfants.
+    candidates_sorted = sorted(raw_candidates, key=lambda p: (len(p.parts), str(p)))
+    selected: list[Path] = []
+    for candidate in candidates_sorted:
+        if any(_path_within(candidate, parent) for parent in selected):
             continue
-        if not _is_suspicious_path(entry):
-            continue
+        selected.append(candidate)
+
+    for entry in selected:
         rel_hint = str(entry.relative_to(mydrive_root))
         target = session_root / rel_hint
         if not apply:
@@ -216,6 +234,442 @@ def _cleanup_external_drive_artifacts(*, drive_root: Path, apply: bool, now_epoc
             step["moved"].append({"src": str(entry), "dst": str(target), "mode": "moved"})
         except Exception as exc:
             step["errors"].append({"src": str(entry), "error": f"{type(exc).__name__}: {exc}"})
+    return step
+
+
+def _cleanup_quarantine_dirs(
+    *,
+    drive_root: Path,
+    apply: bool,
+    quarantine_ttl_seconds: float,
+    now_epoch: float | None = None,
+) -> dict[str, Any]:
+    step: dict[str, Any] = {
+        "quarantine_ttl_seconds": float(max(0.0, quarantine_ttl_seconds)),
+        "removed": [],
+        "skipped_recent": 0,
+        "errors": [],
+    }
+    roots = [
+        drive_root / "jobs",
+        drive_root / "logs",
+        drive_root / "runtime_backup",
+        drive_root / "runtime_migration",
+    ]
+    ttl_seconds = float(max(0.0, quarantine_ttl_seconds))
+    for root in roots:
+        if not root.exists():
+            continue
+        try:
+            for path in root.rglob(".quarantine_*"):
+                if not path.exists():
+                    continue
+                if not _path_within(path, drive_root):
+                    continue
+                age_seconds = _path_age_seconds(path, now_epoch=now_epoch)
+                if age_seconds < ttl_seconds:
+                    step["skipped_recent"] = int(step["skipped_recent"]) + 1
+                    continue
+                removed = _remove_tree(path, apply=apply) if path.is_dir() else _remove_file(path, apply=apply)
+                if removed:
+                    step["removed"].append(str(path))
+        except Exception as exc:
+            step["errors"].append(f"quarantine_scan_failed:{type(exc).__name__}:{exc}")
+    return step
+
+
+def _cleanup_duplicate_source_metadata(
+    *,
+    dataset_registry: dict[str, Any],
+    drive_root: Path,
+    apply: bool,
+    raw_metadata_ttl_seconds: float,
+    now_epoch: float | None = None,
+) -> dict[str, Any]:
+    ttl_seconds = float(max(0.0, raw_metadata_ttl_seconds))
+    step: dict[str, Any] = {
+        "raw_metadata_ttl_seconds": ttl_seconds,
+        "removed_raw_metadata": [],
+        "removed_raw_metadata_due_to_ttl": [],
+        "skipped_missing": 0,
+        "skipped_recent_ttl": [],
+        "skipped_mismatch": [],
+        "errors": [],
+    }
+    dataset_sources = dataset_registry.get("dataset_sources", [])
+    if not isinstance(dataset_sources, list):
+        return step
+
+    for entry in dataset_sources:
+        if not isinstance(entry, dict):
+            continue
+        dataset_source_id = str(entry.get("dataset_source_id", "")).strip()
+        raw_dir_text = str(entry.get("raw_dir", "")).strip()
+        sampled_dir_text = str(entry.get("sampled_dir", "")).strip()
+        if not raw_dir_text or not sampled_dir_text:
+            continue
+        source_status = str(entry.get("source_status", "")).strip().lower()
+        raw_dir = Path(raw_dir_text)
+        sampled_dir = Path(sampled_dir_text)
+        raw_meta = raw_dir / "_dataset_source_metadata.json"
+        sampled_meta = sampled_dir / "_dataset_source_metadata.json"
+
+        if not raw_meta.exists() or not sampled_meta.exists():
+            step["skipped_missing"] = int(step["skipped_missing"]) + 1
+            continue
+        if not _path_within(raw_meta, drive_root) or not _path_within(sampled_meta, drive_root):
+            continue
+
+        same_content = False
+        try:
+            raw_payload = _load_json_dict(raw_meta, default={})
+            sampled_payload = _load_json_dict(sampled_meta, default={})
+            if raw_payload and sampled_payload:
+                same_content = raw_payload == sampled_payload
+            else:
+                same_content = raw_meta.read_text(encoding="utf-8") == sampled_meta.read_text(encoding="utf-8")
+        except Exception as exc:
+            step["errors"].append(f"metadata_compare_failed:{dataset_source_id}:{type(exc).__name__}:{exc}")
+            continue
+
+        if not same_content:
+            if source_status == "completed":
+                raw_age_seconds = _path_age_seconds(raw_meta, now_epoch=now_epoch)
+                if raw_age_seconds >= ttl_seconds:
+                    if _remove_file(raw_meta, apply=apply):
+                        step["removed_raw_metadata"].append(str(raw_meta))
+                        step["removed_raw_metadata_due_to_ttl"].append(str(raw_meta))
+                    continue
+                step["skipped_recent_ttl"].append(
+                    {
+                        "dataset_source_id": dataset_source_id,
+                        "raw_metadata": str(raw_meta),
+                        "sampled_metadata": str(sampled_meta),
+                        "age_seconds": float(raw_age_seconds),
+                    }
+                )
+                continue
+            step["skipped_mismatch"].append(
+                {
+                    "dataset_source_id": dataset_source_id,
+                    "raw_metadata": str(raw_meta),
+                    "sampled_metadata": str(sampled_meta),
+                }
+            )
+            continue
+
+        if _remove_file(raw_meta, apply=apply):
+            step["removed_raw_metadata"].append(str(raw_meta))
+    return step
+
+
+def _collect_protected_job_ids(config: dict[str, Any], latest_manifest_payload: dict[str, Any] | None = None) -> set[str]:
+    protected: set[str] = set()
+    spaces = [
+        config.get("job", {}),
+        config.get("dataset_generation", {}),
+        config.get("dataset_build", {}),
+        config.get("dataset_merge_final", {}),
+        config.get("train", {}),
+        config.get("evaluation", {}),
+        config.get("benchmark", {}),
+    ]
+    for space in spaces:
+        if not isinstance(space, dict):
+            continue
+        for key, value in space.items():
+            if "job_id" not in str(key):
+                continue
+            job_id = str(value or "").strip()
+            if job_id and job_id.lower() not in {"auto", "<auto>"}:
+                protected.add(job_id)
+    manifest = latest_manifest_payload if isinstance(latest_manifest_payload, dict) else {}
+    for key, value in manifest.items():
+        if "job_id" not in str(key):
+            continue
+        if isinstance(value, list):
+            for item in value:
+                job_id = str(item or "").strip()
+                if job_id:
+                    protected.add(job_id)
+            continue
+        job_id = str(value or "").strip()
+        if job_id:
+            protected.add(job_id)
+    return protected
+
+
+def _cleanup_pipeline_manifests(
+    *,
+    pipeline_root: Path,
+    apply: bool,
+    pipeline_manifest_ttl_seconds: float,
+    pipeline_manifest_keep_recent: int,
+    now_epoch: float | None = None,
+) -> dict[str, Any]:
+    ttl_seconds = float(max(0.0, pipeline_manifest_ttl_seconds))
+    keep_recent = max(0, int(pipeline_manifest_keep_recent))
+    step: dict[str, Any] = {
+        "pipeline_root": str(pipeline_root),
+        "pipeline_manifest_ttl_seconds": ttl_seconds,
+        "pipeline_manifest_keep_recent": keep_recent,
+        "removed": [],
+        "skipped_recent_ttl": 0,
+        "skipped_keep_recent": 0,
+        "errors": [],
+    }
+    if not pipeline_root.exists():
+        return step
+    files: list[Path] = []
+    try:
+        files.extend(sorted(pipeline_root.glob("dataset_pipeline_*.json")))
+        files.extend(sorted(pipeline_root.glob("latest_dataset_pipeline_*.json")))
+        files = [item for item in files if item.is_file()]
+    except Exception as exc:
+        step["errors"].append(f"pipeline_manifest_scan_failed:{type(exc).__name__}:{exc}")
+        return step
+
+    files_sorted = sorted(files, key=lambda item: float(item.stat().st_mtime), reverse=True)
+    kept = 0
+    for file_path in files_sorted:
+        if kept < keep_recent:
+            kept += 1
+            step["skipped_keep_recent"] = int(step["skipped_keep_recent"]) + 1
+            continue
+        age_seconds = _path_age_seconds(file_path, now_epoch=now_epoch)
+        if age_seconds < ttl_seconds:
+            step["skipped_recent_ttl"] = int(step["skipped_recent_ttl"]) + 1
+            continue
+        if _remove_file(file_path, apply=apply):
+            step["removed"].append(str(file_path))
+    return step
+
+
+def _cleanup_completed_job_dirs(
+    *,
+    job_roots: list[Path],
+    apply: bool,
+    protected_job_ids: set[str],
+    job_dir_ttl_seconds: float,
+    job_dir_keep_recent_per_run_type: int,
+    now_epoch: float | None = None,
+) -> dict[str, Any]:
+    ttl_seconds = float(max(0.0, job_dir_ttl_seconds))
+    keep_recent = max(0, int(job_dir_keep_recent_per_run_type))
+    terminal_statuses = {"completed", "failed", "cancelled"}
+    step: dict[str, Any] = {
+        "job_roots": [str(root) for root in job_roots],
+        "job_dir_ttl_seconds": ttl_seconds,
+        "job_dir_keep_recent_per_run_type": keep_recent,
+        "protected_job_ids": sorted(str(item) for item in protected_job_ids if str(item).strip()),
+        "removed": [],
+        "skipped_protected": 0,
+        "skipped_active": 0,
+        "skipped_recent_ttl": 0,
+        "skipped_keep_recent": 0,
+        "scanned": 0,
+        "errors": [],
+    }
+    protected = {str(item).strip() for item in protected_job_ids if str(item).strip()}
+    candidates_by_run_type: dict[str, list[dict[str, Any]]] = {}
+    for root in job_roots:
+        if not root.exists():
+            continue
+        try:
+            job_dirs = sorted([path for path in root.iterdir() if path.is_dir()])
+        except Exception as exc:
+            step["errors"].append(f"job_root_scan_failed:{root}:{type(exc).__name__}:{exc}")
+            continue
+        for job_dir in job_dirs:
+            step["scanned"] = int(step["scanned"]) + 1
+            job_id = str(job_dir.name).strip()
+            if job_id in protected:
+                step["skipped_protected"] = int(step["skipped_protected"]) + 1
+                continue
+            active, _ = is_job_active(job_dir, active_updated_max_age_seconds=600.0)
+            if active:
+                step["skipped_active"] = int(step["skipped_active"]) + 1
+                continue
+            status_payload = _load_json_dict(job_dir / "run_status.json", default={})
+            status = str(status_payload.get("status", "")).strip().lower()
+            if status not in terminal_statuses:
+                continue
+            run_type = str(status_payload.get("run_type", "")).strip().lower() or "unknown"
+            updated_epoch = _parse_iso_to_epoch(status_payload.get("updated_at"))
+            if updated_epoch <= 0.0:
+                try:
+                    updated_epoch = float(job_dir.stat().st_mtime)
+                except Exception:
+                    updated_epoch = 0.0
+            age_seconds = _job_dir_age_seconds(job_dir, now_epoch=now_epoch)
+            candidates_by_run_type.setdefault(run_type, []).append(
+                {
+                    "job_id": job_id,
+                    "job_dir": job_dir,
+                    "updated_epoch": float(updated_epoch),
+                    "age_seconds": float(age_seconds),
+                    "root": str(root),
+                    "run_type": run_type,
+                }
+            )
+
+    for run_type, items in candidates_by_run_type.items():
+        sorted_items = sorted(items, key=lambda item: float(item.get("updated_epoch", 0.0)), reverse=True)
+        for idx, item in enumerate(sorted_items):
+            if idx < keep_recent:
+                step["skipped_keep_recent"] = int(step["skipped_keep_recent"]) + 1
+                continue
+            age_seconds = float(item.get("age_seconds", 0.0))
+            if age_seconds < ttl_seconds:
+                step["skipped_recent_ttl"] = int(step["skipped_recent_ttl"]) + 1
+                continue
+            job_dir = Path(str(item.get("job_dir")))
+            if _remove_tree(job_dir, apply=apply):
+                step["removed"].append(
+                    {
+                        "job_id": str(item.get("job_id", "")),
+                        "run_type": str(run_type),
+                        "job_dir": str(job_dir),
+                        "age_seconds": float(age_seconds),
+                    }
+                )
+    return step
+
+
+def _collect_protected_global_target_ids(config: dict[str, Any]) -> set[str]:
+    protected: set[str] = set()
+    dataset_generation_cfg = config.get("dataset_generation", {})
+    dataset_build_cfg = config.get("dataset_build", {})
+    if not isinstance(dataset_generation_cfg, dict):
+        dataset_generation_cfg = {}
+    if not isinstance(dataset_build_cfg, dict):
+        dataset_build_cfg = {}
+
+    def _add_target_id(value: Any) -> None:
+        target_id = str(value or "").strip()
+        if target_id:
+            protected.add(target_id)
+
+    _add_target_id(dataset_generation_cfg.get("global_target_id"))
+    _add_target_id(dataset_build_cfg.get("global_target_id"))
+    generate_progress_path = str(dataset_generation_cfg.get("global_progress_path", "")).strip()
+    if generate_progress_path:
+        _add_target_id(Path(generate_progress_path).stem)
+    build_progress_path = str(dataset_build_cfg.get("global_target_progress_path", "")).strip()
+    if build_progress_path:
+        _add_target_id(Path(build_progress_path).stem)
+
+    # Fallback utile si global_target_id n'est pas explicitement configure.
+    if not protected and _as_bool(dataset_generation_cfg.get("global_target_enabled", False), default=False):
+        _add_target_id(dataset_generation_cfg.get("dataset_source_id"))
+    return protected
+
+
+def _cleanup_global_progress_mirrors(
+    *,
+    data_root: Path,
+    apply: bool,
+    protected_target_ids: set[str],
+    global_progress_ttl_seconds: float,
+    global_progress_keep_recent: int,
+    now_epoch: float | None = None,
+) -> dict[str, Any]:
+    ttl_seconds = float(max(0.0, global_progress_ttl_seconds))
+    keep_recent = max(0, int(global_progress_keep_recent))
+    progress_root = data_root / "global_generation_progress"
+    protected = {str(item).strip() for item in protected_target_ids if str(item).strip()}
+    step: dict[str, Any] = {
+        "progress_root": str(progress_root),
+        "global_progress_ttl_seconds": ttl_seconds,
+        "global_progress_keep_recent": keep_recent,
+        "protected_target_ids": sorted(protected),
+        "removed_progress_files": [],
+        "removed_workers_dirs": [],
+        "removed_worker_snapshots": [],
+        "skipped_protected": 0,
+        "skipped_recent_ttl": 0,
+        "skipped_keep_recent": 0,
+        "workers_dirs_scanned": 0,
+        "errors": [],
+    }
+    if not progress_root.exists():
+        return step
+
+    try:
+        progress_files = sorted(
+            [path for path in progress_root.glob("*.json") if path.is_file()],
+            key=lambda path: float(path.stat().st_mtime),
+            reverse=True,
+        )
+    except Exception as exc:
+        step["errors"].append(f"progress_scan_failed:{type(exc).__name__}:{exc}")
+        progress_files = []
+
+    kept_recent = 0
+    removed_target_ids: set[str] = set()
+    for progress_file in progress_files:
+        target_id = str(progress_file.stem).strip()
+        if target_id in protected:
+            step["skipped_protected"] = int(step["skipped_protected"]) + 1
+            continue
+        if kept_recent < keep_recent:
+            kept_recent += 1
+            step["skipped_keep_recent"] = int(step["skipped_keep_recent"]) + 1
+            continue
+        age_seconds = _path_age_seconds(progress_file, now_epoch=now_epoch)
+        if age_seconds < ttl_seconds:
+            step["skipped_recent_ttl"] = int(step["skipped_recent_ttl"]) + 1
+            continue
+        if _remove_file(progress_file, apply=apply):
+            step["removed_progress_files"].append(str(progress_file))
+            removed_target_ids.add(target_id)
+
+    workers_dirs = sorted([path for path in progress_root.glob("*.workers") if path.is_dir()])
+    for workers_dir in workers_dirs:
+        step["workers_dirs_scanned"] = int(step["workers_dirs_scanned"]) + 1
+        name_text = str(workers_dir.name or "").strip()
+        if name_text.endswith(".workers"):
+            target_id = name_text[: -len(".workers")]
+        else:
+            target_id = name_text
+
+        progress_file = progress_root / f"{target_id}.json"
+        if target_id in protected:
+            # Pour les cibles protegees, on purge seulement les snapshots devenus vieux.
+            for snapshot_path in workers_dir.glob("*.json"):
+                age_seconds = _path_age_seconds(snapshot_path, now_epoch=now_epoch)
+                if age_seconds < ttl_seconds:
+                    continue
+                if _remove_file(snapshot_path, apply=apply):
+                    step["removed_worker_snapshots"].append(str(snapshot_path))
+            continue
+
+        if target_id in removed_target_ids:
+            if _remove_tree(workers_dir, apply=apply):
+                step["removed_workers_dirs"].append(str(workers_dir))
+            continue
+
+        for snapshot_path in workers_dir.glob("*.json"):
+            age_seconds = _path_age_seconds(snapshot_path, now_epoch=now_epoch)
+            if age_seconds < ttl_seconds:
+                continue
+            if _remove_file(snapshot_path, apply=apply):
+                step["removed_worker_snapshots"].append(str(snapshot_path))
+
+        try:
+            dir_has_entries = any(workers_dir.iterdir())
+        except Exception:
+            dir_has_entries = True
+        if dir_has_entries:
+            continue
+        if progress_file.exists():
+            continue
+        dir_age_seconds = _path_age_seconds(workers_dir, now_epoch=now_epoch)
+        if dir_age_seconds < ttl_seconds:
+            continue
+        if _remove_tree(workers_dir, apply=apply):
+            step["removed_workers_dirs"].append(str(workers_dir))
+
     return step
 
 
@@ -330,6 +784,11 @@ def run_storage_cleanup(
     cleanup_models: bool,
     cleanup_retention: bool = False,
     cleanup_external_artifacts: bool = False,
+    cleanup_quarantine_dirs: bool = False,
+    cleanup_duplicate_source_metadata: bool = False,
+    cleanup_global_progress_mirrors: bool = False,
+    cleanup_pipeline_manifests: bool = False,
+    cleanup_completed_job_dirs: bool = False,
     keep_model_ids: list[str] | None = None,
     keep_top_models: int = 1,
     keep_dataset_ids: list[str] | None = None,
@@ -342,6 +801,13 @@ def run_storage_cleanup(
     retention_benchmark_keep_recent: int = 60,
     retention_checkpoint_ttl_seconds: float = 14.0 * 86400.0,
     retention_checkpoint_keep_recent_per_model: int = 2,
+    retention_global_progress_ttl_seconds: float = 14.0 * 86400.0,
+    retention_global_progress_keep_recent: int = 3,
+    retention_pipeline_manifest_ttl_seconds: float = 14.0 * 86400.0,
+    retention_pipeline_manifest_keep_recent: int = 60,
+    retention_job_dir_ttl_seconds: float = 14.0 * 86400.0,
+    retention_job_dir_keep_recent_per_run_type: int = 8,
+    retention_source_metadata_raw_ttl_seconds: float = 24.0 * 3600.0,
 ) -> dict[str, Any]:
     keep_model_ids = list(keep_model_ids or [])
     keep_dataset_ids = [str(item).strip() for item in (keep_dataset_ids or []) if str(item).strip()]
@@ -354,6 +820,11 @@ def run_storage_cleanup(
         "cleanup_models": bool(cleanup_models),
         "cleanup_retention": bool(cleanup_retention),
         "cleanup_external_artifacts": bool(cleanup_external_artifacts),
+        "cleanup_quarantine_dirs": bool(cleanup_quarantine_dirs),
+        "cleanup_duplicate_source_metadata": bool(cleanup_duplicate_source_metadata),
+        "cleanup_global_progress_mirrors": bool(cleanup_global_progress_mirrors),
+        "cleanup_pipeline_manifests": bool(cleanup_pipeline_manifests),
+        "cleanup_completed_job_dirs": bool(cleanup_completed_job_dirs),
         "drive_raw_cleanup_include_inactive_partial": bool(drive_raw_cleanup_include_inactive_partial),
         "drive_raw_cleanup_inactive_min_age_seconds": float(max(0.0, drive_raw_cleanup_inactive_min_age_seconds)),
         "steps": {},
@@ -403,6 +874,55 @@ def run_storage_cleanup(
         _as_int(
             retention_cfg.get("checkpoint_keep_recent_per_model", retention_checkpoint_keep_recent_per_model),
             retention_checkpoint_keep_recent_per_model,
+        ),
+    )
+    global_progress_ttl_seconds = max(
+        0.0,
+        _as_float(
+            retention_cfg.get("global_progress_ttl_seconds", retention_global_progress_ttl_seconds),
+            retention_global_progress_ttl_seconds,
+        ),
+    )
+    global_progress_keep_recent = max(
+        0,
+        _as_int(
+            retention_cfg.get("global_progress_keep_recent", retention_global_progress_keep_recent),
+            retention_global_progress_keep_recent,
+        ),
+    )
+    pipeline_manifest_ttl_seconds = max(
+        0.0,
+        _as_float(
+            retention_cfg.get("pipeline_manifest_ttl_seconds", retention_pipeline_manifest_ttl_seconds),
+            retention_pipeline_manifest_ttl_seconds,
+        ),
+    )
+    pipeline_manifest_keep_recent = max(
+        0,
+        _as_int(
+            retention_cfg.get("pipeline_manifest_keep_recent", retention_pipeline_manifest_keep_recent),
+            retention_pipeline_manifest_keep_recent,
+        ),
+    )
+    job_dir_ttl_seconds = max(
+        0.0,
+        _as_float(
+            retention_cfg.get("job_dir_ttl_seconds", retention_job_dir_ttl_seconds),
+            retention_job_dir_ttl_seconds,
+        ),
+    )
+    job_dir_keep_recent_per_run_type = max(
+        0,
+        _as_int(
+            retention_cfg.get("job_dir_keep_recent_per_run_type", retention_job_dir_keep_recent_per_run_type),
+            retention_job_dir_keep_recent_per_run_type,
+        ),
+    )
+    source_metadata_raw_ttl_seconds = max(
+        0.0,
+        _as_float(
+            retention_cfg.get("source_metadata_raw_ttl_seconds", retention_source_metadata_raw_ttl_seconds),
+            retention_source_metadata_raw_ttl_seconds,
         ),
     )
 
@@ -469,6 +989,74 @@ def run_storage_cleanup(
         report["steps"]["runtime_backup_stream_cleanup"] = step
 
     dataset_registry = _load_json_dict(data_root / "dataset_registry.json", default={"dataset_sources": [], "built_datasets": []})
+    protected_global_target_ids = _collect_protected_global_target_ids(config)
+    latest_manifest_payload, _ = _load_latest_pipeline_manifest(drive_root)
+    if isinstance(latest_manifest_payload, dict):
+        latest_manifest_target = str(latest_manifest_payload.get("global_target_id", "")).strip()
+        if latest_manifest_target:
+            protected_global_target_ids.add(latest_manifest_target)
+    protected_job_ids = _collect_protected_job_ids(config, latest_manifest_payload)
+
+    global_progress_step: dict[str, Any] | None = None
+    if cleanup_global_progress_mirrors or cleanup_retention:
+        global_progress_step = _cleanup_global_progress_mirrors(
+            data_root=data_root,
+            apply=bool(apply),
+            protected_target_ids=protected_global_target_ids,
+            global_progress_ttl_seconds=float(global_progress_ttl_seconds),
+            global_progress_keep_recent=int(global_progress_keep_recent),
+            now_epoch=now_epoch,
+        )
+    if cleanup_global_progress_mirrors and isinstance(global_progress_step, dict):
+        report["steps"]["global_progress_cleanup"] = global_progress_step
+
+    pipeline_manifest_step: dict[str, Any] | None = None
+    if cleanup_pipeline_manifests or cleanup_retention:
+        pipeline_manifest_step = _cleanup_pipeline_manifests(
+            pipeline_root=drive_root / "logs" / "pipeline",
+            apply=bool(apply),
+            pipeline_manifest_ttl_seconds=float(pipeline_manifest_ttl_seconds),
+            pipeline_manifest_keep_recent=int(pipeline_manifest_keep_recent),
+            now_epoch=now_epoch,
+        )
+    if cleanup_pipeline_manifests and isinstance(pipeline_manifest_step, dict):
+        report["steps"]["pipeline_manifest_cleanup"] = pipeline_manifest_step
+
+    completed_job_dirs_step: dict[str, Any] | None = None
+    if cleanup_completed_job_dirs or cleanup_retention:
+        drive_jobs_root = drive_root / "jobs"
+        backup_root = paths.jobs_backup_root or (drive_root / "runtime_backup" / "jobs")
+        dedup_roots: list[Path] = []
+        for root in [drive_jobs_root, backup_root]:
+            if root not in dedup_roots:
+                dedup_roots.append(root)
+        completed_job_dirs_step = _cleanup_completed_job_dirs(
+            job_roots=dedup_roots,
+            apply=bool(apply),
+            protected_job_ids=protected_job_ids,
+            job_dir_ttl_seconds=float(job_dir_ttl_seconds),
+            job_dir_keep_recent_per_run_type=int(job_dir_keep_recent_per_run_type),
+            now_epoch=now_epoch,
+        )
+    if cleanup_completed_job_dirs and isinstance(completed_job_dirs_step, dict):
+        report["steps"]["completed_job_dirs_cleanup"] = completed_job_dirs_step
+
+    if cleanup_duplicate_source_metadata:
+        report["steps"]["duplicate_source_metadata_cleanup"] = _cleanup_duplicate_source_metadata(
+            dataset_registry=dataset_registry,
+            drive_root=drive_root,
+            apply=bool(apply),
+            raw_metadata_ttl_seconds=float(source_metadata_raw_ttl_seconds),
+            now_epoch=now_epoch,
+        )
+
+    if cleanup_quarantine_dirs:
+        report["steps"]["quarantine_cleanup"] = _cleanup_quarantine_dirs(
+            drive_root=drive_root,
+            apply=bool(apply),
+            quarantine_ttl_seconds=float(quarantine_ttl_seconds),
+            now_epoch=now_epoch,
+        )
 
     if cleanup_drive_raw_dirs:
         raw_partial_min_age_seconds = max(0.0, _as_float(drive_raw_cleanup_inactive_min_age_seconds, 0.0))
@@ -647,35 +1235,59 @@ def run_storage_cleanup(
             "benchmark_keep_recent": int(benchmark_keep_recent),
             "checkpoint_ttl_seconds": float(checkpoint_ttl_seconds),
             "checkpoint_keep_recent_per_model": int(checkpoint_keep_recent_per_model),
+            "global_progress_ttl_seconds": float(global_progress_ttl_seconds),
+            "global_progress_keep_recent": int(global_progress_keep_recent),
+            "pipeline_manifest_ttl_seconds": float(pipeline_manifest_ttl_seconds),
+            "pipeline_manifest_keep_recent": int(pipeline_manifest_keep_recent),
+            "job_dir_ttl_seconds": float(job_dir_ttl_seconds),
+            "job_dir_keep_recent_per_run_type": int(job_dir_keep_recent_per_run_type),
+            "source_metadata_raw_ttl_seconds": float(source_metadata_raw_ttl_seconds),
             "quarantine_removed": [],
+            "quarantine_skipped_recent": 0,
             "benchmark_reports_removed": [],
             "old_checkpoints_removed": [],
+            "global_progress_removed": [],
+            "global_progress_workers_dirs_removed": [],
+            "global_progress_worker_snapshots_removed": [],
+            "pipeline_manifests_removed": [],
+            "completed_job_dirs_removed": [],
+            "source_metadata_raw_removed": [],
             "errors": [],
         }
 
+        if isinstance(global_progress_step, dict):
+            retention_step["global_progress_removed"] = list(global_progress_step.get("removed_progress_files", []) or [])
+            retention_step["global_progress_workers_dirs_removed"] = list(global_progress_step.get("removed_workers_dirs", []) or [])
+            retention_step["global_progress_worker_snapshots_removed"] = list(
+                global_progress_step.get("removed_worker_snapshots", []) or []
+            )
+            retention_step["errors"].extend(list(global_progress_step.get("errors", []) or []))
+        if isinstance(pipeline_manifest_step, dict):
+            retention_step["pipeline_manifests_removed"] = list(pipeline_manifest_step.get("removed", []) or [])
+            retention_step["errors"].extend(list(pipeline_manifest_step.get("errors", []) or []))
+        if isinstance(completed_job_dirs_step, dict):
+            retention_step["completed_job_dirs_removed"] = list(completed_job_dirs_step.get("removed", []) or [])
+            retention_step["errors"].extend(list(completed_job_dirs_step.get("errors", []) or []))
+        source_metadata_step = _cleanup_duplicate_source_metadata(
+            dataset_registry=dataset_registry,
+            drive_root=drive_root,
+            apply=bool(apply),
+            raw_metadata_ttl_seconds=float(source_metadata_raw_ttl_seconds),
+            now_epoch=now_epoch,
+        )
+        retention_step["source_metadata_raw_removed"] = list(source_metadata_step.get("removed_raw_metadata", []) or [])
+        retention_step["errors"].extend(list(source_metadata_step.get("errors", []) or []))
+
         # 1) Quarantine dirs older than TTL.
-        quarantine_roots = [
-            drive_root / "jobs",
-            drive_root / "logs",
-            drive_root / "runtime_backup",
-            drive_root / "runtime_migration",
-        ]
-        for root in quarantine_roots:
-            if not root.exists():
-                continue
-            try:
-                for path in root.rglob(".quarantine_*"):
-                    if not path.exists() or not path.is_dir():
-                        continue
-                    if not _path_within(path, drive_root):
-                        continue
-                    age_seconds = _path_age_seconds(path, now_epoch=now_epoch)
-                    if age_seconds < float(quarantine_ttl_seconds):
-                        continue
-                    if _remove_tree(path, apply=apply):
-                        retention_step["quarantine_removed"].append(str(path))
-            except Exception as exc:
-                retention_step["errors"].append(f"quarantine_scan_failed:{type(exc).__name__}:{exc}")
+        quarantine_step = _cleanup_quarantine_dirs(
+            drive_root=drive_root,
+            apply=bool(apply),
+            quarantine_ttl_seconds=float(quarantine_ttl_seconds),
+            now_epoch=now_epoch,
+        )
+        retention_step["quarantine_removed"] = list(quarantine_step.get("removed", []))
+        retention_step["quarantine_skipped_recent"] = int(quarantine_step.get("skipped_recent", 0) or 0)
+        retention_step["errors"].extend(list(quarantine_step.get("errors", []) or []))
 
         # 2) Benchmark reports rotation with TTL + keep recent.
         benchmark_root = paths.reports_root / "benchmarks"
