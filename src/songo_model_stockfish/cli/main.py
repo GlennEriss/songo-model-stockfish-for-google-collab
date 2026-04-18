@@ -406,6 +406,10 @@ def build_parser() -> argparse.ArgumentParser:
     storage_cleanup.add_argument("--retention-completed-job-dir-ttl-days", type=float, default=14.0)
     storage_cleanup.add_argument("--retention-completed-job-dir-keep-recent-per-run-type", type=int, default=8)
     storage_cleanup.add_argument("--retention-source-metadata-raw-ttl-hours", type=float, default=24.0)
+    storage_cleanup.add_argument("--retention-drive-root-artifact-ttl-hours", type=float, default=24.0)
+    storage_cleanup.add_argument("--retention-drive-root-artifact-keep-recent-per-key", type=int, default=1)
+    storage_cleanup.add_argument("--retention-recovered-external-ttl-days", type=float, default=7.0)
+    storage_cleanup.add_argument("--retention-recovered-external-keep-recent-sessions", type=int, default=2)
     storage_cleanup.add_argument("--keep-model-id", action="append", default=[])
     storage_cleanup.add_argument("--keep-model-ids")
     storage_cleanup.add_argument("--keep-top-models", type=int, default=1)
@@ -540,6 +544,18 @@ def main(argv: list[str] | None = None) -> int:
                 0, int(args.retention_completed_job_dir_keep_recent_per_run_type)
             ),
             retention_source_metadata_raw_ttl_seconds=max(0.0, float(args.retention_source_metadata_raw_ttl_hours) * 3600.0),
+            retention_drive_root_artifact_ttl_seconds=max(
+                0.0, float(args.retention_drive_root_artifact_ttl_hours) * 3600.0
+            ),
+            retention_drive_root_artifact_keep_recent_per_key=max(
+                0, int(args.retention_drive_root_artifact_keep_recent_per_key)
+            ),
+            retention_recovered_external_ttl_seconds=max(
+                0.0, float(args.retention_recovered_external_ttl_days) * 86400.0
+            ),
+            retention_recovered_external_keep_recent_sessions=max(
+                0, int(args.retention_recovered_external_keep_recent_sessions)
+            ),
         )
         print(json.dumps(result, indent=2, ensure_ascii=True))
         return 0

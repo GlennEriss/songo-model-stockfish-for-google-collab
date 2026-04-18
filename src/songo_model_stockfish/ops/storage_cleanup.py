@@ -746,6 +746,283 @@ def _cleanup_pipeline_manifests(
     return step
 
 
+def _canonicalize_duplicate_basename(file_name: str) -> str:
+    path = Path(str(file_name or "").strip())
+    stem = str(path.stem or "").strip()
+    suffix = str(path.suffix or "").strip().lower()
+    duplicate_match = re.fullmatch(r"(.+)\s\((\d+)\)", stem)
+    if duplicate_match:
+        stem = str(duplicate_match.group(1) or "").strip()
+    return (stem + suffix).strip().lower()
+
+
+def _is_drive_root_operational_artifact_name(file_name: str) -> bool:
+    name = _canonicalize_duplicate_basename(file_name)
+    if not name:
+        return False
+    if name in {
+        "config.yaml",
+        "run_status.json",
+        "state.json",
+        "dataset_registry.json",
+        "dataset_generation_summary.json",
+        "dataset_build_summary.json",
+        "training_summary.json",
+        "evaluation_summary.json",
+        "benchmark_summary.json",
+        "latest_dataset_pipeline.json",
+        "latest_dataset_pipeline",
+        "tournament_progress.latest.json",
+        "_dataset_source_metadata.json",
+    }:
+        return True
+    if name.startswith("state") and name.endswith(".json"):
+        return True
+    if name.startswith("run_status") and name.endswith(".json"):
+        return True
+    if name.startswith("config") and name.endswith(".yaml"):
+        return True
+    if name.startswith("dataset_registry") and name.endswith(".json"):
+        return True
+    if name.startswith("dataset_benchmatch") and (
+        name.endswith(".log") or name.endswith(".json") or name.endswith(".jsonl")
+    ):
+        return True
+    if name.startswith("bench_models") and name.endswith(".json"):
+        return True
+    if name.startswith("latest_dataset_pipeline"):
+        return True
+    if name.startswith("tournament_progress") and (
+        name.endswith(".json") or name.endswith(".jsonl")
+    ):
+        return True
+    if name.startswith("events") and name.endswith(".jsonl"):
+        return True
+    if name.startswith("metrics") and name.endswith(".jsonl"):
+        return True
+    if name.startswith("mcts") and (name.endswith(".json") or name.endswith(".jsonl")):
+        return True
+    if name.startswith("minimax") and (name.endswith(".json") or name.endswith(".jsonl")):
+        return True
+    if name.startswith("metadata") and name.endswith(".json"):
+        return True
+    if name.endswith("_evaluation_summary.json"):
+        return True
+    if (
+        name.endswith(".json")
+        and (
+            "dataset_generation_summary" in name
+            or "dataset_build_summary" in name
+            or "training_summary" in name
+            or "evaluation_summary" in name
+            or "benchmark_summary" in name
+        )
+    ):
+        return True
+    if ".tmp." in str(file_name or "").lower():
+        return True
+    return False
+
+
+def _drive_root_operational_artifact_group_key(file_name: str) -> str:
+    name = _canonicalize_duplicate_basename(file_name)
+    if not name:
+        return ""
+    if name.startswith("state") and name.endswith(".json"):
+        return "state.json"
+    if name.startswith("run_status") and name.endswith(".json"):
+        return "run_status.json"
+    if name.startswith("config") and name.endswith(".yaml"):
+        return "config.yaml"
+    if name.startswith("dataset_registry") and name.endswith(".json"):
+        return "dataset_registry.json"
+    if name.startswith("dataset_benchmatch"):
+        return "dataset_benchmatch"
+    if name.startswith("bench_models") and name.endswith(".json"):
+        return "bench_models.json"
+    if name.startswith("latest_dataset_pipeline"):
+        return "latest_dataset_pipeline.json"
+    if name.startswith("tournament_progress"):
+        return "tournament_progress.latest.json"
+    if name.startswith("events") and name.endswith(".jsonl"):
+        return "events.jsonl"
+    if name.startswith("metrics") and name.endswith(".jsonl"):
+        return "metrics.jsonl"
+    if name.startswith("mcts"):
+        return "mcts.json_or_jsonl"
+    if name.startswith("minimax"):
+        return "minimax.json_or_jsonl"
+    if name.startswith("metadata") and name.endswith(".json"):
+        return "metadata.json"
+    if name.endswith("_evaluation_summary.json"):
+        return "evaluation_summary.json"
+    if "dataset_generation_summary" in name and name.endswith(".json"):
+        return "dataset_generation_summary.json"
+    if "dataset_build_summary" in name and name.endswith(".json"):
+        return "dataset_build_summary.json"
+    if "training_summary" in name and name.endswith(".json"):
+        return "training_summary.json"
+    if "evaluation_summary" in name and name.endswith(".json"):
+        return "evaluation_summary.json"
+    if "benchmark_summary" in name and name.endswith(".json"):
+        return "benchmark_summary.json"
+    if ".tmp." in name:
+        return f"tmp::{name.split('.tmp.', 1)[0]}"
+    return name
+
+
+def _cleanup_drive_root_operational_artifacts(
+    *,
+    drive_root: Path,
+    apply: bool,
+    artifact_ttl_seconds: float,
+    artifact_keep_recent_per_key: int,
+    now_epoch: float | None = None,
+) -> dict[str, Any]:
+    ttl_seconds = float(max(0.0, artifact_ttl_seconds))
+    keep_recent = max(0, int(artifact_keep_recent_per_key))
+    step: dict[str, Any] = {
+        "drive_root": str(drive_root),
+        "artifact_ttl_seconds": ttl_seconds,
+        "artifact_keep_recent_per_key": keep_recent,
+        "scanned_files": 0,
+        "candidate_files": 0,
+        "groups_count": 0,
+        "removed": [],
+        "skipped_keep_recent": 0,
+        "skipped_recent_ttl": 0,
+        "errors": [],
+    }
+    if not drive_root.exists():
+        return step
+    groups: dict[str, list[Path]] = {}
+    try:
+        entries = sorted(drive_root.iterdir())
+    except Exception as exc:
+        step["errors"].append(f"drive_root_scan_failed:{type(exc).__name__}:{exc}")
+        return step
+
+    for path in entries:
+        if not path.is_file():
+            continue
+        step["scanned_files"] = int(step["scanned_files"]) + 1
+        if not _is_drive_root_operational_artifact_name(path.name):
+            continue
+        group_key = _drive_root_operational_artifact_group_key(path.name)
+        if not group_key:
+            continue
+        groups.setdefault(group_key, []).append(path)
+        step["candidate_files"] = int(step["candidate_files"]) + 1
+
+    step["groups_count"] = int(len(groups))
+    for group_key, paths_for_group in groups.items():
+        def _path_sort_key(path: Path) -> tuple[int, float]:
+            stem = str(path.stem or "").strip()
+            duplicate_named_copy = bool(re.fullmatch(r"(.+)\s\((\d+)\)", stem))
+            try:
+                mtime = float(path.stat().st_mtime)
+            except Exception:
+                mtime = 0.0
+            # Priorite au nom canonique (sans "(n)"), puis date.
+            return (1 if duplicate_named_copy else 0, -mtime)
+
+        sorted_paths = sorted(paths_for_group, key=_path_sort_key)
+        for idx, file_path in enumerate(sorted_paths):
+            file_name_lower = str(file_path.name or "").lower()
+            group_keep_recent = 0 if ".tmp." in file_name_lower else keep_recent
+            if idx < group_keep_recent:
+                step["skipped_keep_recent"] = int(step["skipped_keep_recent"]) + 1
+                continue
+            age_seconds = _path_age_seconds(file_path, now_epoch=now_epoch)
+            if age_seconds < ttl_seconds:
+                step["skipped_recent_ttl"] = int(step["skipped_recent_ttl"]) + 1
+                continue
+            if _remove_file(file_path, apply=apply):
+                step["removed"].append(
+                    {
+                        "path": str(file_path),
+                        "group_key": str(group_key),
+                        "age_seconds": float(age_seconds),
+                    }
+                )
+    return step
+
+
+def _cleanup_recovered_external_sessions(
+    *,
+    drive_root: Path,
+    apply: bool,
+    recovered_external_ttl_seconds: float,
+    recovered_external_keep_recent_sessions: int,
+    now_epoch: float | None = None,
+) -> dict[str, Any]:
+    ttl_seconds = float(max(0.0, recovered_external_ttl_seconds))
+    keep_recent = max(0, int(recovered_external_keep_recent_sessions))
+    recovered_root = drive_root / "runtime_migration" / "recovered_external"
+    step: dict[str, Any] = {
+        "recovered_root": str(recovered_root),
+        "recovered_external_ttl_seconds": ttl_seconds,
+        "recovered_external_keep_recent_sessions": keep_recent,
+        "sessions_scanned": 0,
+        "removed_sessions": [],
+        "skipped_keep_recent": 0,
+        "skipped_recent_ttl": 0,
+        "removed_empty_dirs": [],
+        "errors": [],
+    }
+    if not recovered_root.exists():
+        return step
+
+    session_dirs: list[Path] = []
+    try:
+        for path in recovered_root.rglob("*"):
+            if not path.is_dir():
+                continue
+            if re.fullmatch(r"\d{9,}", str(path.name or "").strip()):
+                session_dirs.append(path)
+    except Exception as exc:
+        step["errors"].append(f"recovered_external_scan_failed:{type(exc).__name__}:{exc}")
+        return step
+
+    step["sessions_scanned"] = int(len(session_dirs))
+    sorted_sessions = sorted(session_dirs, key=lambda item: float(item.stat().st_mtime), reverse=True)
+    for idx, session_dir in enumerate(sorted_sessions):
+        if idx < keep_recent:
+            step["skipped_keep_recent"] = int(step["skipped_keep_recent"]) + 1
+            continue
+        age_seconds = _path_age_seconds(session_dir, now_epoch=now_epoch)
+        if age_seconds < ttl_seconds:
+            step["skipped_recent_ttl"] = int(step["skipped_recent_ttl"]) + 1
+            continue
+        if _remove_tree(session_dir, apply=apply):
+            step["removed_sessions"].append(
+                {
+                    "path": str(session_dir),
+                    "age_seconds": float(age_seconds),
+                }
+            )
+
+    try:
+        empty_dirs = sorted(
+            [path for path in recovered_root.rglob("*") if path.is_dir()],
+            key=lambda item: len(item.parts),
+            reverse=True,
+        )
+        for path in empty_dirs:
+            try:
+                if any(path.iterdir()):
+                    continue
+                if path == recovered_root:
+                    continue
+                if _remove_tree(path, apply=apply):
+                    step["removed_empty_dirs"].append(str(path))
+            except Exception:
+                continue
+    except Exception as exc:
+        step["errors"].append(f"recovered_external_empty_cleanup_failed:{type(exc).__name__}:{exc}")
+    return step
+
+
 def _cleanup_completed_job_dirs(
     *,
     job_roots: list[Path],
@@ -1109,6 +1386,10 @@ def run_storage_cleanup(
     retention_job_dir_ttl_seconds: float = 14.0 * 86400.0,
     retention_job_dir_keep_recent_per_run_type: int = 8,
     retention_source_metadata_raw_ttl_seconds: float = 24.0 * 3600.0,
+    retention_drive_root_artifact_ttl_seconds: float = 24.0 * 3600.0,
+    retention_drive_root_artifact_keep_recent_per_key: int = 1,
+    retention_recovered_external_ttl_seconds: float = 7.0 * 86400.0,
+    retention_recovered_external_keep_recent_sessions: int = 2,
 ) -> dict[str, Any]:
     keep_model_ids = list(keep_model_ids or [])
     keep_dataset_ids = [str(item).strip() for item in (keep_dataset_ids or []) if str(item).strip()]
@@ -1224,6 +1505,40 @@ def run_storage_cleanup(
         _as_float(
             retention_cfg.get("source_metadata_raw_ttl_seconds", retention_source_metadata_raw_ttl_seconds),
             retention_source_metadata_raw_ttl_seconds,
+        ),
+    )
+    drive_root_artifact_ttl_seconds = max(
+        0.0,
+        _as_float(
+            retention_cfg.get("drive_root_artifact_ttl_seconds", retention_drive_root_artifact_ttl_seconds),
+            retention_drive_root_artifact_ttl_seconds,
+        ),
+    )
+    drive_root_artifact_keep_recent_per_key = max(
+        0,
+        _as_int(
+            retention_cfg.get(
+                "drive_root_artifact_keep_recent_per_key",
+                retention_drive_root_artifact_keep_recent_per_key,
+            ),
+            retention_drive_root_artifact_keep_recent_per_key,
+        ),
+    )
+    recovered_external_ttl_seconds = max(
+        0.0,
+        _as_float(
+            retention_cfg.get("recovered_external_ttl_seconds", retention_recovered_external_ttl_seconds),
+            retention_recovered_external_ttl_seconds,
+        ),
+    )
+    recovered_external_keep_recent_sessions = max(
+        0,
+        _as_int(
+            retention_cfg.get(
+                "recovered_external_keep_recent_sessions",
+                retention_recovered_external_keep_recent_sessions,
+            ),
+            retention_recovered_external_keep_recent_sessions,
         ),
     )
 
@@ -1543,10 +1858,17 @@ def run_storage_cleanup(
             "job_dir_ttl_seconds": float(job_dir_ttl_seconds),
             "job_dir_keep_recent_per_run_type": int(job_dir_keep_recent_per_run_type),
             "source_metadata_raw_ttl_seconds": float(source_metadata_raw_ttl_seconds),
+            "drive_root_artifact_ttl_seconds": float(drive_root_artifact_ttl_seconds),
+            "drive_root_artifact_keep_recent_per_key": int(drive_root_artifact_keep_recent_per_key),
+            "recovered_external_ttl_seconds": float(recovered_external_ttl_seconds),
+            "recovered_external_keep_recent_sessions": int(recovered_external_keep_recent_sessions),
             "quarantine_removed": [],
             "quarantine_skipped_recent": 0,
             "benchmark_reports_removed": [],
             "old_checkpoints_removed": [],
+            "drive_root_operational_artifacts_removed": [],
+            "recovered_external_sessions_removed": [],
+            "recovered_external_empty_dirs_removed": [],
             "global_progress_removed": [],
             "global_progress_workers_dirs_removed": [],
             "global_progress_worker_snapshots_removed": [],
@@ -1589,6 +1911,35 @@ def run_storage_cleanup(
         retention_step["quarantine_removed"] = list(quarantine_step.get("removed", []))
         retention_step["quarantine_skipped_recent"] = int(quarantine_step.get("skipped_recent", 0) or 0)
         retention_step["errors"].extend(list(quarantine_step.get("errors", []) or []))
+
+        # 1.5) Drive root operational artifacts rotation (state/config/run_status/... duplicates).
+        drive_root_operational_step = _cleanup_drive_root_operational_artifacts(
+            drive_root=drive_root,
+            apply=bool(apply),
+            artifact_ttl_seconds=float(drive_root_artifact_ttl_seconds),
+            artifact_keep_recent_per_key=int(drive_root_artifact_keep_recent_per_key),
+            now_epoch=now_epoch,
+        )
+        retention_step["drive_root_operational_artifacts_removed"] = list(
+            drive_root_operational_step.get("removed", []) or []
+        )
+        retention_step["errors"].extend(list(drive_root_operational_step.get("errors", []) or []))
+
+        # 1.6) Recovered external sessions rotation (post-migration holding area).
+        recovered_external_step = _cleanup_recovered_external_sessions(
+            drive_root=drive_root,
+            apply=bool(apply),
+            recovered_external_ttl_seconds=float(recovered_external_ttl_seconds),
+            recovered_external_keep_recent_sessions=int(recovered_external_keep_recent_sessions),
+            now_epoch=now_epoch,
+        )
+        retention_step["recovered_external_sessions_removed"] = list(
+            recovered_external_step.get("removed_sessions", []) or []
+        )
+        retention_step["recovered_external_empty_dirs_removed"] = list(
+            recovered_external_step.get("removed_empty_dirs", []) or []
+        )
+        retention_step["errors"].extend(list(recovered_external_step.get("errors", []) or []))
 
         # 2) Benchmark reports rotation with TTL + keep recent.
         benchmark_root = paths.reports_root / "benchmarks"
