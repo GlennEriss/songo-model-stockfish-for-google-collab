@@ -1135,8 +1135,15 @@ cells = [
             'latest_dataset_pipeline*',
             'mcts_*.json',
             'mcts_*.jsonl',
+            'mcts*.json',
+            'mcts*.jsonl',
+            'mcts*summary*.json',
+            'mcts*game*.json',
+            'mcts*game*.jsonl',
             'minimax_*.json',
             'minimax_*.jsonl',
+            'minimax*.json',
+            'minimax*.jsonl',
             'dataset_registry*.json',
             'config*.yaml',
             'dataset_generation_summary.json',
@@ -1166,8 +1173,12 @@ cells = [
             '.latest_dataset_pipeline*.tmp.*',
             '.mcts_*.json.tmp.*',
             '.mcts_*.jsonl.tmp.*',
+            '.mcts*.json.tmp.*',
+            '.mcts*.jsonl.tmp.*',
             '.minimax_*.json.tmp.*',
             '.minimax_*.jsonl.tmp.*',
+            '.minimax*.json.tmp.*',
+            '.minimax*.jsonl.tmp.*',
             '.run_status*.json.tmp.*',
             '.state*.json.tmp.*',
             '.songo_policy_value*.pt.tmp.*',
@@ -1415,9 +1426,9 @@ cells = [
                     'dataset' in name or 'train' in name or 'evaluation' in name or 'benchmark' in name
                 ):
                     return 2
-                if name.startswith('mcts_') and (name.endswith('.json') or name.endswith('.jsonl')):
+                if name.startswith('mcts') and (name.endswith('.json') or name.endswith('.jsonl')):
                     return 3
-                if name.startswith('minimax_') and (name.endswith('.json') or name.endswith('.jsonl')):
+                if name.startswith('minimax') and (name.endswith('.json') or name.endswith('.jsonl')):
                     return 3
                 if name.startswith('songo_policy_value') and name.endswith('.model_card.json'):
                     return 3

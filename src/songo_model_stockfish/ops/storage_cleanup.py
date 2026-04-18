@@ -241,9 +241,9 @@ def _cleanup_external_drive_artifacts(*, drive_root: Path, apply: bool, now_epoc
             return True
         if name.startswith("latest_dataset_pipeline"):
             return True
-        if name.startswith("mcts_") and (name.endswith(".json") or name.endswith(".jsonl")):
+        if name.startswith("mcts") and (name.endswith(".json") or name.endswith(".jsonl")):
             return True
-        if name.startswith("minimax_") and (name.endswith(".json") or name.endswith(".jsonl")):
+        if name.startswith("minimax") and (name.endswith(".json") or name.endswith(".jsonl")):
             return True
         if name.startswith("_dataset"):
             return True
@@ -304,8 +304,8 @@ def _cleanup_external_drive_artifacts(*, drive_root: Path, apply: bool, now_epoc
                 or lower_name.startswith(".events")
                 or lower_name.startswith(".run_status")
                 or lower_name.startswith(".state")
-                or lower_name.startswith(".mcts_")
-                or lower_name.startswith(".minimax_")
+                or lower_name.startswith(".mcts")
+                or lower_name.startswith(".minimax")
                 or lower_name.startswith(".songo_policy_value")
                 or "config.yaml.tmp." in lower_name
                 or (
