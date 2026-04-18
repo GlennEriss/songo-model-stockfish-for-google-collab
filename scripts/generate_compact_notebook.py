@@ -1080,18 +1080,20 @@ cells = [
         # - correction artefacts ecrits hors dossier principal Drive (MyDrive/songo-stockfish)
         # - purge artefacts non critiques en doublon (quarantine, streams, metadata dupliquees)
         # - sans toucher aux datasets finaux ni aux modeles par defaut
-        # Workflow recommande: d'abord DRY_RUN, puis APPLY.
+        # Execution en 2 etapes + heartbeat pour voir la progression.
 
         import json
         import os
         import subprocess
+        import time
         from pathlib import Path
 
-        STORAGE_CLEANUP_DRY_RUN = True  # False => ajoute --apply
+        STORAGE_CLEANUP_DRY_RUN = False  # True = simulation seulement (aucune action)
         STORAGE_CLEANUP_SCOPE = 'safe_noncritical'  # 'external_only' | 'safe_noncritical' | 'full'
         STORAGE_CLEANUP_PURGE_MODELS = False  # True seulement si tu veux vraiment purger les modeles
         STORAGE_CLEANUP_ALLOW_MODEL_PURGE = False  # Double garde-fou explicite
         STORAGE_CLEANUP_KEEP_MODEL_ID = 'songo_policy_value_colab_pro_v12'
+        STORAGE_CLEANUP_HEARTBEAT_SECONDS = 20
         STORAGE_CLEANUP_CONFIG_PATH = str(
             globals().get(
                 'TRAIN_CONTINUE_CONFIG_ACTIVE_PATH',
@@ -1099,45 +1101,145 @@ cells = [
             )
         )
 
-        cleanup_cmd = [
-            str(PYTHON_BIN),
-            '-m',
-            'songo_model_stockfish.cli.main',
-            'storage-cleanup',
-            '--config',
-            str(STORAGE_CLEANUP_CONFIG_PATH),
-            '--fix-external-artifacts',
-        ]
+        env = dict(os.environ)
+        env['PYTHONPATH'] = str(Path(WORKTREE) / 'src')
+
+        def _build_cleanup_cmd(extra_args):
+            cmd = [
+                str(PYTHON_BIN),
+                '-m',
+                'songo_model_stockfish.cli.main',
+                'storage-cleanup',
+                '--config',
+                str(STORAGE_CLEANUP_CONFIG_PATH),
+            ]
+            cmd.extend(list(extra_args or []))
+            if not bool(STORAGE_CLEANUP_DRY_RUN):
+                cmd.append('--apply')
+            return cmd
+
+        def _run_cleanup_step(step_name, extra_args):
+            cmd = _build_cleanup_cmd(extra_args)
+            print(f'\\n=== {step_name} ===')
+            print('command =', cmd)
+            started = time.time()
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(WORKTREE),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            heartbeat = max(5, int(STORAGE_CLEANUP_HEARTBEAT_SECONDS))
+            last_beat = started
+            while proc.poll() is None:
+                now = time.time()
+                if now - last_beat >= heartbeat:
+                    print(
+                        f'[{step_name}] en cours... elapsed='
+                        f'{int(now - started)}s | dry_run={STORAGE_CLEANUP_DRY_RUN}'
+                    )
+                    last_beat = now
+                time.sleep(2.0)
+            stdout_text, stderr_text = proc.communicate()
+            if stderr_text and stderr_text.strip():
+                print(f'[{step_name}][stderr]')
+                print(stderr_text.strip())
+            if proc.returncode != 0:
+                print(f'[{step_name}] echec | returncode={proc.returncode}')
+                if stdout_text and stdout_text.strip():
+                    print(f'[{step_name}][stdout]')
+                    print(stdout_text.strip())
+                raise RuntimeError(f'{step_name} a echoue (rc={proc.returncode})')
+            report = {}
+            stdout_clean = (stdout_text or '').strip()
+            if stdout_clean:
+                try:
+                    report = json.loads(stdout_clean)
+                except Exception:
+                    print(f'[{step_name}] sortie non-JSON brute:')
+                    print(stdout_clean)
+                    report = {}
+            print(f'[{step_name}] termine en {int(time.time() - started)}s')
+            return report
+
+        def _print_external_summary(report):
+            step = dict(report.get('steps', {}).get('external_artifacts_cleanup', {}) or {})
+            moved = list(step.get('moved', []) or [])
+            skipped = list(step.get('skipped', []) or [])
+            errors = list(step.get('errors', []) or [])
+            print('External artifacts summary:')
+            print('  moved   =', len(moved))
+            print('  skipped =', len(skipped))
+            print('  errors  =', len(errors))
+            for item in moved[:10]:
+                if isinstance(item, dict):
+                    print('   -', item.get('src', '<none>'), '=>', item.get('dst', '<none>'))
+
+        def _print_safe_summary(report):
+            steps = dict(report.get('steps', {}) or {})
+            backup = dict(steps.get('runtime_backup_stream_cleanup', {}) or {})
+            q = dict(steps.get('quarantine_cleanup', {}) or {})
+            d = dict(steps.get('duplicate_source_metadata_cleanup', {}) or {})
+            gp = dict(steps.get('global_progress_cleanup', {}) or {})
+            pm = dict(steps.get('pipeline_manifest_cleanup', {}) or {})
+            jd = dict(steps.get('completed_job_dirs_cleanup', {}) or {})
+            print('Safe cleanup summary:')
+            print('  backup_events_removed          =', backup.get('events_removed', 0))
+            print('  backup_metrics_removed         =', backup.get('metrics_removed', 0))
+            print('  quarantine_removed             =', len(q.get('removed', []) or []))
+            print('  duplicate_source_metadata_rm   =', len(d.get('removed_raw_metadata', []) or []))
+            print('  global_progress_removed        =', len(gp.get('removed_progress_files', []) or []))
+            print('  pipeline_manifests_removed     =', len(pm.get('removed', []) or []))
+            print('  completed_job_dirs_removed     =', len(jd.get('removed', []) or []))
+
+        print('Maintenance hebdo config:')
+        print('  dry_run              =', STORAGE_CLEANUP_DRY_RUN)
+        print('  scope                =', STORAGE_CLEANUP_SCOPE)
+        print('  heartbeat_seconds    =', STORAGE_CLEANUP_HEARTBEAT_SECONDS)
+        print('  purge_models         =', STORAGE_CLEANUP_PURGE_MODELS)
+        print('  allow_model_purge    =', STORAGE_CLEANUP_ALLOW_MODEL_PURGE)
+        print('  keep_model_id        =', STORAGE_CLEANUP_KEEP_MODEL_ID)
+        print('  config_path          =', STORAGE_CLEANUP_CONFIG_PATH)
+
         scope_value = str(STORAGE_CLEANUP_SCOPE).strip().lower()
+        if scope_value not in {'external_only', 'safe_noncritical', 'full'}:
+            raise ValueError(f'STORAGE_CLEANUP_SCOPE invalide: {STORAGE_CLEANUP_SCOPE}')
+
+        # Etape 1: corriger les artefacts externes (hors songo-stockfish).
+        external_report = _run_cleanup_step('cleanup_external_artifacts', ['--fix-external-artifacts'])
+        _print_external_summary(external_report)
+
+        # Etape 2: purge non critique.
         if scope_value in {'safe_noncritical', 'full'}:
-            cleanup_cmd.extend(
-                [
-                    '--purge-runtime-backup-streams',
-                    '--purge-quarantine',
-                    '--purge-duplicate-source-metadata',
-                    '--purge-global-progress-mirrors',
-                    '--purge-pipeline-manifests',
-                    '--purge-completed-job-dirs',
-                ]
-            )
+            safe_args = [
+                '--purge-runtime-backup-streams',
+                '--purge-quarantine',
+                '--purge-duplicate-source-metadata',
+                '--purge-global-progress-mirrors',
+                '--purge-pipeline-manifests',
+                '--purge-completed-job-dirs',
+            ]
+            safe_report = _run_cleanup_step('cleanup_safe_noncritical', safe_args)
+            _print_safe_summary(safe_report)
+
         if scope_value == 'full':
-            cleanup_cmd.extend(
-                [
-                    '--retention',
-                    '--purge-drive-raw',
-                    '--purge-drive-raw-include-inactive-partial',
-                    '--purge-drive-raw-inactive-min-age-hours',
-                    '48',
-                    '--purge-drive-label-cache',
-                ]
-            )
+            full_args = [
+                '--retention',
+                '--purge-drive-raw',
+                '--purge-drive-raw-include-inactive-partial',
+                '--purge-drive-raw-inactive-min-age-hours',
+                '48',
+                '--purge-drive-label-cache',
+            ]
             if bool(STORAGE_CLEANUP_PURGE_MODELS):
                 if not bool(STORAGE_CLEANUP_ALLOW_MODEL_PURGE):
                     raise RuntimeError(
                         'Refus de purge modeles: active aussi STORAGE_CLEANUP_ALLOW_MODEL_PURGE=True '
                         'pour confirmer explicitement.'
                     )
-                cleanup_cmd.extend(
+                full_args.extend(
                     [
                         '--purge-models',
                         '--allow-model-purge',
@@ -1147,58 +1249,10 @@ cells = [
                         '0',
                     ]
                 )
-        if not bool(STORAGE_CLEANUP_DRY_RUN):
-            cleanup_cmd.append('--apply')
+            full_report = _run_cleanup_step('cleanup_full', full_args)
+            print('Full cleanup summary keys =', list(dict(full_report.get('steps', {}) or {}).keys()))
 
-        env = dict(os.environ)
-        env['PYTHONPATH'] = str(Path(WORKTREE) / 'src')
-
-        print('Maintenance hebdo config:')
-        print('  dry_run          =', STORAGE_CLEANUP_DRY_RUN)
-        print('  scope            =', STORAGE_CLEANUP_SCOPE)
-        print('  purge_models     =', STORAGE_CLEANUP_PURGE_MODELS)
-        print('  allow_model_purge =', STORAGE_CLEANUP_ALLOW_MODEL_PURGE)
-        print('  keep_model_id    =', STORAGE_CLEANUP_KEEP_MODEL_ID)
-        print('  config_path      =', STORAGE_CLEANUP_CONFIG_PATH)
-        print('  command          =', cleanup_cmd)
-
-        proc = subprocess.run(
-            cleanup_cmd,
-            cwd=str(WORKTREE),
-            env=env,
-            text=True,
-            capture_output=True,
-            check=True,
-        )
-        if proc.stderr.strip():
-            print('[stderr]')
-            print(proc.stderr.strip())
-        stdout_text = proc.stdout.strip()
-        if stdout_text:
-            print('[stdout]')
-            print(stdout_text)
-        cleanup_report = {}
-        try:
-            cleanup_report = json.loads(stdout_text) if stdout_text else {}
-        except Exception:
-            cleanup_report = {}
-
-        ext_step = dict(cleanup_report.get('steps', {}).get('external_artifacts_cleanup', {}) or {})
-        moved_count = len(ext_step.get('moved', []) or [])
-        skipped_count = len(ext_step.get('skipped', []) or [])
-        errors_count = len(ext_step.get('errors', []) or [])
-        print('External artifacts summary:')
-        print('  moved   =', moved_count)
-        print('  skipped =', skipped_count)
-        print('  errors  =', errors_count)
-        if moved_count:
-            preview = (ext_step.get('moved') or [])[:10]
-            print('  moved_preview =')
-            for item in preview:
-                if isinstance(item, dict):
-                    print('   -', item.get('src', '<none>'), '=>', item.get('dst', '<none>'))
-
-        print('Maintenance hebdo terminee.')
+        print('\\nMaintenance hebdo terminee.')
         """
     ),
     md("## 3quater. Audit Usage Datasets (Train)"),

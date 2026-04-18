@@ -197,6 +197,27 @@ def _cleanup_external_drive_artifacts(*, drive_root: Path, apply: bool, now_epoc
             return True
         return False
 
+    def _resolve_available_target(path: Path) -> Path:
+        if not path.exists():
+            return path
+        parent = path.parent
+        suffix = path.suffix
+        if suffix:
+            base_name = path.name[: -len(suffix)]
+        else:
+            base_name = path.name
+        for idx in range(1, 10000):
+            if suffix:
+                candidate = parent / f"{base_name}__dup_{idx:03d}{suffix}"
+            else:
+                candidate = parent / f"{base_name}__dup_{idx:03d}"
+            if not candidate.exists():
+                return candidate
+        # Fallback theoretique si collisions massives.
+        if suffix:
+            return parent / f"{base_name}__dup_{int(now_ts)}{suffix}"
+        return parent / f"{base_name}__dup_{int(now_ts)}"
+
     raw_candidates: list[Path] = []
     try:
         for entry in sorted(mydrive_root.rglob("*")):
@@ -221,15 +242,12 @@ def _cleanup_external_drive_artifacts(*, drive_root: Path, apply: bool, now_epoc
 
     for entry in selected:
         rel_hint = str(entry.relative_to(mydrive_root))
-        target = session_root / rel_hint
+        target = _resolve_available_target(session_root / rel_hint)
         if not apply:
             step["moved"].append({"src": str(entry), "dst": str(target), "mode": "dry_run"})
             continue
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
-            if target.exists():
-                step["skipped"].append({"src": str(entry), "reason": "target_exists", "dst": str(target)})
-                continue
             shutil.move(str(entry), str(target))
             step["moved"].append({"src": str(entry), "dst": str(target), "mode": "moved"})
         except Exception as exc:
