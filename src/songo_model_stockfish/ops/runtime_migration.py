@@ -242,6 +242,35 @@ def _path_within(path: Path, base: Path) -> bool:
         path.resolve().relative_to(base.resolve())
         return True
     except Exception:
+        pass
+    try:
+        path_abs = Path(str(path)).expanduser()
+        base_abs = Path(str(base)).expanduser()
+        if not path_abs.is_absolute() or not base_abs.is_absolute():
+            return False
+        path_text = os.path.normpath(str(path_abs))
+        base_text = os.path.normpath(str(base_abs))
+        if path_text == base_text:
+            return True
+        base_prefix = base_text.rstrip(os.sep) + os.sep
+        return path_text.startswith(base_prefix)
+    except Exception:
+        return False
+
+
+def _path_text_within(path: Path, base: Path) -> bool:
+    try:
+        path_abs = Path(str(path)).expanduser()
+        base_abs = Path(str(base)).expanduser()
+        if not path_abs.is_absolute() or not base_abs.is_absolute():
+            return False
+        path_text = os.path.normpath(str(path_abs))
+        base_text = os.path.normpath(str(base_abs))
+        if path_text == base_text:
+            return True
+        base_prefix = base_text.rstrip(os.sep) + os.sep
+        return path_text.startswith(base_prefix)
+    except Exception:
         return False
 
 
@@ -266,7 +295,8 @@ def _resolve_allowed_drive_root() -> Path:
 
 def _resolve_quarantine_root_for_src(src_path: Path, quarantine_root: Path | None) -> Path | None:
     mydrive_root = Path("/content/drive/MyDrive")
-    if not _path_within(src_path, mydrive_root):
+    src_in_mydrive = _path_within(src_path, mydrive_root) or _path_text_within(src_path, mydrive_root)
+    if not src_in_mydrive:
         return quarantine_root
 
     allowed_drive_root = _resolve_allowed_drive_root()
@@ -276,7 +306,11 @@ def _resolve_quarantine_root_for_src(src_path: Path, quarantine_root: Path | Non
 
     # Garde-fou: si un quarantine_root MyDrive pointe hors drive_root autorise,
     # on reroute vers le dossier de quarantine du projet.
-    if _path_within(quarantine_root, mydrive_root) and not _path_within(quarantine_root, allowed_drive_root):
+    quarantine_in_mydrive = _path_within(quarantine_root, mydrive_root) or _path_text_within(quarantine_root, mydrive_root)
+    quarantine_in_allowed = _path_within(quarantine_root, allowed_drive_root) or _path_text_within(
+        quarantine_root, allowed_drive_root
+    )
+    if quarantine_in_mydrive and not quarantine_in_allowed:
         return default_drive_quarantine_root
     return quarantine_root
 
@@ -284,6 +318,10 @@ def _resolve_quarantine_root_for_src(src_path: Path, quarantine_root: Path | Non
 def _build_quarantine_path(src_path: Path, quarantine_root: Path | None) -> Path:
     stem = f".quarantine_{src_path.name}_{int(time.time())}"
     resolved_quarantine_root = _resolve_quarantine_root_for_src(src_path, quarantine_root)
+    mydrive_root = Path("/content/drive/MyDrive")
+    if resolved_quarantine_root is None and (_path_within(src_path, mydrive_root) or _path_text_within(src_path, mydrive_root)):
+        allowed_drive_root = _resolve_allowed_drive_root()
+        resolved_quarantine_root = allowed_drive_root / "runtime_migration" / "quarantine"
     if resolved_quarantine_root is None:
         candidate = src_path.with_name(stem)
         if not candidate.exists():

@@ -16,6 +16,20 @@ def _path_within(path: Path, base: Path) -> bool:
         path.resolve().relative_to(base.resolve())
         return True
     except Exception:
+        pass
+    # Fallback robuste pour certains montages FUSE/Drive ou resolve() ambigu.
+    try:
+        path_abs = Path(str(path)).expanduser()
+        base_abs = Path(str(base)).expanduser()
+        if not path_abs.is_absolute() or not base_abs.is_absolute():
+            return False
+        path_text = os.path.normpath(str(path_abs))
+        base_text = os.path.normpath(str(base_abs))
+        if path_text == base_text:
+            return True
+        base_prefix = base_text.rstrip(os.sep) + os.sep
+        return path_text.startswith(base_prefix)
+    except Exception:
         return False
 
 

@@ -365,6 +365,18 @@ cells = [
                 path.resolve().relative_to(base.resolve())
                 return True
             except Exception:
+                pass
+            try:
+                path_abs = Path(str(path)).expanduser()
+                base_abs = Path(str(base)).expanduser()
+                if not path_abs.is_absolute() or not base_abs.is_absolute():
+                    return False
+                path_text = os.path.normpath(str(path_abs))
+                base_text = os.path.normpath(str(base_abs))
+                if path_text == base_text:
+                    return True
+                return path_text.startswith(base_text.rstrip(os.sep) + os.sep)
+            except Exception:
                 return False
 
         def _assert_mydrive_scoped(path_like: str | Path, *, label: str) -> Path:
@@ -2167,6 +2179,7 @@ cells = [
 
         def _apply_runtime_storage_cfg(cfg: dict) -> dict:
             storage_cfg = dict(cfg.get('storage', {}) or {})
+            storage_cfg['drive_root'] = str(DRIVE_ROOT)
             storage_cfg['jobs_root'] = str(JOBS_ROOT)
             storage_cfg['logs_root'] = str(LOGS_ROOT)
             storage_cfg['runtime_state_backup_enabled'] = bool(RUNTIME_HYBRID_BACKUP_ENABLED)
@@ -2930,15 +2943,61 @@ cells = [
         from datetime import UTC, datetime
         from pathlib import Path
 
+        def _path_within(path: Path, base: Path) -> bool:
+            try:
+                path.resolve().relative_to(base.resolve())
+                return True
+            except Exception:
+                pass
+            try:
+                path_abs = Path(str(path)).expanduser()
+                base_abs = Path(str(base)).expanduser()
+                if not path_abs.is_absolute() or not base_abs.is_absolute():
+                    return False
+                path_text = os.path.normpath(str(path_abs))
+                base_text = os.path.normpath(str(base_abs))
+                if path_text == base_text:
+                    return True
+                return path_text.startswith(base_text.rstrip(os.sep) + os.sep)
+            except Exception:
+                return False
+
+        def _assert_launch_path(path_like: Path | str, *, label: str) -> Path:
+            path = Path(str(path_like))
+            mydrive_root = Path('/content/drive/MyDrive')
+            drive_root_path = Path(DRIVE_ROOT)
+            runtime_local_root = Path(str(globals().get('RUNTIME_LOCAL_ROOT', '/content/songo-stockfish-runtime')))
+            worktree_root = Path(WORKTREE)
+            if _path_within(path, mydrive_root) and not _path_within(path, drive_root_path):
+                raise RuntimeError(
+                    f'Chemin refuse hors drive projet: {path} (label={label}, drive_root={drive_root_path})'
+                )
+            if (
+                not _path_within(path, mydrive_root)
+                and not _path_within(path, runtime_local_root)
+                and not _path_within(path, worktree_root)
+            ):
+                raise RuntimeError(
+                    f'Chemin runtime inattendu: {path} (label={label}) | '
+                    f'attendu sous {drive_root_path} ou {runtime_local_root}'
+                )
+            return path
+
         logs_dir = Path(PIPELINE_LOGS_DIR)
+        _assert_launch_path(logs_dir, label='PIPELINE_LOGS_DIR')
         logs_dir.mkdir(parents=True, exist_ok=True)
         jobs_dir = Path(JOBS_ROOT)
+        _assert_launch_path(jobs_dir, label='JOBS_ROOT')
         jobs_dir.mkdir(parents=True, exist_ok=True)
+        _assert_launch_path(jobs_dir / DATASET_GENERATE_JOB_ID, label='DATASET_GENERATE_JOB_DIR')
+        _assert_launch_path(jobs_dir / DATASET_BUILD_JOB_ID, label='DATASET_BUILD_JOB_DIR')
         (jobs_dir / DATASET_GENERATE_JOB_ID).mkdir(parents=True, exist_ok=True)
         (jobs_dir / DATASET_BUILD_JOB_ID).mkdir(parents=True, exist_ok=True)
 
         generate_log_path = logs_dir / f'{DATASET_GENERATE_JOB_ID}.log'
         build_log_path = logs_dir / f'{DATASET_BUILD_JOB_ID}.log'
+        _assert_launch_path(generate_log_path, label='GENERATE_LOG_PATH')
+        _assert_launch_path(build_log_path, label='BUILD_LOG_PATH')
 
         def _append_launch_line(log_path: Path, text: str) -> None:
             stamp = datetime.now(UTC).isoformat().replace('+00:00', 'Z')
@@ -3027,6 +3086,7 @@ cells = [
             },
         }
         latest_path = Path(PIPELINE_MANIFEST_PATH)
+        _assert_launch_path(latest_path, label='PIPELINE_MANIFEST_PATH')
         _safe_write_json(latest_path, manifest, label='pipeline_manifest_write')
         firestore_manifest_written = False
         firestore_manifest_error = ''
@@ -3327,6 +3387,18 @@ cells = [
             try:
                 path.resolve().relative_to(base.resolve())
                 return True
+            except Exception:
+                pass
+            try:
+                path_abs = Path(str(path)).expanduser()
+                base_abs = Path(str(base)).expanduser()
+                if not path_abs.is_absolute() or not base_abs.is_absolute():
+                    return False
+                path_text = os.path.normpath(str(path_abs))
+                base_text = os.path.normpath(str(base_abs))
+                if path_text == base_text:
+                    return True
+                return path_text.startswith(base_text.rstrip(os.sep) + os.sep)
             except Exception:
                 return False
 
