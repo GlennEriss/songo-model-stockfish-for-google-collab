@@ -201,6 +201,7 @@ def _cleanup_external_drive_artifacts(*, drive_root: Path, apply: bool, now_epoc
         "benchmark_summary.json",
         "latest_dataset_pipeline",
         "latest_dataset_pipeline.json",
+        "tournament_progress.latest.json",
         "config.yaml",
         "run_status.json",
         "state.json",
@@ -239,7 +240,13 @@ def _cleanup_external_drive_artifacts(*, drive_root: Path, apply: bool, now_epoc
             return True
         if name.startswith("events") and name.endswith(".jsonl"):
             return True
+        if name.startswith("metrics") and name.endswith(".jsonl"):
+            return True
         if name.startswith("latest_dataset_pipeline"):
+            return True
+        if name.startswith("tournament_progress") and (name.endswith(".json") or name.endswith(".jsonl")):
+            return True
+        if name.startswith("metadata") and name.endswith(".json"):
             return True
         if name.startswith("mcts") and (name.endswith(".json") or name.endswith(".jsonl")):
             return True
@@ -302,8 +309,11 @@ def _cleanup_external_drive_artifacts(*, drive_root: Path, apply: bool, now_epoc
                 or lower_name.startswith("._model")
                 or lower_name.startswith(".bench_models")
                 or lower_name.startswith(".events")
+                or lower_name.startswith(".metrics")
                 or lower_name.startswith(".run_status")
                 or lower_name.startswith(".state")
+                or lower_name.startswith(".tournament_progress")
+                or lower_name.startswith(".metadata")
                 or lower_name.startswith(".mcts")
                 or lower_name.startswith(".minimax")
                 or lower_name.startswith(".songo_policy_value")
@@ -314,6 +324,7 @@ def _cleanup_external_drive_artifacts(*, drive_root: Path, apply: bool, now_epoc
                 )
                 or "run_status.json.tmp." in lower_name
                 or "state.json.tmp." in lower_name
+                or "tournament_progress.latest.json.tmp." in lower_name
                 or "dataset_registry.json.tmp." in lower_name
                 or "dataset_generation_summary.json.tmp." in lower_name
                 or "dataset_build_summary.json.tmp." in lower_name

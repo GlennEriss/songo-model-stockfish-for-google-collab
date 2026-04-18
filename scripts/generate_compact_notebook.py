@@ -1132,7 +1132,12 @@ cells = [
             'bench_models*.json',
             'build_dataset*.log',
             'events*.jsonl',
+            'metrics*.jsonl',
             'latest_dataset_pipeline*',
+            'tournament_progress*.json',
+            'tournament_progress*.jsonl',
+            'tournament_progress*.latest.json',
+            'metadata*.json',
             'mcts_*.json',
             'mcts_*.jsonl',
             'mcts*.json',
@@ -1170,7 +1175,12 @@ cells = [
             '.model*.tmp.*',
             '._model*.tmp.*',
             '.events*.jsonl.tmp.*',
+            '.metrics*.jsonl.tmp.*',
             '.latest_dataset_pipeline*.tmp.*',
+            '.tournament_progress*.json.tmp.*',
+            '.tournament_progress*.jsonl.tmp.*',
+            '.tournament_progress*.latest.json.tmp.*',
+            '.metadata*.json.tmp.*',
             '.mcts_*.json.tmp.*',
             '.mcts_*.jsonl.tmp.*',
             '.mcts*.json.tmp.*',
@@ -1386,6 +1396,7 @@ cells = [
                     'state.json',
                     'latest_dataset_pipeline',
                     'latest_dataset_pipeline.json',
+                    'tournament_progress.latest.json',
                     'dataset_registry.json',
                     'dataset_generation_summary.json',
                     'dataset_build_summary.json',
@@ -1403,7 +1414,13 @@ cells = [
                     return 2
                 if name.startswith('events') and name.endswith('.jsonl'):
                     return 2
+                if name.startswith('metrics') and name.endswith('.jsonl'):
+                    return 2
                 if name.startswith('latest_dataset_pipeline'):
+                    return 2
+                if name.startswith('tournament_progress') and (name.endswith('.json') or name.endswith('.jsonl')):
+                    return 2
+                if name.startswith('metadata') and name.endswith('.json'):
                     return 2
                 if name.startswith('dataset_registry') and name.endswith('.json'):
                     return 2
