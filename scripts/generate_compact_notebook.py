@@ -1125,18 +1125,36 @@ cells = [
             '.model*',
             '*.model',
             'model_songo_policy*',
+            'songo_policy_value*.pt',
+            'songo_policy_value*.model_card.json',
+            '*_evaluation_summary*.json',
+            '*.model_card.json',
             'bench_models*.json',
             'build_dataset*.log',
+            'events*.jsonl',
+            'latest_dataset_pipeline*',
+            'mcts_*.json',
+            'mcts_*.jsonl',
+            'minimax_*.json',
+            'minimax_*.jsonl',
             'dataset_registry*.json',
             'config*.yaml',
             'dataset_generation_summary.json',
+            'dataset_generation_summary*.json',
             'dataset_build_summary.json',
+            'dataset_build_summary*.json',
             'training_summary.json',
+            'training_summary*.json',
             'evaluation_summary.json',
+            'evaluation_summary*.json',
             'benchmark_summary.json',
+            'benchmark_summary*.json',
             '*dataset*_summary.json',
+            '*dataset*summary*.json',
             'config.yaml',
+            'run_status*.json',
             'run_status.json',
+            'state*.json',
             'state.json',
             '*dataset*metadata*.json',
             '_dataset_source_metadata.json*',
@@ -1144,16 +1162,31 @@ cells = [
             '._dataset*.tmp.*',
             '.model*.tmp.*',
             '._model*.tmp.*',
+            '.events*.jsonl.tmp.*',
+            '.latest_dataset_pipeline*.tmp.*',
+            '.mcts_*.json.tmp.*',
+            '.mcts_*.jsonl.tmp.*',
+            '.minimax_*.json.tmp.*',
+            '.minimax_*.jsonl.tmp.*',
+            '.run_status*.json.tmp.*',
+            '.state*.json.tmp.*',
+            '.songo_policy_value*.pt.tmp.*',
+            '.songo_policy_value*.model_card.json.tmp.*',
             '.config*.yaml.tmp.*',
             '.config.yaml.tmp.*',
             '.run_status.json.tmp.*',
             '.state.json.tmp.*',
             '.dataset_registry.json.tmp.*',
             '.dataset_generation_summary.json.tmp.*',
+            '.dataset_generation_summary*.json.tmp.*',
             '.dataset_build_summary.json.tmp.*',
+            '.dataset_build_summary*.json.tmp.*',
             '.training_summary.json.tmp.*',
+            '.training_summary*.json.tmp.*',
             '.evaluation_summary.json.tmp.*',
+            '.evaluation_summary*.json.tmp.*',
             '.benchmark_summary.json.tmp.*',
+            '.benchmark_summary*.json.tmp.*',
             '._dataset_source_metadata.json.tmp.*',
             '.bench_models*.tmp.*',
         ]
@@ -1340,6 +1373,8 @@ cells = [
                     'config.yaml',
                     'run_status.json',
                     'state.json',
+                    'latest_dataset_pipeline',
+                    'latest_dataset_pipeline.json',
                     'dataset_registry.json',
                     'dataset_generation_summary.json',
                     'dataset_build_summary.json',
@@ -1351,12 +1386,45 @@ cells = [
                     return 2
                 if name.startswith('config') and name.endswith('.yaml'):
                     return 2
+                if name.startswith('run_status') and name.endswith('.json'):
+                    return 2
+                if name.startswith('state') and name.endswith('.json'):
+                    return 2
+                if name.startswith('events') and name.endswith('.jsonl'):
+                    return 2
+                if name.startswith('latest_dataset_pipeline'):
+                    return 2
                 if name.startswith('dataset_registry') and name.endswith('.json'):
+                    return 2
+                if (
+                    (
+                        'dataset_generation_summary' in name
+                        or 'dataset_build_summary' in name
+                        or 'training_summary' in name
+                        or 'evaluation_summary' in name
+                        or 'benchmark_summary' in name
+                    )
+                    and name.endswith('.json')
+                ):
                     return 2
                 if name.endswith('_summary.json') and (
                     'dataset' in name or 'train' in name or 'evaluation' in name or 'benchmark' in name
                 ):
                     return 2
+                if name.endswith('.json') and 'summary' in name and (
+                    'dataset' in name or 'train' in name or 'evaluation' in name or 'benchmark' in name
+                ):
+                    return 2
+                if name.startswith('mcts_') and (name.endswith('.json') or name.endswith('.jsonl')):
+                    return 3
+                if name.startswith('minimax_') and (name.endswith('.json') or name.endswith('.jsonl')):
+                    return 3
+                if name.startswith('songo_policy_value') and name.endswith('.model_card.json'):
+                    return 3
+                if name.endswith('.model_card.json'):
+                    return 3
+                if name.startswith('songo_policy_value') and name.endswith('.pt'):
+                    return 4
                 if name.startswith('_dataset'):
                     return 3
                 if name.startswith('.dataset') or name.startswith('._dataset'):

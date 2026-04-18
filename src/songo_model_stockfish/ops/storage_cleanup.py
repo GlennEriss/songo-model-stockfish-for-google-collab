@@ -199,6 +199,8 @@ def _cleanup_external_drive_artifacts(*, drive_root: Path, apply: bool, now_epoc
         "training_summary.json",
         "evaluation_summary.json",
         "benchmark_summary.json",
+        "latest_dataset_pipeline",
+        "latest_dataset_pipeline.json",
         "config.yaml",
         "run_status.json",
         "state.json",
@@ -229,6 +231,20 @@ def _cleanup_external_drive_artifacts(*, drive_root: Path, apply: bool, now_epoc
             return True
         if name.startswith("model_songo_policy"):
             return True
+        if name.startswith("songo_policy_value") and name.endswith(".pt"):
+            return True
+        if name.startswith("songo_policy_value") and name.endswith(".model_card.json"):
+            return True
+        if name.endswith(".model_card.json"):
+            return True
+        if name.startswith("events") and name.endswith(".jsonl"):
+            return True
+        if name.startswith("latest_dataset_pipeline"):
+            return True
+        if name.startswith("mcts_") and (name.endswith(".json") or name.endswith(".jsonl")):
+            return True
+        if name.startswith("minimax_") and (name.endswith(".json") or name.endswith(".jsonl")):
+            return True
         if name.startswith("_dataset"):
             return True
         if name.startswith(".model") or name.startswith("._model"):
@@ -239,9 +255,33 @@ def _cleanup_external_drive_artifacts(*, drive_root: Path, apply: bool, now_epoc
             return True
         if lower_name.startswith("config") and lower_name.endswith(".yaml"):
             return True
+        if lower_name.startswith("run_status") and lower_name.endswith(".json"):
+            return True
+        if lower_name.startswith("state") and lower_name.endswith(".json"):
+            return True
         if lower_name.startswith("dataset_registry") and lower_name.endswith(".json"):
             return True
+        if lower_name.endswith("_evaluation_summary.json"):
+            return True
+        if (
+            (
+                "dataset_generation_summary" in lower_name
+                or "dataset_build_summary" in lower_name
+                or "training_summary" in lower_name
+                or "evaluation_summary" in lower_name
+                or "benchmark_summary" in lower_name
+            )
+            and lower_name.endswith(".json")
+        ):
+            return True
         if lower_name.endswith("_summary.json") and (
+            "dataset" in lower_name
+            or "train" in lower_name
+            or "evaluation" in lower_name
+            or "benchmark" in lower_name
+        ):
+            return True
+        if lower_name.endswith(".json") and "summary" in lower_name and (
             "dataset" in lower_name
             or "train" in lower_name
             or "evaluation" in lower_name
@@ -261,6 +301,12 @@ def _cleanup_external_drive_artifacts(*, drive_root: Path, apply: bool, now_epoc
                 or lower_name.startswith(".model")
                 or lower_name.startswith("._model")
                 or lower_name.startswith(".bench_models")
+                or lower_name.startswith(".events")
+                or lower_name.startswith(".run_status")
+                or lower_name.startswith(".state")
+                or lower_name.startswith(".mcts_")
+                or lower_name.startswith(".minimax_")
+                or lower_name.startswith(".songo_policy_value")
                 or "config.yaml.tmp." in lower_name
                 or (
                     ("config" in lower_name or lower_name.startswith(".config") or lower_name.startswith("._config"))
@@ -274,6 +320,16 @@ def _cleanup_external_drive_artifacts(*, drive_root: Path, apply: bool, now_epoc
                 or "training_summary.json.tmp." in lower_name
                 or "evaluation_summary.json.tmp." in lower_name
                 or "benchmark_summary.json.tmp." in lower_name
+                or (
+                    ".tmp." in lower_name
+                    and (
+                        "dataset_generation_summary" in lower_name
+                        or "dataset_build_summary" in lower_name
+                        or "training_summary" in lower_name
+                        or "evaluation_summary" in lower_name
+                        or "benchmark_summary" in lower_name
+                    )
+                )
                 or "_dataset_source_metadata.json.tmp" in lower_name
             ):
                 return True
