@@ -1089,15 +1089,20 @@ cells = [
         # - sans toucher aux datasets finaux ni aux modeles par defaut
         # Execution en 2 etapes + heartbeat pour voir la progression.
 
+        import fnmatch
         import json
         import os
+        import shutil
         import shlex
         import subprocess
         import time
+        from collections import deque
         from pathlib import Path
 
         STORAGE_CLEANUP_DRY_RUN = False  # True = simulation seulement (aucune action)
         STORAGE_CLEANUP_SCOPE = 'safe_noncritical'  # 'external_only' | 'safe_noncritical' | 'full'
+        STORAGE_CLEANUP_EXTERNAL_MODE = 'targeted_manual'  # 'targeted_manual' | 'cli_scan' | 'skip'
+        STORAGE_CLEANUP_EXTERNAL_ACTION = 'move'  # 'move' (recommande) | 'delete'
         STORAGE_CLEANUP_PURGE_MODELS = False  # True seulement si tu veux vraiment purger les modeles
         STORAGE_CLEANUP_ALLOW_MODEL_PURGE = False  # Double garde-fou explicite
         STORAGE_CLEANUP_KEEP_MODEL_ID = 'songo_policy_value_colab_pro_v12'
@@ -1107,6 +1112,18 @@ cells = [
         STORAGE_CLEANUP_EXTERNAL_SCAN_MAX_DEPTH = 6
         STORAGE_CLEANUP_EXTERNAL_FORCE_FULL_SCAN = False
         STORAGE_CLEANUP_EXTERNAL_MOVE_MAX_ITEMS = 500
+        STORAGE_CLEANUP_EXTERNAL_TARGET_MAX_DEPTH = 2
+        STORAGE_CLEANUP_EXTERNAL_TARGET_GLOBS = [
+            '.quarantine*',
+            '_dataset*',
+            '*.model',
+            'model_songo_policy*',
+            'bench_models*.json',
+        ]
+        # Noms exacts supplementaires (optionnel) detectes hors DRIVE_ROOT.
+        STORAGE_CLEANUP_EXTERNAL_TARGET_NAMES = []
+        # Chemins absolus supplementaires (optionnel) a traiter en priorite.
+        STORAGE_CLEANUP_EXTERNAL_TARGET_PATHS = []
         STORAGE_CLEANUP_CONFIG_PATH = str(
             globals().get(
                 'TRAIN_CONTINUE_CONFIG_ACTIVE_PATH',
@@ -1122,6 +1139,173 @@ cells = [
             '1' if bool(STORAGE_CLEANUP_EXTERNAL_FORCE_FULL_SCAN) else '0'
         )
         env['SONGO_EXTERNAL_ARTIFACT_MOVE_MAX_ITEMS'] = str(int(STORAGE_CLEANUP_EXTERNAL_MOVE_MAX_ITEMS))
+
+        def _path_within(path, base):
+            try:
+                Path(path).resolve().relative_to(Path(base).resolve())
+                return True
+            except Exception:
+                return False
+
+        def _resolve_available_target(path):
+            path = Path(path)
+            if not path.exists():
+                return path
+            parent = path.parent
+            suffix = path.suffix
+            base_name = path.name[:-len(suffix)] if suffix else path.name
+            for idx in range(1, 10000):
+                if suffix:
+                    candidate = parent / f'{base_name}__dup_{idx:03d}{suffix}'
+                else:
+                    candidate = parent / f'{base_name}__dup_{idx:03d}'
+                if not candidate.exists():
+                    return candidate
+            ts = int(time.time())
+            if suffix:
+                return parent / f'{base_name}__dup_{ts}{suffix}'
+            return parent / f'{base_name}__dup_{ts}'
+
+        def _run_targeted_external_cleanup():
+            mydrive_root = Path('/content/drive/MyDrive')
+            drive_root_path = Path(DRIVE_ROOT)
+            action = str(STORAGE_CLEANUP_EXTERNAL_ACTION).strip().lower()
+            if action not in {'move', 'delete'}:
+                raise ValueError(f'STORAGE_CLEANUP_EXTERNAL_ACTION invalide: {STORAGE_CLEANUP_EXTERNAL_ACTION}')
+
+            target_globs = [str(item).strip() for item in (STORAGE_CLEANUP_EXTERNAL_TARGET_GLOBS or []) if str(item).strip()]
+            target_names = {str(item).strip() for item in (STORAGE_CLEANUP_EXTERNAL_TARGET_NAMES or []) if str(item).strip()}
+            explicit_paths = []
+            for raw in (STORAGE_CLEANUP_EXTERNAL_TARGET_PATHS or []):
+                text = str(raw).strip()
+                if not text:
+                    continue
+                explicit_paths.append(Path(text))
+            max_depth = max(0, int(STORAGE_CLEANUP_EXTERNAL_TARGET_MAX_DEPTH))
+            move_max = max(1, int(STORAGE_CLEANUP_EXTERNAL_MOVE_MAX_ITEMS))
+            session_root = (
+                drive_root_path
+                / 'runtime_migration'
+                / 'recovered_external'
+                / 'manual_targeted'
+                / str(int(time.time()))
+            )
+            report = {
+                'mode': 'targeted_manual',
+                'dry_run': bool(STORAGE_CLEANUP_DRY_RUN),
+                'action': action,
+                'mydrive_root': str(mydrive_root),
+                'drive_root': str(drive_root_path),
+                'target_globs': list(target_globs),
+                'target_names': sorted(target_names),
+                'target_paths': [str(p) for p in explicit_paths],
+                'scan_max_depth': max_depth,
+                'scan_entries': 0,
+                'matched': [],
+                'processed': [],
+                'skipped': [],
+                'errors': [],
+            }
+            if not mydrive_root.exists():
+                report['errors'].append({'scan': str(mydrive_root), 'error': 'mydrive_root_missing'})
+                return report
+
+            queue = deque([(mydrive_root, 0)])
+            raw_candidates = []
+            explicit_targets = []
+            for item in explicit_paths:
+                try:
+                    resolved = item.resolve()
+                except Exception:
+                    resolved = item
+                if not str(resolved).startswith(str(mydrive_root)):
+                    report['skipped'].append({'path': str(item), 'reason': 'outside_mydrive'})
+                    continue
+                if not Path(resolved).exists():
+                    report['skipped'].append({'path': str(item), 'reason': 'missing'})
+                    continue
+                if _path_within(resolved, drive_root_path):
+                    report['skipped'].append({'path': str(item), 'reason': 'inside_drive_root'})
+                    continue
+                explicit_targets.append(Path(resolved))
+
+            while queue:
+                current, depth = queue.popleft()
+                try:
+                    with os.scandir(current) as it:
+                        for entry in it:
+                            report['scan_entries'] = int(report['scan_entries']) + 1
+                            path = Path(entry.path)
+                            if _path_within(path, drive_root_path):
+                                continue
+                            name = path.name
+                            matched = (name in target_names) or any(fnmatch.fnmatch(name, pattern) for pattern in target_globs)
+                            if matched:
+                                raw_candidates.append(path)
+                                continue
+                            if entry.is_dir(follow_symlinks=False) and depth < max_depth:
+                                queue.append((path, depth + 1))
+                except Exception as exc:
+                    report['errors'].append({'scan': str(current), 'error': f'{type(exc).__name__}: {exc}'})
+
+            for item in explicit_targets:
+                raw_candidates.append(item)
+
+            unique_candidates = []
+            seen = set()
+            for item in raw_candidates:
+                text = str(item)
+                if text in seen:
+                    continue
+                seen.add(text)
+                unique_candidates.append(item)
+            unique_candidates = sorted(unique_candidates, key=lambda p: (len(p.parts), str(p)))
+
+            selected = []
+            for candidate in unique_candidates:
+                if any(_path_within(candidate, parent) for parent in selected):
+                    continue
+                selected.append(candidate)
+            report['matched'] = [str(p) for p in selected]
+
+            processed_count = 0
+            for src in selected:
+                if processed_count >= move_max:
+                    report['skipped'].append(
+                        {
+                            'path': '<multiple>',
+                            'reason': 'move_limit_reached',
+                            'limit': int(move_max),
+                            'remaining': int(len(selected) - processed_count),
+                        }
+                    )
+                    break
+                try:
+                    if action == 'move':
+                        rel = src.relative_to(mydrive_root)
+                        dst = _resolve_available_target(session_root / rel)
+                        if not bool(STORAGE_CLEANUP_DRY_RUN):
+                            dst.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.move(str(src), str(dst))
+                        report['processed'].append(
+                            {'src': str(src), 'dst': str(dst), 'mode': 'dry_run' if bool(STORAGE_CLEANUP_DRY_RUN) else 'moved'}
+                        )
+                    else:
+                        if not bool(STORAGE_CLEANUP_DRY_RUN):
+                            if src.is_dir():
+                                shutil.rmtree(src, ignore_errors=False)
+                            else:
+                                src.unlink(missing_ok=False)
+                        report['processed'].append(
+                            {'src': str(src), 'mode': 'dry_run' if bool(STORAGE_CLEANUP_DRY_RUN) else 'deleted'}
+                        )
+                    processed_count += 1
+                    if processed_count % 25 == 0:
+                        print(f'[cleanup_external_artifacts_targeted] progression={processed_count}/{len(selected)}')
+                except Exception as exc:
+                    report['errors'].append({'src': str(src), 'error': f'{type(exc).__name__}: {exc}'})
+
+            return report
 
         def _parse_json_payload(raw_text):
             text = str(raw_text or '').strip()
@@ -1267,6 +1451,12 @@ cells = [
         print('Maintenance hebdo config:')
         print('  dry_run              =', STORAGE_CLEANUP_DRY_RUN)
         print('  scope                =', STORAGE_CLEANUP_SCOPE)
+        print('  external_mode        =', STORAGE_CLEANUP_EXTERNAL_MODE)
+        print('  external_action      =', STORAGE_CLEANUP_EXTERNAL_ACTION)
+        print('  external_target_globs =', STORAGE_CLEANUP_EXTERNAL_TARGET_GLOBS)
+        print('  external_target_names =', STORAGE_CLEANUP_EXTERNAL_TARGET_NAMES)
+        print('  external_target_paths =', STORAGE_CLEANUP_EXTERNAL_TARGET_PATHS)
+        print('  external_target_depth =', STORAGE_CLEANUP_EXTERNAL_TARGET_MAX_DEPTH)
         print('  heartbeat_seconds    =', STORAGE_CLEANUP_HEARTBEAT_SECONDS)
         print('  step_timeout_seconds =', STORAGE_CLEANUP_STEP_TIMEOUT_SECONDS)
         print('  external_scan_max_s  =', STORAGE_CLEANUP_EXTERNAL_SCAN_MAX_SECONDS)
@@ -1281,15 +1471,36 @@ cells = [
         scope_value = str(STORAGE_CLEANUP_SCOPE).strip().lower()
         if scope_value not in {'external_only', 'safe_noncritical', 'full'}:
             raise ValueError(f'STORAGE_CLEANUP_SCOPE invalide: {STORAGE_CLEANUP_SCOPE}')
+        external_mode = str(STORAGE_CLEANUP_EXTERNAL_MODE).strip().lower()
+        if external_mode not in {'targeted_manual', 'cli_scan', 'skip'}:
+            raise ValueError(f'STORAGE_CLEANUP_EXTERNAL_MODE invalide: {STORAGE_CLEANUP_EXTERNAL_MODE}')
 
         # Etape 1: corriger les artefacts externes (hors songo-stockfish).
-        external_report = _run_cleanup_step(
-            'cleanup_external_artifacts',
-            ['--fix-external-artifacts'],
-            timeout_seconds=float(STORAGE_CLEANUP_STEP_TIMEOUT_SECONDS),
-            continue_on_timeout=True,
-        )
-        _print_external_summary(external_report)
+        if external_mode == 'targeted_manual':
+            print('\\n=== cleanup_external_artifacts_targeted_manual ===')
+            external_report = _run_targeted_external_cleanup()
+            print('External artifacts (targeted manual) summary:')
+            print('  scan_entries =', external_report.get('scan_entries', 0))
+            print('  matched      =', len(external_report.get('matched', []) or []))
+            print('  processed    =', len(external_report.get('processed', []) or []))
+            print('  skipped      =', len(external_report.get('skipped', []) or []))
+            print('  errors       =', len(external_report.get('errors', []) or []))
+            preview = list(external_report.get('processed', []) or [])[:20]
+            if preview:
+                print('  processed_preview =')
+                for item in preview:
+                    print('   -', item)
+        elif external_mode == 'cli_scan':
+            external_report = _run_cleanup_step(
+                'cleanup_external_artifacts',
+                ['--fix-external-artifacts'],
+                timeout_seconds=float(STORAGE_CLEANUP_STEP_TIMEOUT_SECONDS),
+                continue_on_timeout=True,
+            )
+            _print_external_summary(external_report)
+        else:
+            print('\\n=== cleanup_external_artifacts ===')
+            print('skip: STORAGE_CLEANUP_EXTERNAL_MODE=skip')
 
         # Etape 2: purge non critique.
         if scope_value in {'safe_noncritical', 'full'}:
