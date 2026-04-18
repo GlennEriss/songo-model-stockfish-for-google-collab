@@ -240,8 +240,6 @@ def _cleanup_external_drive_artifacts(*, drive_root: Path, apply: bool, now_epoc
             return True
         if name.startswith("dataset"):
             return True
-        if name.startswith("dataset") and path.is_dir():
-            return True
         if name.startswith("labeled_positions"):
             return True
         if name.startswith("songo_policy_value") and name.endswith(".pt"):

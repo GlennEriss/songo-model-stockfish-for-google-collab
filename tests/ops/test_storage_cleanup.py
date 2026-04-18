@@ -5,6 +5,8 @@ import os
 import time
 from pathlib import Path
 
+import pytest
+
 from songo_model_stockfish.ops.paths import build_project_paths
 from songo_model_stockfish.ops.storage_cleanup import run_storage_cleanup
 
@@ -290,6 +292,17 @@ def test_duplicate_source_metadata_cleanup_removes_raw_copy_when_identical(tmp_p
     step = report["steps"]["duplicate_source_metadata_cleanup"]
     removed = set(str(item) for item in step.get("removed_raw_metadata", []))
     assert str(raw_dir / "_dataset_source_metadata.json") in removed
+
+
+def test_build_project_paths_rejects_mydrive_root_without_project_folder() -> None:
+    cfg = {
+        "storage": {
+            "drive_root": "/content/drive/MyDrive",
+            "repo_root": "/content/songo-model-stockfish-for-google-collab",
+        }
+    }
+    with pytest.raises(RuntimeError):
+        build_project_paths(cfg)
 
 
 def test_global_progress_cleanup_removes_old_unprotected_targets(tmp_path: Path) -> None:
