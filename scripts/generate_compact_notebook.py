@@ -1287,7 +1287,24 @@ cells = [
                     continue
                 seen.add(text)
                 unique_candidates.append(item)
-            unique_candidates = sorted(unique_candidates, key=lambda p: (len(p.parts), str(p)))
+            explicit_set = {str(p) for p in explicit_targets}
+
+            def _candidate_priority(path):
+                text = str(path)
+                name = str(path.name or '').lower()
+                if text in explicit_set:
+                    return 0
+                if name.startswith('.quarantine'):
+                    return 1
+                if name.startswith('_dataset'):
+                    return 2
+                if name.startswith('bench_models') and name.endswith('.json'):
+                    return 3
+                if name.startswith('model_songo_policy') or name.endswith('.model'):
+                    return 4
+                return 9
+
+            unique_candidates = sorted(unique_candidates, key=lambda p: (_candidate_priority(p), len(p.parts), str(p)))
 
             selected = []
             for candidate in unique_candidates:
@@ -1295,6 +1312,10 @@ cells = [
                     continue
                 selected.append(candidate)
             report['matched'] = [str(p) for p in selected]
+            print(
+                '[cleanup_external_artifacts_targeted] '
+                f'scan_done | matched_unique={len(unique_candidates)} | selected={len(selected)}'
+            )
 
             processed_count = 0
             for src in selected:
@@ -1306,6 +1327,10 @@ cells = [
                             'limit': int(move_max),
                             'remaining': int(len(selected) - processed_count),
                         }
+                    )
+                    print(
+                        '[cleanup_external_artifacts_targeted] '
+                        f'move_limit_reached={move_max} | remaining={len(selected) - processed_count}'
                     )
                     break
                 try:
@@ -1333,6 +1358,10 @@ cells = [
                 except Exception as exc:
                     report['errors'].append({'src': str(src), 'error': f'{type(exc).__name__}: {exc}'})
 
+            print(
+                '[cleanup_external_artifacts_targeted] '
+                f'move_done | processed={processed_count}/{len(selected)}'
+            )
             return report
 
         def _parse_json_payload(raw_text):
