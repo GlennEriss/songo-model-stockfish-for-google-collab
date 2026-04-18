@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from songo_model_stockfish.ops.runtime_migration import (
+    _resolve_quarantine_root_for_src,
     run_drive_to_local_runtime_migration,
     sync_tree_with_hash_verify,
     verify_tree_hash,
@@ -129,3 +130,14 @@ def test_run_migration_accepts_dedicated_quarantine_root(tmp_path: Path) -> None
 
     assert int(summary["jobs"]["purged"]) == 1
     assert summary.get("runtime", {}).get("quarantine_root") == str(quarantine_root)
+
+
+def test_quarantine_root_for_mydrive_src_is_rerouted_under_allowed_drive_root(monkeypatch) -> None:
+    monkeypatch.setenv("SONGO_DRIVE_ROOT", "/content/drive/MyDrive/songo-stockfish")
+    src_path = Path("/content/drive/MyDrive/pipeline")
+    unsafe_root = Path("/content/drive/MyDrive")
+
+    resolved = _resolve_quarantine_root_for_src(src_path, unsafe_root)
+
+    assert resolved is not None
+    assert str(resolved).startswith("/content/drive/MyDrive/songo-stockfish/runtime_migration/quarantine")

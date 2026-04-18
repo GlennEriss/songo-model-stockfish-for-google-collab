@@ -401,15 +401,22 @@ def build_parser() -> argparse.ArgumentParser:
     storage_cleanup.add_argument("--retention-checkpoint-keep-recent-per-model", type=int, default=2)
     storage_cleanup.add_argument("--retention-global-progress-ttl-days", type=float, default=14.0)
     storage_cleanup.add_argument("--retention-global-progress-keep-recent", type=int, default=3)
+    storage_cleanup.add_argument("--retention-global-progress-hard-max-age-days", type=float, default=30.0)
     storage_cleanup.add_argument("--retention-pipeline-manifest-ttl-days", type=float, default=14.0)
     storage_cleanup.add_argument("--retention-pipeline-manifest-keep-recent", type=int, default=60)
+    storage_cleanup.add_argument("--retention-pipeline-manifest-hard-max-age-days", type=float, default=30.0)
     storage_cleanup.add_argument("--retention-completed-job-dir-ttl-days", type=float, default=14.0)
     storage_cleanup.add_argument("--retention-completed-job-dir-keep-recent-per-run-type", type=int, default=8)
+    storage_cleanup.add_argument("--retention-completed-job-dir-hard-max-age-days", type=float, default=30.0)
     storage_cleanup.add_argument("--retention-source-metadata-raw-ttl-hours", type=float, default=24.0)
     storage_cleanup.add_argument("--retention-drive-root-artifact-ttl-hours", type=float, default=24.0)
     storage_cleanup.add_argument("--retention-drive-root-artifact-keep-recent-per-key", type=int, default=1)
+    storage_cleanup.add_argument("--retention-drive-root-artifact-hard-max-age-days", type=float, default=30.0)
     storage_cleanup.add_argument("--retention-recovered-external-ttl-days", type=float, default=7.0)
     storage_cleanup.add_argument("--retention-recovered-external-keep-recent-sessions", type=int, default=2)
+    storage_cleanup.add_argument("--retention-recovered-external-hard-max-age-days", type=float, default=30.0)
+    storage_cleanup.add_argument("--retention-benchmark-report-hard-max-age-days", type=float, default=60.0)
+    storage_cleanup.add_argument("--retention-checkpoint-hard-max-age-days", type=float, default=30.0)
     storage_cleanup.add_argument("--keep-model-id", action="append", default=[])
     storage_cleanup.add_argument("--keep-model-ids")
     storage_cleanup.add_argument("--keep-top-models", type=int, default=1)
@@ -537,11 +544,20 @@ def main(argv: list[str] | None = None) -> int:
             retention_checkpoint_keep_recent_per_model=max(0, int(args.retention_checkpoint_keep_recent_per_model)),
             retention_global_progress_ttl_seconds=max(0.0, float(args.retention_global_progress_ttl_days) * 86400.0),
             retention_global_progress_keep_recent=max(0, int(args.retention_global_progress_keep_recent)),
+            retention_global_progress_hard_max_age_seconds=max(
+                0.0, float(args.retention_global_progress_hard_max_age_days) * 86400.0
+            ),
             retention_pipeline_manifest_ttl_seconds=max(0.0, float(args.retention_pipeline_manifest_ttl_days) * 86400.0),
             retention_pipeline_manifest_keep_recent=max(0, int(args.retention_pipeline_manifest_keep_recent)),
+            retention_pipeline_manifest_hard_max_age_seconds=max(
+                0.0, float(args.retention_pipeline_manifest_hard_max_age_days) * 86400.0
+            ),
             retention_job_dir_ttl_seconds=max(0.0, float(args.retention_completed_job_dir_ttl_days) * 86400.0),
             retention_job_dir_keep_recent_per_run_type=max(
                 0, int(args.retention_completed_job_dir_keep_recent_per_run_type)
+            ),
+            retention_job_dir_hard_max_age_seconds=max(
+                0.0, float(args.retention_completed_job_dir_hard_max_age_days) * 86400.0
             ),
             retention_source_metadata_raw_ttl_seconds=max(0.0, float(args.retention_source_metadata_raw_ttl_hours) * 3600.0),
             retention_drive_root_artifact_ttl_seconds=max(
@@ -550,11 +566,23 @@ def main(argv: list[str] | None = None) -> int:
             retention_drive_root_artifact_keep_recent_per_key=max(
                 0, int(args.retention_drive_root_artifact_keep_recent_per_key)
             ),
+            retention_drive_root_artifact_hard_max_age_seconds=max(
+                0.0, float(args.retention_drive_root_artifact_hard_max_age_days) * 86400.0
+            ),
             retention_recovered_external_ttl_seconds=max(
                 0.0, float(args.retention_recovered_external_ttl_days) * 86400.0
             ),
             retention_recovered_external_keep_recent_sessions=max(
                 0, int(args.retention_recovered_external_keep_recent_sessions)
+            ),
+            retention_recovered_external_hard_max_age_seconds=max(
+                0.0, float(args.retention_recovered_external_hard_max_age_days) * 86400.0
+            ),
+            retention_benchmark_report_hard_max_age_seconds=max(
+                0.0, float(args.retention_benchmark_report_hard_max_age_days) * 86400.0
+            ),
+            retention_checkpoint_hard_max_age_seconds=max(
+                0.0, float(args.retention_checkpoint_hard_max_age_days) * 86400.0
             ),
         )
         print(json.dumps(result, indent=2, ensure_ascii=True))

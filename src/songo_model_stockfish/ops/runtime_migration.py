@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import time
@@ -236,9 +237,47 @@ def load_manifest_prefer_local(local_manifest_path: Path, *, firestore_manifest:
     return {}, "none"
 
 
+def _path_within(path: Path, base: Path) -> bool:
+    try:
+        path.resolve().relative_to(base.resolve())
+        return True
+    except Exception:
+        return False
+
+
+def _resolve_allowed_drive_root() -> Path:
+    mydrive_root = Path("/content/drive/MyDrive")
+    configured_text = str(os.environ.get("SONGO_DRIVE_ROOT", "")).strip()
+    if configured_text:
+        configured = Path(configured_text)
+    else:
+        configured = mydrive_root / "songo-stockfish"
+    if configured == mydrive_root:
+        return mydrive_root / "songo-stockfish"
+    return configured
+
+
+def _resolve_quarantine_root_for_src(src_path: Path, quarantine_root: Path | None) -> Path | None:
+    mydrive_root = Path("/content/drive/MyDrive")
+    if not _path_within(src_path, mydrive_root):
+        return quarantine_root
+
+    allowed_drive_root = _resolve_allowed_drive_root()
+    default_drive_quarantine_root = allowed_drive_root / "runtime_migration" / "quarantine"
+    if quarantine_root is None:
+        return default_drive_quarantine_root
+
+    # Garde-fou: si un quarantine_root MyDrive pointe hors drive_root autorise,
+    # on reroute vers le dossier de quarantine du projet.
+    if _path_within(quarantine_root, mydrive_root) and not _path_within(quarantine_root, allowed_drive_root):
+        return default_drive_quarantine_root
+    return quarantine_root
+
+
 def _build_quarantine_path(src_path: Path, quarantine_root: Path | None) -> Path:
     stem = f".quarantine_{src_path.name}_{int(time.time())}"
-    if quarantine_root is None:
+    resolved_quarantine_root = _resolve_quarantine_root_for_src(src_path, quarantine_root)
+    if resolved_quarantine_root is None:
         candidate = src_path.with_name(stem)
         if not candidate.exists():
             return candidate
@@ -248,13 +287,13 @@ def _build_quarantine_path(src_path: Path, quarantine_root: Path | None) -> Path
             if not alt.exists():
                 return alt
             suffix += 1
-    quarantine_root.mkdir(parents=True, exist_ok=True)
-    candidate = quarantine_root / stem
+    resolved_quarantine_root.mkdir(parents=True, exist_ok=True)
+    candidate = resolved_quarantine_root / stem
     if not candidate.exists():
         return candidate
     suffix = 1
     while True:
-        alt = quarantine_root / f"{stem}_{suffix}"
+        alt = resolved_quarantine_root / f"{stem}_{suffix}"
         if not alt.exists():
             return alt
         suffix += 1
@@ -292,6 +331,10 @@ def run_drive_to_local_runtime_migration(
     local_jobs_root.mkdir(parents=True, exist_ok=True)
     local_pipeline_logs_root.mkdir(parents=True, exist_ok=True)
     resolved_manifest = manifest if isinstance(manifest, dict) else {}
+    effective_quarantine_root = _resolve_quarantine_root_for_src(
+        drive_jobs_root if drive_jobs_root.exists() else drive_pipeline_logs_root,
+        quarantine_root,
+    )
 
     summary: dict[str, Any] = {
         "lock": {"path": str(lock_dir) if lock_dir is not None else "", "acquired": bool(lock_acquired)},
@@ -415,6 +458,7 @@ def run_drive_to_local_runtime_migration(
                 "skip_active_job_dirs": bool(skip_active_job_dirs),
                 "active_updated_max_age_seconds": float(active_updated_max_age_seconds),
                 "quarantine_root": str(quarantine_root) if quarantine_root is not None else "",
+                "effective_quarantine_root": str(effective_quarantine_root) if effective_quarantine_root is not None else "",
             }
     finally:
         if lock_dir is not None and lock_acquired:

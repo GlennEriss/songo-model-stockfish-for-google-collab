@@ -69,16 +69,30 @@ def test_storage_cleanup_cli_smoke_all_flags(monkeypatch, capsys, tmp_path: Path
             "21",
             "--retention-global-progress-keep-recent",
             "4",
+            "--retention-global-progress-hard-max-age-days",
+            "31",
             "--retention-pipeline-manifest-ttl-days",
             "10",
             "--retention-pipeline-manifest-keep-recent",
             "12",
+            "--retention-pipeline-manifest-hard-max-age-days",
+            "45",
             "--retention-completed-job-dir-ttl-days",
             "30",
             "--retention-completed-job-dir-keep-recent-per-run-type",
             "9",
+            "--retention-completed-job-dir-hard-max-age-days",
+            "50",
             "--retention-source-metadata-raw-ttl-hours",
             "36",
+            "--retention-drive-root-artifact-hard-max-age-days",
+            "33",
+            "--retention-recovered-external-hard-max-age-days",
+            "34",
+            "--retention-benchmark-report-hard-max-age-days",
+            "90",
+            "--retention-checkpoint-hard-max-age-days",
+            "32",
         ]
     )
 
@@ -97,11 +111,18 @@ def test_storage_cleanup_cli_smoke_all_flags(monkeypatch, capsys, tmp_path: Path
     assert float(captured_kwargs.get("retention_job_stream_ttl_seconds", 0.0)) == 96.0 * 3600.0
     assert float(captured_kwargs.get("retention_global_progress_ttl_seconds", 0.0)) == 21.0 * 86400.0
     assert int(captured_kwargs.get("retention_global_progress_keep_recent", 0)) == 4
+    assert float(captured_kwargs.get("retention_global_progress_hard_max_age_seconds", 0.0)) == 31.0 * 86400.0
     assert float(captured_kwargs.get("retention_pipeline_manifest_ttl_seconds", 0.0)) == 10.0 * 86400.0
     assert int(captured_kwargs.get("retention_pipeline_manifest_keep_recent", 0)) == 12
+    assert float(captured_kwargs.get("retention_pipeline_manifest_hard_max_age_seconds", 0.0)) == 45.0 * 86400.0
     assert float(captured_kwargs.get("retention_job_dir_ttl_seconds", 0.0)) == 30.0 * 86400.0
     assert int(captured_kwargs.get("retention_job_dir_keep_recent_per_run_type", 0)) == 9
+    assert float(captured_kwargs.get("retention_job_dir_hard_max_age_seconds", 0.0)) == 50.0 * 86400.0
     assert float(captured_kwargs.get("retention_source_metadata_raw_ttl_seconds", 0.0)) == 36.0 * 3600.0
+    assert float(captured_kwargs.get("retention_drive_root_artifact_hard_max_age_seconds", 0.0)) == 33.0 * 86400.0
+    assert float(captured_kwargs.get("retention_recovered_external_hard_max_age_seconds", 0.0)) == 34.0 * 86400.0
+    assert float(captured_kwargs.get("retention_benchmark_report_hard_max_age_seconds", 0.0)) == 90.0 * 86400.0
+    assert float(captured_kwargs.get("retention_checkpoint_hard_max_age_seconds", 0.0)) == 32.0 * 86400.0
     assert list(captured_kwargs.get("keep_model_ids", [])) == ["model_a", "model_b", "model_c", "model_d"]
 
     payload = json.loads(capsys.readouterr().out)

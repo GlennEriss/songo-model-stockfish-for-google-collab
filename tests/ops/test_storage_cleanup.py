@@ -496,3 +496,47 @@ def test_duplicate_source_metadata_cleanup_uses_ttl_for_completed_mismatch(tmp_p
     removed_due_to_ttl = set(str(item) for item in step.get("removed_raw_metadata_due_to_ttl", []))
     assert str(raw_meta) in removed
     assert str(raw_meta) in removed_due_to_ttl
+
+
+def test_retention_drive_root_artifacts_hard_max_age_overrides_keep_recent(tmp_path: Path) -> None:
+    drive_root = tmp_path / "drive"
+    drive_root.mkdir(parents=True, exist_ok=True)
+    cfg = _make_config(drive_root)
+    paths = build_project_paths(cfg)
+
+    state_main = paths.drive_root / "state.json"
+    state_dup = paths.drive_root / "state (1).json"
+    state_main.write_text("{}", encoding="utf-8")
+    state_dup.write_text("{}", encoding="utf-8")
+
+    old_epoch = time.time() - 40.0 * 86400.0
+    os.utime(state_main, (old_epoch, old_epoch))
+    os.utime(state_dup, (old_epoch, old_epoch))
+
+    report = run_storage_cleanup(
+        config=cfg,
+        paths=paths,
+        apply=False,
+        cleanup_runtime_migration=False,
+        cleanup_runtime_backup_streams=False,
+        cleanup_drive_raw_dirs=False,
+        cleanup_drive_label_cache=False,
+        cleanup_models=False,
+        cleanup_retention=True,
+        keep_model_ids=[],
+        keep_top_models=0,
+        keep_dataset_ids=[],
+        retention_drive_root_artifact_ttl_seconds=365.0 * 86400.0,
+        retention_drive_root_artifact_keep_recent_per_key=1,
+        retention_drive_root_artifact_hard_max_age_seconds=30.0 * 86400.0,
+    )
+
+    step = report["steps"]["retention_cleanup"]
+    removed = {
+        str(item.get("path", ""))
+        for item in step.get("drive_root_operational_artifacts_removed", [])
+        if isinstance(item, dict)
+    }
+    assert str(state_main) in removed
+    assert str(state_dup) in removed
+    assert int(step.get("drive_root_operational_removed_hard_max_age", 0) or 0) >= 2

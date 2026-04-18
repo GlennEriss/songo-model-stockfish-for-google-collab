@@ -706,15 +706,19 @@ def _cleanup_pipeline_manifests(
     apply: bool,
     pipeline_manifest_ttl_seconds: float,
     pipeline_manifest_keep_recent: int,
+    pipeline_manifest_hard_max_age_seconds: float = 0.0,
     now_epoch: float | None = None,
 ) -> dict[str, Any]:
     ttl_seconds = float(max(0.0, pipeline_manifest_ttl_seconds))
     keep_recent = max(0, int(pipeline_manifest_keep_recent))
+    hard_max_seconds = float(max(0.0, pipeline_manifest_hard_max_age_seconds))
     step: dict[str, Any] = {
         "pipeline_root": str(pipeline_root),
         "pipeline_manifest_ttl_seconds": ttl_seconds,
         "pipeline_manifest_keep_recent": keep_recent,
+        "pipeline_manifest_hard_max_age_seconds": hard_max_seconds,
         "removed": [],
+        "removed_hard_max_age": 0,
         "skipped_recent_ttl": 0,
         "skipped_keep_recent": 0,
         "errors": [],
@@ -733,11 +737,21 @@ def _cleanup_pipeline_manifests(
     files_sorted = sorted(files, key=lambda item: float(item.stat().st_mtime), reverse=True)
     kept = 0
     for file_path in files_sorted:
+        age_seconds = _path_age_seconds(file_path, now_epoch=now_epoch)
         if kept < keep_recent:
+            if hard_max_seconds > 0.0 and age_seconds >= hard_max_seconds:
+                if _remove_file(file_path, apply=apply):
+                    step["removed"].append(str(file_path))
+                    step["removed_hard_max_age"] = int(step["removed_hard_max_age"]) + 1
+                continue
             kept += 1
             step["skipped_keep_recent"] = int(step["skipped_keep_recent"]) + 1
             continue
-        age_seconds = _path_age_seconds(file_path, now_epoch=now_epoch)
+        if hard_max_seconds > 0.0 and age_seconds >= hard_max_seconds:
+            if _remove_file(file_path, apply=apply):
+                step["removed"].append(str(file_path))
+                step["removed_hard_max_age"] = int(step["removed_hard_max_age"]) + 1
+            continue
         if age_seconds < ttl_seconds:
             step["skipped_recent_ttl"] = int(step["skipped_recent_ttl"]) + 1
             continue
@@ -877,18 +891,22 @@ def _cleanup_drive_root_operational_artifacts(
     apply: bool,
     artifact_ttl_seconds: float,
     artifact_keep_recent_per_key: int,
+    artifact_hard_max_age_seconds: float = 0.0,
     now_epoch: float | None = None,
 ) -> dict[str, Any]:
     ttl_seconds = float(max(0.0, artifact_ttl_seconds))
     keep_recent = max(0, int(artifact_keep_recent_per_key))
+    hard_max_seconds = float(max(0.0, artifact_hard_max_age_seconds))
     step: dict[str, Any] = {
         "drive_root": str(drive_root),
         "artifact_ttl_seconds": ttl_seconds,
         "artifact_keep_recent_per_key": keep_recent,
+        "artifact_hard_max_age_seconds": hard_max_seconds,
         "scanned_files": 0,
         "candidate_files": 0,
         "groups_count": 0,
         "removed": [],
+        "removed_hard_max_age": 0,
         "skipped_keep_recent": 0,
         "skipped_recent_ttl": 0,
         "errors": [],
@@ -930,10 +948,34 @@ def _cleanup_drive_root_operational_artifacts(
         for idx, file_path in enumerate(sorted_paths):
             file_name_lower = str(file_path.name or "").lower()
             group_keep_recent = 0 if ".tmp." in file_name_lower else keep_recent
+            age_seconds = _path_age_seconds(file_path, now_epoch=now_epoch)
             if idx < group_keep_recent:
+                if hard_max_seconds > 0.0 and age_seconds >= hard_max_seconds:
+                    if _remove_file(file_path, apply=apply):
+                        step["removed"].append(
+                            {
+                                "path": str(file_path),
+                                "group_key": str(group_key),
+                                "age_seconds": float(age_seconds),
+                                "reason": "hard_max_age",
+                            }
+                        )
+                        step["removed_hard_max_age"] = int(step["removed_hard_max_age"]) + 1
+                    continue
                 step["skipped_keep_recent"] = int(step["skipped_keep_recent"]) + 1
                 continue
-            age_seconds = _path_age_seconds(file_path, now_epoch=now_epoch)
+            if hard_max_seconds > 0.0 and age_seconds >= hard_max_seconds:
+                if _remove_file(file_path, apply=apply):
+                    step["removed"].append(
+                        {
+                            "path": str(file_path),
+                            "group_key": str(group_key),
+                            "age_seconds": float(age_seconds),
+                            "reason": "hard_max_age",
+                        }
+                    )
+                    step["removed_hard_max_age"] = int(step["removed_hard_max_age"]) + 1
+                continue
             if age_seconds < ttl_seconds:
                 step["skipped_recent_ttl"] = int(step["skipped_recent_ttl"]) + 1
                 continue
@@ -954,17 +996,21 @@ def _cleanup_recovered_external_sessions(
     apply: bool,
     recovered_external_ttl_seconds: float,
     recovered_external_keep_recent_sessions: int,
+    recovered_external_hard_max_age_seconds: float = 0.0,
     now_epoch: float | None = None,
 ) -> dict[str, Any]:
     ttl_seconds = float(max(0.0, recovered_external_ttl_seconds))
     keep_recent = max(0, int(recovered_external_keep_recent_sessions))
+    hard_max_seconds = float(max(0.0, recovered_external_hard_max_age_seconds))
     recovered_root = drive_root / "runtime_migration" / "recovered_external"
     step: dict[str, Any] = {
         "recovered_root": str(recovered_root),
         "recovered_external_ttl_seconds": ttl_seconds,
         "recovered_external_keep_recent_sessions": keep_recent,
+        "recovered_external_hard_max_age_seconds": hard_max_seconds,
         "sessions_scanned": 0,
         "removed_sessions": [],
+        "removed_hard_max_age": 0,
         "skipped_keep_recent": 0,
         "skipped_recent_ttl": 0,
         "removed_empty_dirs": [],
@@ -987,10 +1033,32 @@ def _cleanup_recovered_external_sessions(
     step["sessions_scanned"] = int(len(session_dirs))
     sorted_sessions = sorted(session_dirs, key=lambda item: float(item.stat().st_mtime), reverse=True)
     for idx, session_dir in enumerate(sorted_sessions):
+        age_seconds = _path_age_seconds(session_dir, now_epoch=now_epoch)
         if idx < keep_recent:
+            if hard_max_seconds > 0.0 and age_seconds >= hard_max_seconds:
+                if _remove_tree(session_dir, apply=apply):
+                    step["removed_sessions"].append(
+                        {
+                            "path": str(session_dir),
+                            "age_seconds": float(age_seconds),
+                            "reason": "hard_max_age",
+                        }
+                    )
+                    step["removed_hard_max_age"] = int(step["removed_hard_max_age"]) + 1
+                continue
             step["skipped_keep_recent"] = int(step["skipped_keep_recent"]) + 1
             continue
-        age_seconds = _path_age_seconds(session_dir, now_epoch=now_epoch)
+        if hard_max_seconds > 0.0 and age_seconds >= hard_max_seconds:
+            if _remove_tree(session_dir, apply=apply):
+                step["removed_sessions"].append(
+                    {
+                        "path": str(session_dir),
+                        "age_seconds": float(age_seconds),
+                        "reason": "hard_max_age",
+                    }
+                )
+                step["removed_hard_max_age"] = int(step["removed_hard_max_age"]) + 1
+            continue
         if age_seconds < ttl_seconds:
             step["skipped_recent_ttl"] = int(step["skipped_recent_ttl"]) + 1
             continue
@@ -1030,17 +1098,21 @@ def _cleanup_completed_job_dirs(
     protected_job_ids: set[str],
     job_dir_ttl_seconds: float,
     job_dir_keep_recent_per_run_type: int,
+    job_dir_hard_max_age_seconds: float = 0.0,
     now_epoch: float | None = None,
 ) -> dict[str, Any]:
     ttl_seconds = float(max(0.0, job_dir_ttl_seconds))
     keep_recent = max(0, int(job_dir_keep_recent_per_run_type))
+    hard_max_seconds = float(max(0.0, job_dir_hard_max_age_seconds))
     terminal_statuses = {"completed", "failed", "cancelled"}
     step: dict[str, Any] = {
         "job_roots": [str(root) for root in job_roots],
         "job_dir_ttl_seconds": ttl_seconds,
         "job_dir_keep_recent_per_run_type": keep_recent,
+        "job_dir_hard_max_age_seconds": hard_max_seconds,
         "protected_job_ids": sorted(str(item) for item in protected_job_ids if str(item).strip()),
         "removed": [],
+        "removed_hard_max_age": 0,
         "skipped_protected": 0,
         "skipped_active": 0,
         "skipped_recent_ttl": 0,
@@ -1094,14 +1166,40 @@ def _cleanup_completed_job_dirs(
     for run_type, items in candidates_by_run_type.items():
         sorted_items = sorted(items, key=lambda item: float(item.get("updated_epoch", 0.0)), reverse=True)
         for idx, item in enumerate(sorted_items):
+            age_seconds = float(item.get("age_seconds", 0.0))
+            job_dir = Path(str(item.get("job_dir")))
             if idx < keep_recent:
+                if hard_max_seconds > 0.0 and age_seconds >= hard_max_seconds:
+                    if _remove_tree(job_dir, apply=apply):
+                        step["removed"].append(
+                            {
+                                "job_id": str(item.get("job_id", "")),
+                                "run_type": str(run_type),
+                                "job_dir": str(job_dir),
+                                "age_seconds": float(age_seconds),
+                                "reason": "hard_max_age",
+                            }
+                        )
+                        step["removed_hard_max_age"] = int(step["removed_hard_max_age"]) + 1
+                    continue
                 step["skipped_keep_recent"] = int(step["skipped_keep_recent"]) + 1
                 continue
-            age_seconds = float(item.get("age_seconds", 0.0))
+            if hard_max_seconds > 0.0 and age_seconds >= hard_max_seconds:
+                if _remove_tree(job_dir, apply=apply):
+                    step["removed"].append(
+                        {
+                            "job_id": str(item.get("job_id", "")),
+                            "run_type": str(run_type),
+                            "job_dir": str(job_dir),
+                            "age_seconds": float(age_seconds),
+                            "reason": "hard_max_age",
+                        }
+                    )
+                    step["removed_hard_max_age"] = int(step["removed_hard_max_age"]) + 1
+                continue
             if age_seconds < ttl_seconds:
                 step["skipped_recent_ttl"] = int(step["skipped_recent_ttl"]) + 1
                 continue
-            job_dir = Path(str(item.get("job_dir")))
             if _remove_tree(job_dir, apply=apply):
                 step["removed"].append(
                     {
@@ -1150,20 +1248,24 @@ def _cleanup_global_progress_mirrors(
     protected_target_ids: set[str],
     global_progress_ttl_seconds: float,
     global_progress_keep_recent: int,
+    global_progress_hard_max_age_seconds: float = 0.0,
     now_epoch: float | None = None,
 ) -> dict[str, Any]:
     ttl_seconds = float(max(0.0, global_progress_ttl_seconds))
     keep_recent = max(0, int(global_progress_keep_recent))
+    hard_max_seconds = float(max(0.0, global_progress_hard_max_age_seconds))
     progress_root = data_root / "global_generation_progress"
     protected = {str(item).strip() for item in protected_target_ids if str(item).strip()}
     step: dict[str, Any] = {
         "progress_root": str(progress_root),
         "global_progress_ttl_seconds": ttl_seconds,
         "global_progress_keep_recent": keep_recent,
+        "global_progress_hard_max_age_seconds": hard_max_seconds,
         "protected_target_ids": sorted(protected),
         "removed_progress_files": [],
         "removed_workers_dirs": [],
         "removed_worker_snapshots": [],
+        "removed_hard_max_age": 0,
         "skipped_protected": 0,
         "skipped_recent_ttl": 0,
         "skipped_keep_recent": 0,
@@ -1190,11 +1292,23 @@ def _cleanup_global_progress_mirrors(
         if target_id in protected:
             step["skipped_protected"] = int(step["skipped_protected"]) + 1
             continue
+        age_seconds = _path_age_seconds(progress_file, now_epoch=now_epoch)
         if kept_recent < keep_recent:
+            if hard_max_seconds > 0.0 and age_seconds >= hard_max_seconds:
+                if _remove_file(progress_file, apply=apply):
+                    step["removed_progress_files"].append(str(progress_file))
+                    step["removed_hard_max_age"] = int(step["removed_hard_max_age"]) + 1
+                    removed_target_ids.add(target_id)
+                continue
             kept_recent += 1
             step["skipped_keep_recent"] = int(step["skipped_keep_recent"]) + 1
             continue
-        age_seconds = _path_age_seconds(progress_file, now_epoch=now_epoch)
+        if hard_max_seconds > 0.0 and age_seconds >= hard_max_seconds:
+            if _remove_file(progress_file, apply=apply):
+                step["removed_progress_files"].append(str(progress_file))
+                step["removed_hard_max_age"] = int(step["removed_hard_max_age"]) + 1
+                removed_target_ids.add(target_id)
+            continue
         if age_seconds < ttl_seconds:
             step["skipped_recent_ttl"] = int(step["skipped_recent_ttl"]) + 1
             continue
@@ -1216,6 +1330,11 @@ def _cleanup_global_progress_mirrors(
             # Pour les cibles protegees, on purge seulement les snapshots devenus vieux.
             for snapshot_path in workers_dir.glob("*.json"):
                 age_seconds = _path_age_seconds(snapshot_path, now_epoch=now_epoch)
+                if hard_max_seconds > 0.0 and age_seconds >= hard_max_seconds:
+                    if _remove_file(snapshot_path, apply=apply):
+                        step["removed_worker_snapshots"].append(str(snapshot_path))
+                        step["removed_hard_max_age"] = int(step["removed_hard_max_age"]) + 1
+                    continue
                 if age_seconds < ttl_seconds:
                     continue
                 if _remove_file(snapshot_path, apply=apply):
@@ -1229,6 +1348,11 @@ def _cleanup_global_progress_mirrors(
 
         for snapshot_path in workers_dir.glob("*.json"):
             age_seconds = _path_age_seconds(snapshot_path, now_epoch=now_epoch)
+            if hard_max_seconds > 0.0 and age_seconds >= hard_max_seconds:
+                if _remove_file(snapshot_path, apply=apply):
+                    step["removed_worker_snapshots"].append(str(snapshot_path))
+                    step["removed_hard_max_age"] = int(step["removed_hard_max_age"]) + 1
+                continue
             if age_seconds < ttl_seconds:
                 continue
             if _remove_file(snapshot_path, apply=apply):
@@ -1381,15 +1505,22 @@ def run_storage_cleanup(
     retention_checkpoint_keep_recent_per_model: int = 2,
     retention_global_progress_ttl_seconds: float = 14.0 * 86400.0,
     retention_global_progress_keep_recent: int = 3,
+    retention_global_progress_hard_max_age_seconds: float = 30.0 * 86400.0,
     retention_pipeline_manifest_ttl_seconds: float = 14.0 * 86400.0,
     retention_pipeline_manifest_keep_recent: int = 60,
+    retention_pipeline_manifest_hard_max_age_seconds: float = 30.0 * 86400.0,
     retention_job_dir_ttl_seconds: float = 14.0 * 86400.0,
     retention_job_dir_keep_recent_per_run_type: int = 8,
+    retention_job_dir_hard_max_age_seconds: float = 30.0 * 86400.0,
     retention_source_metadata_raw_ttl_seconds: float = 24.0 * 3600.0,
     retention_drive_root_artifact_ttl_seconds: float = 24.0 * 3600.0,
     retention_drive_root_artifact_keep_recent_per_key: int = 1,
+    retention_drive_root_artifact_hard_max_age_seconds: float = 30.0 * 86400.0,
     retention_recovered_external_ttl_seconds: float = 7.0 * 86400.0,
     retention_recovered_external_keep_recent_sessions: int = 2,
+    retention_recovered_external_hard_max_age_seconds: float = 30.0 * 86400.0,
+    retention_benchmark_report_hard_max_age_seconds: float = 60.0 * 86400.0,
+    retention_checkpoint_hard_max_age_seconds: float = 30.0 * 86400.0,
 ) -> dict[str, Any]:
     keep_model_ids = list(keep_model_ids or [])
     keep_dataset_ids = [str(item).strip() for item in (keep_dataset_ids or []) if str(item).strip()]
@@ -1472,6 +1603,13 @@ def run_storage_cleanup(
             retention_global_progress_keep_recent,
         ),
     )
+    global_progress_hard_max_age_seconds = max(
+        0.0,
+        _as_float(
+            retention_cfg.get("global_progress_hard_max_age_seconds", retention_global_progress_hard_max_age_seconds),
+            retention_global_progress_hard_max_age_seconds,
+        ),
+    )
     pipeline_manifest_ttl_seconds = max(
         0.0,
         _as_float(
@@ -1486,6 +1624,15 @@ def run_storage_cleanup(
             retention_pipeline_manifest_keep_recent,
         ),
     )
+    pipeline_manifest_hard_max_age_seconds = max(
+        0.0,
+        _as_float(
+            retention_cfg.get(
+                "pipeline_manifest_hard_max_age_seconds", retention_pipeline_manifest_hard_max_age_seconds
+            ),
+            retention_pipeline_manifest_hard_max_age_seconds,
+        ),
+    )
     job_dir_ttl_seconds = max(
         0.0,
         _as_float(
@@ -1498,6 +1645,13 @@ def run_storage_cleanup(
         _as_int(
             retention_cfg.get("job_dir_keep_recent_per_run_type", retention_job_dir_keep_recent_per_run_type),
             retention_job_dir_keep_recent_per_run_type,
+        ),
+    )
+    job_dir_hard_max_age_seconds = max(
+        0.0,
+        _as_float(
+            retention_cfg.get("job_dir_hard_max_age_seconds", retention_job_dir_hard_max_age_seconds),
+            retention_job_dir_hard_max_age_seconds,
         ),
     )
     source_metadata_raw_ttl_seconds = max(
@@ -1524,6 +1678,16 @@ def run_storage_cleanup(
             retention_drive_root_artifact_keep_recent_per_key,
         ),
     )
+    drive_root_artifact_hard_max_age_seconds = max(
+        0.0,
+        _as_float(
+            retention_cfg.get(
+                "drive_root_artifact_hard_max_age_seconds",
+                retention_drive_root_artifact_hard_max_age_seconds,
+            ),
+            retention_drive_root_artifact_hard_max_age_seconds,
+        ),
+    )
     recovered_external_ttl_seconds = max(
         0.0,
         _as_float(
@@ -1539,6 +1703,30 @@ def run_storage_cleanup(
                 retention_recovered_external_keep_recent_sessions,
             ),
             retention_recovered_external_keep_recent_sessions,
+        ),
+    )
+    recovered_external_hard_max_age_seconds = max(
+        0.0,
+        _as_float(
+            retention_cfg.get(
+                "recovered_external_hard_max_age_seconds",
+                retention_recovered_external_hard_max_age_seconds,
+            ),
+            retention_recovered_external_hard_max_age_seconds,
+        ),
+    )
+    benchmark_report_hard_max_age_seconds = max(
+        0.0,
+        _as_float(
+            retention_cfg.get("benchmark_report_hard_max_age_seconds", retention_benchmark_report_hard_max_age_seconds),
+            retention_benchmark_report_hard_max_age_seconds,
+        ),
+    )
+    checkpoint_hard_max_age_seconds = max(
+        0.0,
+        _as_float(
+            retention_cfg.get("checkpoint_hard_max_age_seconds", retention_checkpoint_hard_max_age_seconds),
+            retention_checkpoint_hard_max_age_seconds,
         ),
     )
 
@@ -1621,6 +1809,7 @@ def run_storage_cleanup(
             protected_target_ids=protected_global_target_ids,
             global_progress_ttl_seconds=float(global_progress_ttl_seconds),
             global_progress_keep_recent=int(global_progress_keep_recent),
+            global_progress_hard_max_age_seconds=float(global_progress_hard_max_age_seconds),
             now_epoch=now_epoch,
         )
     if cleanup_global_progress_mirrors and isinstance(global_progress_step, dict):
@@ -1633,6 +1822,7 @@ def run_storage_cleanup(
             apply=bool(apply),
             pipeline_manifest_ttl_seconds=float(pipeline_manifest_ttl_seconds),
             pipeline_manifest_keep_recent=int(pipeline_manifest_keep_recent),
+            pipeline_manifest_hard_max_age_seconds=float(pipeline_manifest_hard_max_age_seconds),
             now_epoch=now_epoch,
         )
     if cleanup_pipeline_manifests and isinstance(pipeline_manifest_step, dict):
@@ -1652,6 +1842,7 @@ def run_storage_cleanup(
             protected_job_ids=protected_job_ids,
             job_dir_ttl_seconds=float(job_dir_ttl_seconds),
             job_dir_keep_recent_per_run_type=int(job_dir_keep_recent_per_run_type),
+            job_dir_hard_max_age_seconds=float(job_dir_hard_max_age_seconds),
             now_epoch=now_epoch,
         )
     if cleanup_completed_job_dirs and isinstance(completed_job_dirs_step, dict):
@@ -1853,15 +2044,22 @@ def run_storage_cleanup(
             "checkpoint_keep_recent_per_model": int(checkpoint_keep_recent_per_model),
             "global_progress_ttl_seconds": float(global_progress_ttl_seconds),
             "global_progress_keep_recent": int(global_progress_keep_recent),
+            "global_progress_hard_max_age_seconds": float(global_progress_hard_max_age_seconds),
             "pipeline_manifest_ttl_seconds": float(pipeline_manifest_ttl_seconds),
             "pipeline_manifest_keep_recent": int(pipeline_manifest_keep_recent),
+            "pipeline_manifest_hard_max_age_seconds": float(pipeline_manifest_hard_max_age_seconds),
             "job_dir_ttl_seconds": float(job_dir_ttl_seconds),
             "job_dir_keep_recent_per_run_type": int(job_dir_keep_recent_per_run_type),
+            "job_dir_hard_max_age_seconds": float(job_dir_hard_max_age_seconds),
             "source_metadata_raw_ttl_seconds": float(source_metadata_raw_ttl_seconds),
             "drive_root_artifact_ttl_seconds": float(drive_root_artifact_ttl_seconds),
             "drive_root_artifact_keep_recent_per_key": int(drive_root_artifact_keep_recent_per_key),
+            "drive_root_artifact_hard_max_age_seconds": float(drive_root_artifact_hard_max_age_seconds),
             "recovered_external_ttl_seconds": float(recovered_external_ttl_seconds),
             "recovered_external_keep_recent_sessions": int(recovered_external_keep_recent_sessions),
+            "recovered_external_hard_max_age_seconds": float(recovered_external_hard_max_age_seconds),
+            "benchmark_report_hard_max_age_seconds": float(benchmark_report_hard_max_age_seconds),
+            "checkpoint_hard_max_age_seconds": float(checkpoint_hard_max_age_seconds),
             "quarantine_removed": [],
             "quarantine_skipped_recent": 0,
             "benchmark_reports_removed": [],
@@ -1875,6 +2073,13 @@ def run_storage_cleanup(
             "pipeline_manifests_removed": [],
             "completed_job_dirs_removed": [],
             "source_metadata_raw_removed": [],
+            "global_progress_removed_hard_max_age": 0,
+            "pipeline_manifests_removed_hard_max_age": 0,
+            "completed_job_dirs_removed_hard_max_age": 0,
+            "drive_root_operational_removed_hard_max_age": 0,
+            "recovered_external_removed_hard_max_age": 0,
+            "benchmark_reports_removed_hard_max_age": 0,
+            "old_checkpoints_removed_hard_max_age": 0,
             "errors": [],
         }
 
@@ -1884,12 +2089,21 @@ def run_storage_cleanup(
             retention_step["global_progress_worker_snapshots_removed"] = list(
                 global_progress_step.get("removed_worker_snapshots", []) or []
             )
+            retention_step["global_progress_removed_hard_max_age"] = int(
+                global_progress_step.get("removed_hard_max_age", 0) or 0
+            )
             retention_step["errors"].extend(list(global_progress_step.get("errors", []) or []))
         if isinstance(pipeline_manifest_step, dict):
             retention_step["pipeline_manifests_removed"] = list(pipeline_manifest_step.get("removed", []) or [])
+            retention_step["pipeline_manifests_removed_hard_max_age"] = int(
+                pipeline_manifest_step.get("removed_hard_max_age", 0) or 0
+            )
             retention_step["errors"].extend(list(pipeline_manifest_step.get("errors", []) or []))
         if isinstance(completed_job_dirs_step, dict):
             retention_step["completed_job_dirs_removed"] = list(completed_job_dirs_step.get("removed", []) or [])
+            retention_step["completed_job_dirs_removed_hard_max_age"] = int(
+                completed_job_dirs_step.get("removed_hard_max_age", 0) or 0
+            )
             retention_step["errors"].extend(list(completed_job_dirs_step.get("errors", []) or []))
         source_metadata_step = _cleanup_duplicate_source_metadata(
             dataset_registry=dataset_registry,
@@ -1918,10 +2132,14 @@ def run_storage_cleanup(
             apply=bool(apply),
             artifact_ttl_seconds=float(drive_root_artifact_ttl_seconds),
             artifact_keep_recent_per_key=int(drive_root_artifact_keep_recent_per_key),
+            artifact_hard_max_age_seconds=float(drive_root_artifact_hard_max_age_seconds),
             now_epoch=now_epoch,
         )
         retention_step["drive_root_operational_artifacts_removed"] = list(
             drive_root_operational_step.get("removed", []) or []
+        )
+        retention_step["drive_root_operational_removed_hard_max_age"] = int(
+            drive_root_operational_step.get("removed_hard_max_age", 0) or 0
         )
         retention_step["errors"].extend(list(drive_root_operational_step.get("errors", []) or []))
 
@@ -1931,6 +2149,7 @@ def run_storage_cleanup(
             apply=bool(apply),
             recovered_external_ttl_seconds=float(recovered_external_ttl_seconds),
             recovered_external_keep_recent_sessions=int(recovered_external_keep_recent_sessions),
+            recovered_external_hard_max_age_seconds=float(recovered_external_hard_max_age_seconds),
             now_epoch=now_epoch,
         )
         retention_step["recovered_external_sessions_removed"] = list(
@@ -1938,6 +2157,9 @@ def run_storage_cleanup(
         )
         retention_step["recovered_external_empty_dirs_removed"] = list(
             recovered_external_step.get("removed_empty_dirs", []) or []
+        )
+        retention_step["recovered_external_removed_hard_max_age"] = int(
+            recovered_external_step.get("removed_hard_max_age", 0) or 0
         )
         retention_step["errors"].extend(list(recovered_external_step.get("errors", []) or []))
 
@@ -1959,9 +2181,28 @@ def run_storage_cleanup(
                 reverse=True,
             )
             for idx, path in enumerate(benchmark_candidates_sorted):
-                if idx < int(benchmark_keep_recent):
-                    continue
                 age_seconds = _path_age_seconds(path, now_epoch=now_epoch)
+                if idx < int(benchmark_keep_recent):
+                    if (
+                        float(benchmark_report_hard_max_age_seconds) > 0.0
+                        and age_seconds >= float(benchmark_report_hard_max_age_seconds)
+                    ):
+                        if _remove_file(path, apply=apply):
+                            retention_step["benchmark_reports_removed"].append(str(path))
+                            retention_step["benchmark_reports_removed_hard_max_age"] = int(
+                                retention_step["benchmark_reports_removed_hard_max_age"]
+                            ) + 1
+                    continue
+                if (
+                    float(benchmark_report_hard_max_age_seconds) > 0.0
+                    and age_seconds >= float(benchmark_report_hard_max_age_seconds)
+                ):
+                    if _remove_file(path, apply=apply):
+                        retention_step["benchmark_reports_removed"].append(str(path))
+                        retention_step["benchmark_reports_removed_hard_max_age"] = int(
+                            retention_step["benchmark_reports_removed_hard_max_age"]
+                        ) + 1
+                    continue
                 if age_seconds < float(benchmark_report_ttl_seconds):
                     continue
                 if _remove_file(path, apply=apply):
@@ -1984,9 +2225,28 @@ def run_storage_cleanup(
             for model_id, paths_for_model in per_model_candidates.items():
                 sorted_paths = sorted(paths_for_model, key=lambda item: float(item.stat().st_mtime), reverse=True)
                 for idx, path in enumerate(sorted_paths):
-                    if idx < int(checkpoint_keep_recent_per_model):
-                        continue
                     age_seconds = _path_age_seconds(path, now_epoch=now_epoch)
+                    if idx < int(checkpoint_keep_recent_per_model):
+                        if (
+                            float(checkpoint_hard_max_age_seconds) > 0.0
+                            and age_seconds >= float(checkpoint_hard_max_age_seconds)
+                        ):
+                            if _remove_file(path, apply=apply):
+                                retention_step["old_checkpoints_removed"].append(str(path))
+                                retention_step["old_checkpoints_removed_hard_max_age"] = int(
+                                    retention_step["old_checkpoints_removed_hard_max_age"]
+                                ) + 1
+                        continue
+                    if (
+                        float(checkpoint_hard_max_age_seconds) > 0.0
+                        and age_seconds >= float(checkpoint_hard_max_age_seconds)
+                    ):
+                        if _remove_file(path, apply=apply):
+                            retention_step["old_checkpoints_removed"].append(str(path))
+                            retention_step["old_checkpoints_removed_hard_max_age"] = int(
+                                retention_step["old_checkpoints_removed_hard_max_age"]
+                            ) + 1
+                        continue
                     if age_seconds < float(checkpoint_ttl_seconds):
                         continue
                     if not _path_within(path, models_root):

@@ -1003,14 +1003,15 @@ cells = [
         # Migration one-shot: Drive/jobs + Drive/logs/pipeline -> runtime local.
         # Objectif: vider les artefacts volatils du Drive sans perdre d'etat.
         import json
+        import importlib
         import sys
         from pathlib import Path
 
         sys.path.insert(0, f'{WORKTREE}/src')
-        from songo_model_stockfish.ops.runtime_migration import (
-            load_manifest_prefer_local,
-            run_drive_to_local_runtime_migration,
-        )
+        import songo_model_stockfish.ops.runtime_migration as runtime_migration
+        runtime_migration = importlib.reload(runtime_migration)
+        load_manifest_prefer_local = runtime_migration.load_manifest_prefer_local
+        run_drive_to_local_runtime_migration = runtime_migration.run_drive_to_local_runtime_migration
 
         MIGRATE_DRIVE_RUNTIME_TO_LOCAL = True
         MIGRATE_PURGE_DRIVE_AFTER_VERIFY = True
@@ -1123,17 +1124,24 @@ cells = [
         STORAGE_CLEANUP_RETENTION_QUARANTINE_TTL_HOURS = 72.0
         STORAGE_CLEANUP_RETENTION_SOURCE_METADATA_TTL_HOURS = 24.0
         STORAGE_CLEANUP_RETENTION_PIPELINE_MANIFEST_TTL_DAYS = 14.0
+        STORAGE_CLEANUP_RETENTION_PIPELINE_MANIFEST_HARD_MAX_AGE_DAYS = 30.0
         STORAGE_CLEANUP_RETENTION_GLOBAL_PROGRESS_TTL_DAYS = 14.0
+        STORAGE_CLEANUP_RETENTION_GLOBAL_PROGRESS_HARD_MAX_AGE_DAYS = 30.0
         STORAGE_CLEANUP_RETENTION_COMPLETED_JOB_DIR_TTL_DAYS = 14.0
         STORAGE_CLEANUP_RETENTION_COMPLETED_JOB_KEEP_RECENT_PER_RUN_TYPE = 8
+        STORAGE_CLEANUP_RETENTION_COMPLETED_JOB_DIR_HARD_MAX_AGE_DAYS = 30.0
         STORAGE_CLEANUP_RETENTION_BENCHMARK_REPORT_TTL_DAYS = 45.0
         STORAGE_CLEANUP_RETENTION_BENCHMARK_KEEP_RECENT = 60
+        STORAGE_CLEANUP_RETENTION_BENCHMARK_REPORT_HARD_MAX_AGE_DAYS = 60.0
         STORAGE_CLEANUP_RETENTION_CHECKPOINT_TTL_DAYS = 14.0
         STORAGE_CLEANUP_RETENTION_CHECKPOINT_KEEP_RECENT_PER_MODEL = 2
+        STORAGE_CLEANUP_RETENTION_CHECKPOINT_HARD_MAX_AGE_DAYS = 30.0
         STORAGE_CLEANUP_RETENTION_DRIVE_ROOT_ARTIFACT_TTL_HOURS = 24.0
         STORAGE_CLEANUP_RETENTION_DRIVE_ROOT_ARTIFACT_KEEP_RECENT_PER_KEY = 1
+        STORAGE_CLEANUP_RETENTION_DRIVE_ROOT_ARTIFACT_HARD_MAX_AGE_DAYS = 30.0
         STORAGE_CLEANUP_RETENTION_RECOVERED_EXTERNAL_TTL_DAYS = 7.0
         STORAGE_CLEANUP_RETENTION_RECOVERED_EXTERNAL_KEEP_RECENT_SESSIONS = 2
+        STORAGE_CLEANUP_RETENTION_RECOVERED_EXTERNAL_HARD_MAX_AGE_DAYS = 30.0
         STORAGE_CLEANUP_EXTERNAL_TARGET_GLOBS = [
             '.quarantine*',
             '.dataset*',
@@ -1604,26 +1612,40 @@ cells = [
                 str(float(STORAGE_CLEANUP_RETENTION_PIPELINE_MANIFEST_TTL_DAYS)),
                 '--retention-global-progress-ttl-days',
                 str(float(STORAGE_CLEANUP_RETENTION_GLOBAL_PROGRESS_TTL_DAYS)),
+                '--retention-global-progress-hard-max-age-days',
+                str(float(STORAGE_CLEANUP_RETENTION_GLOBAL_PROGRESS_HARD_MAX_AGE_DAYS)),
                 '--retention-completed-job-dir-ttl-days',
                 str(float(STORAGE_CLEANUP_RETENTION_COMPLETED_JOB_DIR_TTL_DAYS)),
                 '--retention-completed-job-dir-keep-recent-per-run-type',
                 str(int(STORAGE_CLEANUP_RETENTION_COMPLETED_JOB_KEEP_RECENT_PER_RUN_TYPE)),
+                '--retention-completed-job-dir-hard-max-age-days',
+                str(float(STORAGE_CLEANUP_RETENTION_COMPLETED_JOB_DIR_HARD_MAX_AGE_DAYS)),
                 '--retention-benchmark-report-ttl-days',
                 str(float(STORAGE_CLEANUP_RETENTION_BENCHMARK_REPORT_TTL_DAYS)),
                 '--retention-benchmark-keep-recent',
                 str(int(STORAGE_CLEANUP_RETENTION_BENCHMARK_KEEP_RECENT)),
+                '--retention-benchmark-report-hard-max-age-days',
+                str(float(STORAGE_CLEANUP_RETENTION_BENCHMARK_REPORT_HARD_MAX_AGE_DAYS)),
                 '--retention-checkpoint-ttl-days',
                 str(float(STORAGE_CLEANUP_RETENTION_CHECKPOINT_TTL_DAYS)),
                 '--retention-checkpoint-keep-recent-per-model',
                 str(int(STORAGE_CLEANUP_RETENTION_CHECKPOINT_KEEP_RECENT_PER_MODEL)),
+                '--retention-checkpoint-hard-max-age-days',
+                str(float(STORAGE_CLEANUP_RETENTION_CHECKPOINT_HARD_MAX_AGE_DAYS)),
+                '--retention-pipeline-manifest-hard-max-age-days',
+                str(float(STORAGE_CLEANUP_RETENTION_PIPELINE_MANIFEST_HARD_MAX_AGE_DAYS)),
                 '--retention-drive-root-artifact-ttl-hours',
                 str(float(STORAGE_CLEANUP_RETENTION_DRIVE_ROOT_ARTIFACT_TTL_HOURS)),
                 '--retention-drive-root-artifact-keep-recent-per-key',
                 str(int(STORAGE_CLEANUP_RETENTION_DRIVE_ROOT_ARTIFACT_KEEP_RECENT_PER_KEY)),
+                '--retention-drive-root-artifact-hard-max-age-days',
+                str(float(STORAGE_CLEANUP_RETENTION_DRIVE_ROOT_ARTIFACT_HARD_MAX_AGE_DAYS)),
                 '--retention-recovered-external-ttl-days',
                 str(float(STORAGE_CLEANUP_RETENTION_RECOVERED_EXTERNAL_TTL_DAYS)),
                 '--retention-recovered-external-keep-recent-sessions',
                 str(int(STORAGE_CLEANUP_RETENTION_RECOVERED_EXTERNAL_KEEP_RECENT_SESSIONS)),
+                '--retention-recovered-external-hard-max-age-days',
+                str(float(STORAGE_CLEANUP_RETENTION_RECOVERED_EXTERNAL_HARD_MAX_AGE_DAYS)),
             ]
 
         def _build_cleanup_cmd(extra_args):
@@ -1758,6 +1780,16 @@ cells = [
                 '  recovered_external_removed     =',
                 len(retention.get('recovered_external_sessions_removed', []) or []),
             )
+            print(
+                '  hard_max_removed_total         =',
+                int(retention.get('global_progress_removed_hard_max_age', 0) or 0)
+                + int(retention.get('pipeline_manifests_removed_hard_max_age', 0) or 0)
+                + int(retention.get('completed_job_dirs_removed_hard_max_age', 0) or 0)
+                + int(retention.get('drive_root_operational_removed_hard_max_age', 0) or 0)
+                + int(retention.get('recovered_external_removed_hard_max_age', 0) or 0)
+                + int(retention.get('benchmark_reports_removed_hard_max_age', 0) or 0)
+                + int(retention.get('old_checkpoints_removed_hard_max_age', 0) or 0),
+            )
 
         print('Maintenance hebdo config:')
         print('  dry_run              =', STORAGE_CLEANUP_DRY_RUN)
@@ -1771,7 +1803,15 @@ cells = [
         print('  external_target_scan_progress_every =', STORAGE_CLEANUP_EXTERNAL_TARGET_SCAN_PROGRESS_EVERY)
         print('  retention_enabled     =', STORAGE_CLEANUP_ENABLE_RETENTION_POLICY)
         print('  retention_root_artifact_ttl_h =', STORAGE_CLEANUP_RETENTION_DRIVE_ROOT_ARTIFACT_TTL_HOURS)
+        print(
+            '  retention_root_artifact_hard_max_d =',
+            STORAGE_CLEANUP_RETENTION_DRIVE_ROOT_ARTIFACT_HARD_MAX_AGE_DAYS,
+        )
         print('  retention_recovered_external_ttl_d =', STORAGE_CLEANUP_RETENTION_RECOVERED_EXTERNAL_TTL_DAYS)
+        print(
+            '  retention_recovered_external_hard_max_d =',
+            STORAGE_CLEANUP_RETENTION_RECOVERED_EXTERNAL_HARD_MAX_AGE_DAYS,
+        )
         print('  heartbeat_seconds    =', STORAGE_CLEANUP_HEARTBEAT_SECONDS)
         print('  step_timeout_seconds =', STORAGE_CLEANUP_STEP_TIMEOUT_SECONDS)
         print('  external_scan_max_s  =', STORAGE_CLEANUP_EXTERNAL_SCAN_MAX_SECONDS)
