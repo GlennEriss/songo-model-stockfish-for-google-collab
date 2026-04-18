@@ -281,6 +281,12 @@ def _cleanup_external_drive_artifacts(*, drive_root: Path, apply: bool, now_epoc
             and lower_name.endswith(".json")
         ):
             return True
+        if lower_name.startswith("dataset_benchmatch") and (
+            lower_name.endswith(".log")
+            or lower_name.endswith(".json")
+            or lower_name.endswith(".jsonl")
+        ):
+            return True
         if lower_name.endswith("_summary.json") and (
             "dataset" in lower_name
             or "train" in lower_name
@@ -331,6 +337,7 @@ def _cleanup_external_drive_artifacts(*, drive_root: Path, apply: bool, now_epoc
                 or "training_summary.json.tmp." in lower_name
                 or "evaluation_summary.json.tmp." in lower_name
                 or "benchmark_summary.json.tmp." in lower_name
+                or "dataset_benchmatch" in lower_name
                 or (
                     ".tmp." in lower_name
                     and (

@@ -1131,6 +1131,9 @@ cells = [
             '*.model_card.json',
             'bench_models*.json',
             'build_dataset*.log',
+            'dataset_benchmatch*.log',
+            'dataset_benchmatch*.json',
+            'dataset_benchmatch*.jsonl',
             'events*.jsonl',
             'metrics*.jsonl',
             'latest_dataset_pipeline*',
@@ -1208,6 +1211,9 @@ cells = [
             '.evaluation_summary*.json.tmp.*',
             '.benchmark_summary.json.tmp.*',
             '.benchmark_summary*.json.tmp.*',
+            '.dataset_benchmatch*.log.tmp.*',
+            '.dataset_benchmatch*.json.tmp.*',
+            '.dataset_benchmatch*.jsonl.tmp.*',
             '._dataset_source_metadata.json.tmp.*',
             '.bench_models*.tmp.*',
         ]
@@ -1433,6 +1439,10 @@ cells = [
                         or 'benchmark_summary' in name
                     )
                     and name.endswith('.json')
+                ):
+                    return 2
+                if name.startswith('dataset_benchmatch') and (
+                    name.endswith('.log') or name.endswith('.json') or name.endswith('.jsonl')
                 ):
                     return 2
                 if name.endswith('_summary.json') and (
