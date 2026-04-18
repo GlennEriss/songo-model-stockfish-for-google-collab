@@ -3079,6 +3079,9 @@ cells = [
         from pathlib import Path
 
         local_manifest_path = Path(PIPELINE_MANIFEST_PATH)
+        MANIFEST_ALLOW_FIRESTORE_FALLBACK = str(
+            globals().get('MANIFEST_ALLOW_FIRESTORE_FALLBACK', '0')
+        ).strip().lower() in {'1', 'true', 'yes', 'on'}
 
         def _load_manifest() -> tuple[dict, str]:
             manifest = {}
@@ -3091,13 +3094,14 @@ cells = [
                         return manifest, source
                 except Exception:
                     manifest = {}
-            try:
-                manifest = _load_pipeline_manifest_payload(WORKER_TAG)
-                if isinstance(manifest, dict) and manifest:
-                    source = f'firestore:{FIRESTORE_PIPELINE_MANIFESTS_COLLECTION}/{WORKER_TAG}'
-                    return manifest, source
-            except Exception:
-                manifest = {}
+            if MANIFEST_ALLOW_FIRESTORE_FALLBACK:
+                try:
+                    manifest = _load_pipeline_manifest_payload(WORKER_TAG)
+                    if isinstance(manifest, dict) and manifest:
+                        source = f'firestore:{FIRESTORE_PIPELINE_MANIFESTS_COLLECTION}/{WORKER_TAG}'
+                        return manifest, source
+                except Exception:
+                    manifest = {}
             return {}, source
 
         def _manifest_process_records(manifest: dict) -> list[dict]:
@@ -3147,9 +3151,14 @@ cells = [
 
         manifest, manifest_source = _load_manifest()
         if not manifest:
-            print('Manifest introuvable (runtime local + Firestore)')
+            print('Manifest introuvable (runtime local)')
+            if MANIFEST_ALLOW_FIRESTORE_FALLBACK:
+                print('  firestore_fallback = enabled')
+            else:
+                print('  firestore_fallback = disabled')
             print('  drive_path =', local_manifest_path)
-            print('  firestore  =', f'{FIRESTORE_PIPELINE_MANIFESTS_COLLECTION}/{WORKER_TAG}')
+            if MANIFEST_ALLOW_FIRESTORE_FALLBACK:
+                print('  firestore  =', f'{FIRESTORE_PIPELINE_MANIFESTS_COLLECTION}/{WORKER_TAG}')
         else:
             print('Manifest source =', manifest_source)
             print('Manifest:')
@@ -3178,6 +3187,9 @@ cells = [
 
         LIVE_REFRESH_SECONDS = float(globals().get('PROCESS_MONITOR_REFRESH_SECONDS', 5.0))
         LIVE_MAX_LOOPS = int(globals().get('PROCESS_MONITOR_MAX_LOOPS', 120))
+        LIVE_MANIFEST_ALLOW_FIRESTORE_FALLBACK = str(
+            globals().get('MANIFEST_ALLOW_FIRESTORE_FALLBACK', '0')
+        ).strip().lower() in {'1', 'true', 'yes', 'on'}
 
         local_manifest_path = Path(PIPELINE_MANIFEST_PATH)
 
@@ -3191,12 +3203,13 @@ cells = [
                         return manifest, f'drive:{local_manifest_path}'
                 except Exception:
                     manifest = {}
-            try:
-                manifest = _load_pipeline_manifest_payload(WORKER_TAG)
-                if isinstance(manifest, dict) and manifest:
-                    return manifest, f'firestore:{FIRESTORE_PIPELINE_MANIFESTS_COLLECTION}/{WORKER_TAG}'
-            except Exception:
-                manifest = {}
+            if LIVE_MANIFEST_ALLOW_FIRESTORE_FALLBACK:
+                try:
+                    manifest = _load_pipeline_manifest_payload(WORKER_TAG)
+                    if isinstance(manifest, dict) and manifest:
+                        return manifest, f'firestore:{FIRESTORE_PIPELINE_MANIFESTS_COLLECTION}/{WORKER_TAG}'
+                except Exception:
+                    manifest = {}
             return {}, source
 
         def _extract_processes(manifest: dict) -> list[dict]:
@@ -3303,8 +3316,27 @@ cells = [
             globals().get('KEEPALIVE_STOP_WHEN_NO_PROCESS', False),
             default=False,
         )
+        KEEPALIVE_ALLOW_FIRESTORE_FALLBACK = _as_bool_local(
+            globals().get('MANIFEST_ALLOW_FIRESTORE_FALLBACK', False),
+            default=False,
+        )
 
         local_manifest_path = Path(PIPELINE_MANIFEST_PATH)
+
+        def _path_within(path: Path, base: Path) -> bool:
+            try:
+                path.resolve().relative_to(base.resolve())
+                return True
+            except Exception:
+                return False
+
+        mydrive_root = Path('/content/drive/MyDrive')
+        drive_root_path = Path(DRIVE_ROOT)
+        if _path_within(local_manifest_path, mydrive_root) and not _path_within(local_manifest_path, drive_root_path):
+            raise RuntimeError(
+                f'PIPELINE_MANIFEST_PATH hors projet: {local_manifest_path} '
+                f'(drive_root attendu={drive_root_path})'
+            )
 
         def _load_manifest_keepalive() -> dict:
             manifest = {}
@@ -3315,7 +3347,7 @@ cells = [
                         return manifest
                 except Exception:
                     manifest = {}
-            if '_load_pipeline_manifest_payload' in globals():
+            if KEEPALIVE_ALLOW_FIRESTORE_FALLBACK and '_load_pipeline_manifest_payload' in globals():
                 try:
                     manifest = _load_pipeline_manifest_payload(WORKER_TAG)
                     if isinstance(manifest, dict):
@@ -3367,7 +3399,10 @@ cells = [
             KEEPALIVE_MAX_LOOPS if KEEPALIVE_MAX_LOOPS > 0 else 'infini',
             '| stop_when_no_process =',
             KEEPALIVE_STOP_WHEN_NO_PROCESS,
+            '| firestore_fallback =',
+            KEEPALIVE_ALLOW_FIRESTORE_FALLBACK,
         )
+        print('manifest_path =', local_manifest_path)
 
         loop_idx = 0
         while True:
