@@ -19,6 +19,7 @@ import numpy as np
 from songo_model_stockfish.adapters import songo_ai_game
 from songo_model_stockfish.ops.io_utils import (
     acquire_lock_dir,
+    guard_write_path,
     read_json_dict,
     release_lock_dir,
     write_json_atomic,
@@ -42,11 +43,15 @@ def _resolve_storage_path(base: Path, configured: str | None, fallback: Path) ->
     if not configured:
         return fallback
     path = Path(configured)
-    mydrive_root = base.parent
+    mydrive_root = Path("/content/drive/MyDrive")
     if path.is_absolute():
         # Garde-fou: toute cible absolue sous MyDrive doit rester dans drive_root.
         try:
-            if path.resolve().is_relative_to(mydrive_root.resolve()) and not path.resolve().is_relative_to(base.resolve()):
+            if (
+                base.resolve().is_relative_to(mydrive_root.resolve())
+                and path.resolve().is_relative_to(mydrive_root.resolve())
+                and not path.resolve().is_relative_to(base.resolve())
+            ):
                 return base / path.name
         except Exception:
             pass
@@ -2382,10 +2387,7 @@ def _derive_existing_dataset_source(
 
         if kept_samples:
             target_sampled_file = target_sampled_dir / relative_path
-            target_sampled_file.parent.mkdir(parents=True, exist_ok=True)
-            with target_sampled_file.open("w", encoding="utf-8") as handle:
-                for sample in kept_samples:
-                    handle.write(json.dumps(sample, ensure_ascii=True) + "\n")
+            write_jsonl_atomic(target_sampled_file, kept_samples, ensure_ascii=True)
             selected_files += 1
 
             if source_raw_dir.exists():
@@ -2667,10 +2669,7 @@ def _augment_existing_dataset_source(
 
         if kept_samples:
             target_sampled_file = target_sampled_dir / relative_path
-            target_sampled_file.parent.mkdir(parents=True, exist_ok=True)
-            with target_sampled_file.open("w", encoding="utf-8") as handle:
-                for kept_sample in kept_samples:
-                    handle.write(json.dumps(kept_sample, ensure_ascii=True) + "\n")
+            write_jsonl_atomic(target_sampled_file, kept_samples, ensure_ascii=True)
             selected_files += 1
 
             if source_raw_dir.exists():
@@ -2778,9 +2777,7 @@ def _merge_existing_dataset_sources(
                 source_stats["selected_samples"] += 1
 
             if kept_samples:
-                with target_sampled_file.open("w", encoding="utf-8") as handle:
-                    for sample in kept_samples:
-                        handle.write(json.dumps(sample, ensure_ascii=True) + "\n")
+                write_jsonl_atomic(target_sampled_file, kept_samples, ensure_ascii=True)
                 selected_files += 1
                 source_stats["selected_files"] += 1
 
@@ -2809,6 +2806,7 @@ def _merge_existing_dataset_sources(
 
 
 def _append_jsonl(path: Path, payloads: list[dict[str, Any]]) -> None:
+    guard_write_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         for payload in payloads:

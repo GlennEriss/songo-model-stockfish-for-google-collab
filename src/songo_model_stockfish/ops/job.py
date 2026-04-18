@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from songo_model_stockfish.ops.io_utils import read_json_dict, write_json_atomic, write_text_atomic
+from songo_model_stockfish.ops.io_utils import guard_write_path, read_json_dict, write_json_atomic, write_text_atomic
 from songo_model_stockfish.ops.logging import JsonlWriter, build_console_logger, utc_now_iso
 from songo_model_stockfish.ops.paths import ProjectPaths, build_project_paths
 
@@ -458,6 +458,7 @@ class JobContext:
         if backup_path is None:
             return
         try:
+            guard_write_path(backup_path)
             backup_path.parent.mkdir(parents=True, exist_ok=True)
             with backup_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(payload, ensure_ascii=True, default=str) + "\n")

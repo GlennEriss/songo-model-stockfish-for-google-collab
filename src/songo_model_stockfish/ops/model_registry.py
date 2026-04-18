@@ -6,6 +6,8 @@ import shutil
 from pathlib import Path
 from typing import Any
 
+from songo_model_stockfish.ops.io_utils import guard_write_path, write_json_atomic
+
 
 def registry_path(models_root: Path) -> Path:
     return models_root / "model_registry.json"
@@ -20,8 +22,7 @@ def load_registry(models_root: Path) -> dict[str, Any]:
 
 def save_registry(models_root: Path, payload: dict[str, Any]) -> None:
     path = registry_path(models_root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+    write_json_atomic(path, payload, ensure_ascii=True, indent=2)
 
 
 def promoted_best_dir(models_root: Path) -> Path:
@@ -107,14 +108,17 @@ def promote_best_model(models_root: Path) -> dict[str, Any] | None:
         return best
 
     dest_dir = promoted_best_dir(models_root)
+    guard_write_path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest_checkpoint = dest_dir / "model.pt"
+    guard_write_path(dest_checkpoint)
     shutil.copy2(checkpoint_path, dest_checkpoint)
 
     model_card_path_value = str(best.get("model_card_path", "")).strip()
     if model_card_path_value:
         model_card_path = Path(model_card_path_value)
         if model_card_path.exists():
+            guard_write_path(dest_dir / "model_card.json")
             shutil.copy2(model_card_path, dest_dir / "model_card.json")
 
     metadata = {
@@ -126,5 +130,5 @@ def promote_best_model(models_root: Path) -> dict[str, Any] | None:
         "evaluation_top1": float(best.get("evaluation_top1", -1.0)),
         "benchmark_score": float(best.get("benchmark_score", -1.0)),
     }
-    (dest_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, ensure_ascii=True), encoding="utf-8")
+    write_json_atomic(dest_dir / "metadata.json", metadata, ensure_ascii=True, indent=2)
     return metadata

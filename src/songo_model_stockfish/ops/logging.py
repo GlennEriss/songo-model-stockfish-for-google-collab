@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from songo_model_stockfish.ops.io_utils import guard_write_path
+
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -14,9 +16,11 @@ def utc_now_iso() -> str:
 class JsonlWriter:
     def __init__(self, path: Path) -> None:
         self.path = path
+        guard_write_path(self.path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def write(self, payload: dict[str, Any]) -> None:
+        guard_write_path(self.path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, ensure_ascii=True) + "\n")

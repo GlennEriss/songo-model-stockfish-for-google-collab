@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
 
-from songo_model_stockfish.ops.io_utils import read_json_dict, write_json_atomic
+from songo_model_stockfish.ops.io_utils import guard_write_path, read_json_dict, write_json_atomic
 from songo_model_stockfish.ops.job import JobContext
 from songo_model_stockfish.ops.dataset_usage_history import record_training_dataset_usage
 from songo_model_stockfish.ops.logging import utc_now_iso
@@ -41,10 +41,14 @@ def _resolve_storage_path(base: Path, configured: str | None, fallback: Path) ->
     if not configured:
         return fallback
     path = Path(configured)
-    mydrive_root = base.parent
+    mydrive_root = Path("/content/drive/MyDrive")
     if path.is_absolute():
         try:
-            if path.resolve().is_relative_to(mydrive_root.resolve()) and not path.resolve().is_relative_to(base.resolve()):
+            if (
+                base.resolve().is_relative_to(mydrive_root.resolve())
+                and path.resolve().is_relative_to(mydrive_root.resolve())
+                and not path.resolve().is_relative_to(base.resolve())
+            ):
                 return base / path.name
         except Exception:
             pass
@@ -334,6 +338,7 @@ def _run_epoch(
 
 
 def _save_checkpoint(path: Path, payload: dict) -> None:
+    guard_write_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, path)
 
@@ -1087,6 +1092,7 @@ def run_train(job: JobContext) -> dict[str, object]:
         "best_metric": best_metric,
         "amp_enabled": amp_enabled,
     }
+    guard_write_path(final_model_path)
     torch.save(final_payload, final_model_path)
 
     training_summary = {

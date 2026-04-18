@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,6 +23,11 @@ def _resolve_root(*, base_root: Path, configured: object, default_relative: str)
         return base_root / default_relative
     path = Path(text)
     if path.is_absolute():
+        # Garde-fou Colab/Drive: toute cible absolue sous MyDrive doit rester
+        # dans drive_root (base_root) pour eviter les artefacts eparpilles.
+        mydrive_root = Path("/content/drive/MyDrive")
+        if _is_within(base_root, mydrive_root) and _is_within(path, mydrive_root) and not _is_within(path, base_root):
+            return base_root / path.name
         return path
     return base_root / path
 
@@ -53,6 +59,11 @@ def build_project_paths(config: dict) -> ProjectPaths:
             "Drive root introuvable. Monte Google Drive puis relance. "
             f"Chemin configure: {drive_root}"
         )
+
+    # Propagation runtime du garde-fou ecriture Drive.
+    os.environ["SONGO_DRIVE_ROOT"] = str(drive_root)
+    os.environ.setdefault("SONGO_ENFORCE_DRIVE_ROOT_WRITES", "1")
+
     jobs_root = _resolve_root(base_root=drive_root, configured=storage.get("jobs_root"), default_relative="jobs")
     logs_root = _resolve_root(base_root=drive_root, configured=storage.get("logs_root"), default_relative="logs")
     reports_root = _resolve_root(base_root=drive_root, configured=storage.get("reports_root"), default_relative="reports")

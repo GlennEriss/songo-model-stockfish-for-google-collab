@@ -7,6 +7,36 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
+def _path_within(path: Path, base: Path) -> bool:
+    try:
+        path.resolve().relative_to(base.resolve())
+        return True
+    except Exception:
+        return False
+
+
+def _guard_drive_root_write(path: Path) -> None:
+    enforce_text = str(os.environ.get("SONGO_ENFORCE_DRIVE_ROOT_WRITES", "1")).strip().lower()
+    if enforce_text in {"0", "false", "no", "off", "n"}:
+        return
+    mydrive_root = Path("/content/drive/MyDrive")
+    configured_root = str(os.environ.get("SONGO_DRIVE_ROOT", "/content/drive/MyDrive/songo-stockfish")).strip()
+    allowed_drive_root = Path(configured_root or "/content/drive/MyDrive/songo-stockfish")
+    if not _path_within(path, mydrive_root):
+        return
+    if _path_within(path, allowed_drive_root):
+        return
+    raise ValueError(
+        "Refus ecriture hors drive_root autorise. "
+        f"path={path} | allowed_root={allowed_drive_root}. "
+        "Corrige le chemin cible pour ecrire sous MyDrive/songo-stockfish."
+    )
+
+
+def guard_write_path(path: Path) -> None:
+    _guard_drive_root_write(Path(path))
+
+
 def read_json_dict(
     path: Path,
     *,
@@ -33,6 +63,7 @@ def read_json_dict(
 
 
 def write_text_atomic(path: Path, text: str, *, encoding: str = "utf-8") -> None:
+    guard_write_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     last_exc: OSError | None = None
     for attempt in range(3):
@@ -93,6 +124,7 @@ def acquire_lock_dir(
     poll_seconds: float = 0.1,
     stale_after_seconds: float = 120.0,
 ) -> bool:
+    guard_write_path(lock_dir)
     deadline = time.time() + max(1.0, float(timeout_seconds))
     while time.time() < deadline:
         try:

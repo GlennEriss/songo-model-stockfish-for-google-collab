@@ -72,6 +72,8 @@ cells = [
 
         WORKTREE = os.environ.get('WORKTREE', DEFAULT_WORKTREE)
         PYTHON_BIN = sys.executable or 'python3'
+        os.environ['SONGO_DRIVE_ROOT'] = str(DRIVE_ROOT)
+        os.environ.setdefault('SONGO_ENFORCE_DRIVE_ROOT_WRITES', '1')
 
         for relative in [
             'jobs',
@@ -102,6 +104,8 @@ cells = [
         print('DRIVE_ROOT         =', DRIVE_ROOT)
         print('WORKTREE           =', WORKTREE)
         print('PYTHON_BIN         =', PYTHON_BIN)
+        print('SONGO_DRIVE_ROOT   =', os.environ.get('SONGO_DRIVE_ROOT', '<none>'))
+        print('WRITE_GUARD        =', os.environ.get('SONGO_ENFORCE_DRIVE_ROOT_WRITES', '<none>'))
         print('Note: WORKTREE (VM) != DRIVE_ROOT (Drive persistant)')
         print('Repo et dependances prets')
         """
@@ -1116,10 +1120,29 @@ cells = [
         STORAGE_CLEANUP_EXTERNAL_TARGET_SCAN_PROGRESS_EVERY = 2000
         STORAGE_CLEANUP_EXTERNAL_TARGET_GLOBS = [
             '.quarantine*',
+            '.dataset*',
             '_dataset*',
+            '.model*',
             '*.model',
             'model_songo_policy*',
             'bench_models*.json',
+            'build_dataset*.log',
+            'dataset_registry.json',
+            'config.yaml',
+            'run_status.json',
+            'state.json',
+            '*dataset*metadata*.json',
+            '_dataset_source_metadata.json*',
+            '.dataset*.tmp.*',
+            '._dataset*.tmp.*',
+            '.model*.tmp.*',
+            '._model*.tmp.*',
+            '.config.yaml.tmp.*',
+            '.run_status.json.tmp.*',
+            '.state.json.tmp.*',
+            '.dataset_registry.json.tmp.*',
+            '._dataset_source_metadata.json.tmp.*',
+            '.bench_models*.tmp.*',
         ]
         # Noms exacts supplementaires (optionnel) detectes hors DRIVE_ROOT.
         STORAGE_CLEANUP_EXTERNAL_TARGET_NAMES = []
@@ -1134,6 +1157,10 @@ cells = [
 
         env = dict(os.environ)
         env['PYTHONPATH'] = str(Path(WORKTREE) / 'src')
+        env['SONGO_DRIVE_ROOT'] = str(DRIVE_ROOT)
+        env['SONGO_ENFORCE_DRIVE_ROOT_WRITES'] = str(
+            os.environ.get('SONGO_ENFORCE_DRIVE_ROOT_WRITES', '1')
+        )
         env['SONGO_EXTERNAL_ARTIFACT_SCAN_MAX_SECONDS'] = str(float(STORAGE_CLEANUP_EXTERNAL_SCAN_MAX_SECONDS))
         env['SONGO_EXTERNAL_ARTIFACT_SCAN_MAX_DEPTH'] = str(int(STORAGE_CLEANUP_EXTERNAL_SCAN_MAX_DEPTH))
         env['SONGO_EXTERNAL_ARTIFACT_FORCE_FULL_SCAN'] = (

@@ -190,7 +190,14 @@ def _cleanup_external_drive_artifacts(*, drive_root: Path, apply: bool, now_epoc
     if not mydrive_root.exists():
         return step
     session_root = recovered_root / str(int(now_ts))
-    known_file_names = {"_dataset_source_metadata.json", "bench_models_20m_global.json"}
+    known_file_names = {
+        "_dataset_source_metadata.json",
+        "bench_models_20m_global.json",
+        "dataset_registry.json",
+        "config.yaml",
+        "run_status.json",
+        "state.json",
+    }
     scan_max_depth = max(1, _as_int(os.environ.get("SONGO_EXTERNAL_ARTIFACT_SCAN_MAX_DEPTH", "6"), 6))
     scan_max_seconds = max(30.0, _as_float(os.environ.get("SONGO_EXTERNAL_ARTIFACT_SCAN_MAX_SECONDS", "300"), 300.0))
     force_full_scan = _as_bool(os.environ.get("SONGO_EXTERNAL_ARTIFACT_FORCE_FULL_SCAN", "0"), default=False)
@@ -212,14 +219,39 @@ def _cleanup_external_drive_artifacts(*, drive_root: Path, apply: bool, now_epoc
 
     def _is_suspicious_path(path: Path) -> bool:
         name = path.name
-        if name.startswith(".quarantine_"):
+        lower_name = str(name or "").lower()
+        if name.startswith(".quarantine"):
             return True
         if name.startswith("model_songo_policy"):
+            return True
+        if name.startswith("_dataset"):
+            return True
+        if name.startswith(".model") or name.startswith("._model"):
+            return True
+        if name.startswith(".dataset") or name.startswith("._dataset"):
             return True
         if name in known_file_names:
             return True
         if name.startswith("bench_models_") and name.endswith(".json"):
             return True
+        if lower_name.startswith("build_dataset") and lower_name.endswith(".log"):
+            return True
+        if "dataset" in lower_name and "metadata" in lower_name and lower_name.endswith(".json"):
+            return True
+        if ".tmp." in lower_name:
+            if (
+                lower_name.startswith(".dataset")
+                or lower_name.startswith("._dataset")
+                or lower_name.startswith(".model")
+                or lower_name.startswith("._model")
+                or lower_name.startswith(".bench_models")
+                or "config.yaml.tmp." in lower_name
+                or "run_status.json.tmp." in lower_name
+                or "state.json.tmp." in lower_name
+                or "dataset_registry.json.tmp." in lower_name
+                or "_dataset_source_metadata.json.tmp" in lower_name
+            ):
+                return True
         return False
 
     def _is_interesting_dir_name(name: str) -> bool:
