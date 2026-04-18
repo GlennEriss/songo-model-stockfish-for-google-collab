@@ -75,7 +75,7 @@ def build_project_paths(config: dict) -> ProjectPaths:
 
     # Propagation runtime du garde-fou ecriture Drive.
     os.environ["SONGO_DRIVE_ROOT"] = str(drive_root)
-    os.environ.setdefault("SONGO_ENFORCE_DRIVE_ROOT_WRITES", "1")
+    os.environ["SONGO_ENFORCE_DRIVE_ROOT_WRITES"] = "1"
 
     jobs_root = _resolve_root(base_root=drive_root, configured=storage.get("jobs_root"), default_relative="jobs")
     logs_root = _resolve_root(base_root=drive_root, configured=storage.get("logs_root"), default_relative="logs")

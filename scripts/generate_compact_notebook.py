@@ -73,7 +73,7 @@ cells = [
         WORKTREE = os.environ.get('WORKTREE', DEFAULT_WORKTREE)
         PYTHON_BIN = sys.executable or 'python3'
         os.environ['SONGO_DRIVE_ROOT'] = str(DRIVE_ROOT)
-        os.environ.setdefault('SONGO_ENFORCE_DRIVE_ROOT_WRITES', '1')
+        os.environ['SONGO_ENFORCE_DRIVE_ROOT_WRITES'] = '1'
 
         expected_drive_root = Path('/content/drive/MyDrive/songo-stockfish')
         if Path(DRIVE_ROOT) != expected_drive_root:
@@ -1301,9 +1301,7 @@ cells = [
         env = dict(os.environ)
         env['PYTHONPATH'] = str(Path(WORKTREE) / 'src')
         env['SONGO_DRIVE_ROOT'] = str(DRIVE_ROOT)
-        env['SONGO_ENFORCE_DRIVE_ROOT_WRITES'] = str(
-            os.environ.get('SONGO_ENFORCE_DRIVE_ROOT_WRITES', '1')
-        )
+        env['SONGO_ENFORCE_DRIVE_ROOT_WRITES'] = '1'
         env['SONGO_EXTERNAL_ARTIFACT_SCAN_MAX_SECONDS'] = str(float(STORAGE_CLEANUP_EXTERNAL_SCAN_MAX_SECONDS))
         env['SONGO_EXTERNAL_ARTIFACT_SCAN_MAX_DEPTH'] = str(int(STORAGE_CLEANUP_EXTERNAL_SCAN_MAX_DEPTH))
         env['SONGO_EXTERNAL_ARTIFACT_FORCE_FULL_SCAN'] = (
@@ -2954,6 +2952,8 @@ cells = [
 
         generate_cmd = (
             f'cd {shlex.quote(WORKTREE)} && '
+            f'SONGO_DRIVE_ROOT={shlex.quote(str(DRIVE_ROOT))} '
+            f'SONGO_ENFORCE_DRIVE_ROOT_WRITES=1 '
             f'PYTHONPATH={shlex.quote(f"{WORKTREE}/src")} '
             f'{shlex.quote(PYTHON_BIN)} -m songo_model_stockfish.cli.main '
             f'dataset-generate --config {shlex.quote(str(DATASET_GENERATE_CONFIG_ACTIVE))} '
@@ -2962,6 +2962,8 @@ cells = [
 
         build_cmd = (
             f'cd {shlex.quote(WORKTREE)} && '
+            f'SONGO_DRIVE_ROOT={shlex.quote(str(DRIVE_ROOT))} '
+            f'SONGO_ENFORCE_DRIVE_ROOT_WRITES=1 '
             f'PYTHONPATH={shlex.quote(f"{WORKTREE}/src")} '
             f'{shlex.quote(PYTHON_BIN)} -m songo_model_stockfish.cli.main '
             f'dataset-build --config {shlex.quote(str(DATASET_BUILD_CONFIG_ACTIVE))} '
@@ -6119,6 +6121,8 @@ cells = [
 
         train_cmd = (
             f'cd {shlex.quote(WORKTREE)} && '
+            f'SONGO_DRIVE_ROOT={shlex.quote(str(DRIVE_ROOT))} '
+            f'SONGO_ENFORCE_DRIVE_ROOT_WRITES=1 '
             f'PYTHONPATH={shlex.quote(f"{WORKTREE}/src")} '
             f'{shlex.quote(PYTHON_BIN)} -m songo_model_stockfish.cli.main '
             f'train --config {shlex.quote(str(TRAIN_CONTINUE_CONFIG_ACTIVE))} '
@@ -6509,6 +6513,8 @@ cells = [
         eval_job_id = f'{EVALUATION_JOB_ID}_continue'
         eval_cmd = (
             f'cd {shlex.quote(WORKTREE)} && '
+            f'SONGO_DRIVE_ROOT={shlex.quote(str(DRIVE_ROOT))} '
+            f'SONGO_ENFORCE_DRIVE_ROOT_WRITES=1 '
             f'PYTHONPATH={shlex.quote(f"{WORKTREE}/src")} '
             f'{shlex.quote(PYTHON_BIN)} -m songo_model_stockfish.cli.main '
             f'evaluate --config {shlex.quote(str(runtime_eval_cfg_path))} '
@@ -6691,6 +6697,8 @@ cells = [
 
         train_cmd = (
             f'cd {shlex.quote(WORKTREE)} && '
+            f'SONGO_DRIVE_ROOT={shlex.quote(str(DRIVE_ROOT))} '
+            f'SONGO_ENFORCE_DRIVE_ROOT_WRITES=1 '
             f'PYTHONPATH={shlex.quote(f"{WORKTREE}/src")} '
             f'{shlex.quote(PYTHON_BIN)} -m songo_model_stockfish.cli.main '
             f'train --config {shlex.quote(str(TRAIN_SCRATCH_CONFIG_ACTIVE))} '
@@ -7081,6 +7089,8 @@ cells = [
         eval_job_id = f'{EVALUATION_JOB_ID}_scratch'
         eval_cmd = (
             f'cd {shlex.quote(WORKTREE)} && '
+            f'SONGO_DRIVE_ROOT={shlex.quote(str(DRIVE_ROOT))} '
+            f'SONGO_ENFORCE_DRIVE_ROOT_WRITES=1 '
             f'PYTHONPATH={shlex.quote(f"{WORKTREE}/src")} '
             f'{shlex.quote(PYTHON_BIN)} -m songo_model_stockfish.cli.main '
             f'evaluate --config {shlex.quote(str(runtime_eval_cfg_path))} '
@@ -7109,7 +7119,7 @@ cells = [
     md("## 8. Benchmark"),
     code(
         """
-        !bash -lc "cd $WORKTREE && PYTHONPATH=$WORKTREE/src $PYTHON_BIN -m songo_model_stockfish.cli.main benchmark --config $BENCHMARK_CONFIG_ACTIVE --job-id $BENCHMARK_JOB_ID"
+        !bash -lc "cd $WORKTREE && SONGO_DRIVE_ROOT=$DRIVE_ROOT SONGO_ENFORCE_DRIVE_ROOT_WRITES=1 PYTHONPATH=$WORKTREE/src $PYTHON_BIN -m songo_model_stockfish.cli.main benchmark --config $BENCHMARK_CONFIG_ACTIVE --job-id $BENCHMARK_JOB_ID"
         """
     ),
     code(

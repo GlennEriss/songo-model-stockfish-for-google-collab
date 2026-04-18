@@ -786,6 +786,7 @@ def create_job_context(config: dict[str, Any], *, override_job_id: str | None = 
     if paths.jobs_backup_root is not None:
         required_roots.append(paths.jobs_backup_root)
     for path in required_roots:
+        guard_write_path(path)
         path.mkdir(parents=True, exist_ok=True)
 
     job_cfg = config.get("job", {})
@@ -813,11 +814,13 @@ def create_job_context(config: dict[str, Any], *, override_job_id: str | None = 
         if str(existing_status.get("status", "")).lower() == "completed":
             job_id = _next_cycle_job_id(requested_job_id, paths.jobs_root, backup_jobs_root=paths.jobs_backup_root)
     job_dir = paths.jobs_root / job_id
+    guard_write_path(job_dir)
     job_dir.mkdir(parents=True, exist_ok=True)
 
     backup_job_dir: Path | None = None
     if paths.jobs_backup_root is not None:
         backup_job_dir = paths.jobs_backup_root / job_id
+        guard_write_path(backup_job_dir)
         backup_job_dir.mkdir(parents=True, exist_ok=True)
 
     restored_from_backup: list[str] = []

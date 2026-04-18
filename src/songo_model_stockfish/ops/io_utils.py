@@ -37,10 +37,13 @@ def resolve_allowed_drive_root() -> Path:
 
 def _guard_drive_root_write(path: Path) -> None:
     enforce_text = str(os.environ.get("SONGO_ENFORCE_DRIVE_ROOT_WRITES", "1")).strip().lower()
-    if enforce_text in {"0", "false", "no", "off", "n"}:
+    in_mydrive = _path_within(path, _MYDRIVE_ROOT)
+    # Hard safety rule: writes under MyDrive must never escape the project root.
+    # The legacy env flag can relax checks only for non-MyDrive paths.
+    if (not in_mydrive) and enforce_text in {"0", "false", "no", "off", "n"}:
         return
     allowed_drive_root = resolve_allowed_drive_root()
-    if not _path_within(path, _MYDRIVE_ROOT):
+    if not in_mydrive:
         return
     if _path_within(path, allowed_drive_root):
         return
