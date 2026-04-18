@@ -1084,6 +1084,7 @@ cells = [
 
         import json
         import os
+        import shlex
         import subprocess
         import time
         from pathlib import Path
@@ -1141,39 +1142,32 @@ cells = [
             print('command =', cmd)
             started = time.time()
             log_path = Path('/tmp') / f'{step_name}.storage_cleanup.log'
+            cmd_line = ' '.join(shlex.quote(str(part)) for part in cmd)
+            bash_cmd = f"{cmd_line} 2>&1 | tee {shlex.quote(str(log_path))}"
             proc = subprocess.Popen(
-                cmd,
+                ['/bin/bash', '-lc', bash_cmd],
                 cwd=str(WORKTREE),
                 env=env,
                 text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                bufsize=1,
             )
             heartbeat = max(5, int(STORAGE_CLEANUP_HEARTBEAT_SECONDS))
             last_beat = started
-            output_lines = []
-            with log_path.open('w', encoding='utf-8') as log_handle:
-                while True:
-                    line = proc.stdout.readline() if proc.stdout is not None else ''
-                    if line:
-                        output_lines.append(line)
-                        log_handle.write(line)
-                        log_handle.flush()
-                        print(f'[{step_name}] {line.rstrip()}')
-                    else:
-                        if proc.poll() is not None:
-                            break
-                        now = time.time()
-                        if now - last_beat >= heartbeat:
-                            print(
-                                f'[{step_name}] en cours... elapsed='
-                                f'{int(now - started)}s | dry_run={STORAGE_CLEANUP_DRY_RUN}'
-                            )
-                            last_beat = now
-                        time.sleep(1.0)
+            while proc.poll() is None:
+                now = time.time()
+                if now - last_beat >= heartbeat:
+                    print(
+                        f'[{step_name}] en cours... elapsed='
+                        f'{int(now - started)}s | dry_run={STORAGE_CLEANUP_DRY_RUN}'
+                    )
+                    last_beat = now
+                time.sleep(1.0)
             return_code = int(proc.wait())
-            stdout_text = ''.join(output_lines).strip()
+            stdout_text = ''
+            if log_path.exists():
+                try:
+                    stdout_text = log_path.read_text(encoding='utf-8', errors='ignore').strip()
+                except Exception:
+                    stdout_text = ''
             print(f'[{step_name}] log_file = {log_path}')
             if return_code != 0:
                 print(f'[{step_name}] echec | returncode={return_code}')
