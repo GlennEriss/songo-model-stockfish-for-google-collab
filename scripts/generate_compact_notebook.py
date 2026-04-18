@@ -377,6 +377,20 @@ cells = [
                 )
             return path
 
+        def _safe_write_text(path_like: str | Path, text: str, *, encoding: str = 'utf-8', label: str = 'write_text') -> Path:
+            path = _assert_mydrive_scoped(path_like, label=label)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding=encoding)
+            return path
+
+        def _safe_write_json(path_like: str | Path, payload: dict, *, indent: int = 2, ensure_ascii: bool = True, label: str = 'write_json') -> Path:
+            return _safe_write_text(
+                path_like,
+                json.dumps(payload, indent=indent, ensure_ascii=ensure_ascii),
+                encoding='utf-8',
+                label=label,
+            )
+
         _assert_mydrive_scoped(DRIVE_ROOT, label='DRIVE_ROOT')
         _assert_mydrive_scoped(JOBS_ROOT, label='JOBS_ROOT')
         _assert_mydrive_scoped(LOGS_ROOT, label='LOGS_ROOT')
@@ -2188,10 +2202,14 @@ cells = [
         def _write_yaml(payload: dict, target_path_str: str) -> str:
             target_path = Path(target_path_str)
             _assert_mydrive_scoped(target_path, label='generated_config_target')
-            target_path.parent.mkdir(parents=True, exist_ok=True)
             normalized_payload = _apply_runtime_storage_cfg(dict(payload or {}))
             normalized_payload = _apply_runtime_firestore_cfg(normalized_payload)
-            target_path.write_text(yaml.safe_dump(normalized_payload, sort_keys=False, allow_unicode=True), encoding='utf-8')
+            _safe_write_text(
+                target_path,
+                yaml.safe_dump(normalized_payload, sort_keys=False, allow_unicode=True),
+                encoding='utf-8',
+                label='generated_config_target',
+            )
             return str(target_path)
 
         def _resolve_cfg_path(path_like: str) -> Path:
@@ -2334,7 +2352,12 @@ cells = [
                 cfg_payload['train'] = train_payload
                 cfg_payload = _apply_runtime_storage_cfg(cfg_payload)
                 cfg_payload = _apply_runtime_firestore_cfg(cfg_payload)
-                current_path.write_text(yaml.safe_dump(cfg_payload, sort_keys=False, allow_unicode=True), encoding='utf-8')
+                _safe_write_text(
+                    current_path,
+                    yaml.safe_dump(cfg_payload, sort_keys=False, allow_unicode=True),
+                    encoding='utf-8',
+                    label='train_config_autotune_write',
+                )
 
             eval_path = _resolve_cfg_path(str(EVALUATION_CONFIG_ACTIVE))
             if not eval_path.exists():
@@ -2351,7 +2374,12 @@ cells = [
             eval_cfg_payload['runtime'] = eval_runtime_payload
             eval_cfg_payload = _apply_runtime_storage_cfg(eval_cfg_payload)
             eval_cfg_payload = _apply_runtime_firestore_cfg(eval_cfg_payload)
-            eval_path.write_text(yaml.safe_dump(eval_cfg_payload, sort_keys=False, allow_unicode=True), encoding='utf-8')
+            _safe_write_text(
+                eval_path,
+                yaml.safe_dump(eval_cfg_payload, sort_keys=False, allow_unicode=True),
+                encoding='utf-8',
+                label='evaluation_config_autotune_write',
+            )
 
         model_registry_path = Path(DRIVE_ROOT) / 'models' / 'model_registry.json'
         model_registry = json.loads(model_registry_path.read_text(encoding='utf-8')) if model_registry_path.exists() else {'models': []}
@@ -2814,9 +2842,11 @@ cells = [
         benchmark_cfg['benchmark'] = benchmark_block
         benchmark_cfg = _apply_runtime_storage_cfg(benchmark_cfg)
         benchmark_cfg = _apply_runtime_firestore_cfg(benchmark_cfg)
-        Path(BENCHMARK_CONFIG_ACTIVE).write_text(
+        _safe_write_text(
+            Path(BENCHMARK_CONFIG_ACTIVE),
             yaml.safe_dump(benchmark_cfg, sort_keys=False, allow_unicode=True),
             encoding='utf-8',
+            label='benchmark_config_active_write',
         )
 
         print('RUNTIME_PROFILE                =', RUNTIME_PROFILE)
@@ -2997,8 +3027,7 @@ cells = [
             },
         }
         latest_path = Path(PIPELINE_MANIFEST_PATH)
-        latest_path.parent.mkdir(parents=True, exist_ok=True)
-        latest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=True), encoding='utf-8')
+        _safe_write_json(latest_path, manifest, label='pipeline_manifest_write')
         firestore_manifest_written = False
         firestore_manifest_error = ''
         if PIPELINE_MANIFEST_FIRESTORE_WRITE_ENABLED:
@@ -3880,12 +3909,11 @@ cells = [
                 key = str(row.get('status', 'unknown'))
                 status_counts[key] = int(status_counts.get(key, 0)) + 1
 
-            snapshot_path.parent.mkdir(parents=True, exist_ok=True)
             snapshot_payload = {
                 'updated_at': datetime.now(UTC).isoformat().replace('+00:00', 'Z'),
                 'workers': next_workers_snapshot,
             }
-            snapshot_path.write_text(json.dumps(snapshot_payload, indent=2, ensure_ascii=True), encoding='utf-8')
+            _safe_write_json(snapshot_path, snapshot_payload, label='workers_snapshot_write')
 
             print('Workers status strategy = heartbeat + delta progress + dataset_registry cross-check')
             print(
@@ -4057,8 +4085,7 @@ cells = [
         unchanged_global_seconds = int(max(0.0, float(current['ts']) - float(current['last_global_change_ts'])))
         unchanged_build_seconds = int(max(0.0, float(current['ts']) - float(current['last_build_change_ts'])))
 
-        health_state_path.parent.mkdir(parents=True, exist_ok=True)
-        health_state_path.write_text(json.dumps(current, indent=2, ensure_ascii=True), encoding='utf-8')
+        _safe_write_json(health_state_path, current, label='health_snapshot_write')
 
         target = int(payload.get('target_samples', GLOBAL_TARGET_SAMPLES))
         global_updated_at = str(payload.get('updated_at', '<none>'))
@@ -5603,8 +5630,12 @@ cells = [
             eval_block['model_id'] = selected['model_id']
             eval_block['checkpoint_path'] = selected['checkpoint_path']
             eval_cfg['evaluation'] = eval_block
-            runtime_eval_cfg_path.parent.mkdir(parents=True, exist_ok=True)
-            runtime_eval_cfg_path.write_text(yaml.safe_dump(eval_cfg, sort_keys=False), encoding='utf-8')
+            _safe_write_text(
+                runtime_eval_cfg_path,
+                yaml.safe_dump(eval_cfg, sort_keys=False),
+                encoding='utf-8',
+                label='runtime_eval_config_write',
+            )
 
             print('Evaluation runtime config prete')
             print('  dataset_id          =', dataset_id)
@@ -7389,7 +7420,12 @@ cells = [
 
         def _write_json_atomic_text(path: Path, payload: dict) -> None:
             tmp_path = path.with_suffix(path.suffix + '.tmp')
-            tmp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding='utf-8')
+            _safe_write_text(
+                tmp_path,
+                json.dumps(payload, indent=2, ensure_ascii=True),
+                encoding='utf-8',
+                label='tournament_progress_tmp_write',
+            )
             tmp_path.replace(path)
 
         def _append_jsonl(path: Path, payload: dict) -> None:
@@ -7544,7 +7580,12 @@ cells = [
                     'started_at_epoch': now,
                     'expires_at_epoch': now + ttl_seconds,
                 }
-                lease_path.write_text(json.dumps(payload, ensure_ascii=True), encoding='utf-8')
+                _safe_write_text(
+                    lease_path,
+                    json.dumps(payload, ensure_ascii=True),
+                    encoding='utf-8',
+                    label='tournament_run_lease_write',
+                )
                 return {'backend': 'drive', 'owner': owner_id, 'lease_path': lease_path}
             raise ValueError(f'TOURNAMENT_RUN_LEASE_BACKEND non supporte: {backend}')
 
@@ -8223,7 +8264,12 @@ cells = [
             while time.time() < deadline:
                 try:
                     lock_dir.mkdir(parents=False, exist_ok=False)
-                    (lock_dir / 'owner.txt').write_text(owner_id, encoding='utf-8')
+                    _safe_write_text(
+                        lock_dir / 'owner.txt',
+                        owner_id,
+                        encoding='utf-8',
+                        label='tournament_drive_lock_owner_write',
+                    )
                     return {'acquired': True, 'backend': 'drive', 'owner': owner_id, 'lock_dir': lock_dir}
                 except FileExistsError:
                     try:
@@ -8569,7 +8615,7 @@ cells = [
             }
             stamp = datetime.now(UTC).strftime('%Y%m%d_%H%M%S')
             out_path = out_dir / f'model_tournament_{stamp}.json'
-            out_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding='utf-8')
+            _safe_write_json(out_path, payload, label='tournament_report_write')
             print('\\nReport saved:', out_path)
         _emit_tournament_progress(stage='completed', force_log=True)
         if run_lease_released_early:
