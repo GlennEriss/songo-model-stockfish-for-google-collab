@@ -1235,6 +1235,7 @@ cells = [
                     continue
                 explicit_targets.append(Path(resolved))
 
+            started = time.time()
             while queue:
                 if (time.time() - started) >= float(scan_max_seconds):
                     report['scan_truncated'] = True
