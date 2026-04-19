@@ -65,6 +65,7 @@ La ligne technique retenue est:
 - `docs/REPO_STRUCTURE_SPEC.md` : structure cible du repository
 - `docs/ARTIFACTS_AND_LOGGING_SPEC.md` : conventions d'artefacts et de logs
 - `docs/DATASET_V1_SPEC.md` : specification du premier dataset
+- `docs/DATASET_MODEL_TRAINING_PLAYBOOK.md` : guide pratique dataset->labels->modele->metriques et leviers de progression
 - `docs/JOB_CONFIG_SPEC.md` : specification des fichiers YAML de jobs
 - `docs/CLI_SPEC.md` : specification des commandes CLI disponibles
 - `docs/STATE_REPRESENTATION_SPEC.md` : specification de la representation d'etat V1

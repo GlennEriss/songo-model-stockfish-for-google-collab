@@ -70,6 +70,13 @@ Si tu veux comprendre rapidement le projet, lis dans cet ordre:
   - format exact du premier dataset
   - raw games, sampled positions, labeled samples
 
+- `DATASET_MODEL_TRAINING_PLAYBOOK.md`
+  - construction dataset actuelle (generate/build)
+  - labels utilises (`policy_target`, `value_target`, hard examples, tactique)
+  - architecture du modele `PolicyValueMLP`
+  - leviers pour rendre le modele plus fort
+  - metriques prioritaires train/eval/benchmark
+
 ## 6. Documents architecture et operations
 
 - `SYSTEM_ARCHITECTURE.md`
@@ -151,6 +158,7 @@ Lis:
 - `EXPERT_ITERATION_ALPHAZERO_ARCHITECTURE.md`
 - `MODEL_V1_SPEC.md`
 - `DATASET_V1_SPEC.md`
+- `DATASET_MODEL_TRAINING_PLAYBOOK.md`
 
 ### Si tu veux comprendre l'exploitation Colab
 
