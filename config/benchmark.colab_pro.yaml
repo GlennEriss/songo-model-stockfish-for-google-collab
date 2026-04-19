@@ -22,7 +22,11 @@ benchmark:
   parallel_backend: thread
   parallel_workers: 16
   model_search_enabled: true
-  model_search_top_k: 4
+  model_search_profile: fort_plusplus
+  model_search_depth: 3
+  model_search_top_k: 6
+  model_search_top_k_child: 4
+  model_search_alpha_beta: true
   model_search_policy_weight: 0.35
   model_search_value_weight: 1.0
   matchups:

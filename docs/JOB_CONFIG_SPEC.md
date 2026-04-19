@@ -276,7 +276,11 @@ job:
 benchmark:
   target: auto_latest
   model_search_enabled: true
-  model_search_top_k: 4
+  model_search_profile: fort_plusplus
+  model_search_depth: 3
+  model_search_top_k: 6
+  model_search_top_k_child: 4
+  model_search_alpha_beta: true
   model_search_policy_weight: 0.35
   model_search_value_weight: 1.0
   matchups:
@@ -291,10 +295,14 @@ benchmark:
 
 Champs benchmark model search:
 
-- `model_search_enabled`: active une recherche legere cote `ModelAgent` (au lieu du pur `argmax` policy)
-- `model_search_top_k`: nombre de coups candidats explores (tries par prior policy)
-- `model_search_policy_weight`: poids du prior policy dans le score de choix
-- `model_search_value_weight`: poids de la value predite (apres un ply)
+- `model_search_enabled`: active la recherche cote `ModelAgent` (desactivee => prior policy seule)
+- `model_search_profile`: profil de recherche. Valeur supportee: `fort_plusplus`
+- `model_search_depth`: profondeur de recherche negamax (plies)
+- `model_search_top_k`: nombre de coups candidats explores a la racine (tries par prior policy)
+- `model_search_top_k_child`: largeur de branchement sur les noeuds internes
+- `model_search_alpha_beta`: active le pruning alpha-beta
+- `model_search_policy_weight`: poids du prior policy dans le score final a la racine
+- `model_search_value_weight`: poids de la value de recherche dans le score final a la racine
 
 ## 8. Config `evaluation`
 

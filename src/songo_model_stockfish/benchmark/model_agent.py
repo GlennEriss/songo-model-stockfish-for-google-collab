@@ -19,9 +19,13 @@ class ModelAgent:
         display_name: str | None = None,
         device: str = "cpu",
         search_enabled: bool = True,
-        search_top_k: int = 4,
+        search_top_k: int = 6,
+        search_top_k_child: int | None = 4,
+        search_depth: int = 3,
         search_policy_weight: float = 0.35,
         search_value_weight: float = 1.0,
+        search_profile: str = "fort_plusplus",
+        search_alpha_beta: bool = True,
     ) -> None:
         self._checkpoint_path = Path(checkpoint_path)
         if not self._checkpoint_path.exists():
@@ -44,18 +48,27 @@ class ModelAgent:
         self._display_name = display_name or self._checkpoint_path.stem
         self._search_enabled = bool(search_enabled)
         self._search_top_k = max(1, int(search_top_k))
+        self._search_top_k_child = max(1, int(search_top_k_child if search_top_k_child is not None else 4))
+        self._search_depth = max(1, int(search_depth))
         self._search_policy_weight = float(search_policy_weight)
         self._search_value_weight = float(search_value_weight)
+        self._search_profile = str(search_profile or "fort_plusplus").strip().lower() or "fort_plusplus"
+        self._search_alpha_beta = bool(search_alpha_beta)
+        if self._search_profile not in {"fort_plusplus"}:
+            raise ValueError(
+                "ModelAgent search_profile non supporte. "
+                f"Valeur recue: {self._search_profile}. Valeur autorisee: fort_plusplus."
+            )
 
     @property
     def display_name(self) -> str:
         return self._display_name
 
-    def _infer_state(self, state: Any) -> tuple[list[int], torch.Tensor, float]:
+    def _infer_state(self, state: Any) -> tuple[list[int], dict[int, float], float]:
         raw_state = songo_ai_game.to_raw_state(state)
         legal_moves = songo_ai_game.legal_moves(state)
         if not legal_moves:
-            return [], torch.zeros((0,), dtype=torch.float32), 0.0
+            return [], {}, 0.0
         features, legal_mask = encode_model_features(raw_state, legal_moves, tactical_analysis=None)
         features = adapt_feature_dim(features, self._input_dim)
         x = torch.from_numpy(features).unsqueeze(0).to(self._device)
@@ -65,7 +78,40 @@ class ModelAgent:
             masked_logits = _masked_policy_logits(policy_logits, mask)
             policy_probs = torch.softmax(masked_logits, dim=1).squeeze(0).detach().cpu()
             root_value = float(value.item())
-        return list(legal_moves), policy_probs, root_value
+        policy_by_move = {int(move): float(policy_probs[int(move) - 1].item()) for move in legal_moves}
+        prior_total = float(sum(policy_by_move.values()))
+        if prior_total > 0.0:
+            policy_by_move = {int(move): float(score / prior_total) for move, score in policy_by_move.items()}
+        else:
+            uniform = 1.0 / float(len(legal_moves))
+            policy_by_move = {int(move): float(uniform) for move in legal_moves}
+        return list(legal_moves), policy_by_move, root_value
+
+    @staticmethod
+    def _state_signature(state: Any) -> tuple[Any, ...]:
+        raw_state = songo_ai_game.to_raw_state(state)
+        scores = raw_state.get("scores", {})
+        return (
+            tuple(int(value) for value in raw_state.get("board", [])),
+            str(raw_state.get("player_to_move", "")),
+            int(scores.get("south", 0)),
+            int(scores.get("north", 0)),
+            bool(raw_state.get("is_terminal", False)),
+            int(state.get("turn_index", 0)),
+        )
+
+    @staticmethod
+    def _terminal_value_for_side_to_move(state: Any) -> float:
+        winner = songo_ai_game.winner(state)
+        if winner is None:
+            return 0.0
+        side_to_move = int(songo_ai_game.current_player(state))
+        return 1.0 if int(winner) == side_to_move else -1.0
+
+    @staticmethod
+    def _rank_candidate_moves(legal_moves: list[int], policy_by_move: dict[int, float], *, top_k: int) -> list[int]:
+        ranked = sorted(legal_moves, key=lambda m: float(policy_by_move.get(int(m), 0.0)), reverse=True)
+        return ranked[: min(len(ranked), max(1, int(top_k)))]
 
     def _child_value_from_root_pov(self, child_state: Any, *, root_player: int) -> float:
         # Terminal fast-path: exact outcome from root player's perspective.
@@ -79,14 +125,73 @@ class ModelAgent:
         # Value is learned from side-to-move perspective; after one ply it's opponent to move.
         return -float(child_value)
 
+    def _negamax_search(
+        self,
+        state: Any,
+        *,
+        depth_left: int,
+        alpha: float,
+        beta: float,
+        infer_cache: dict[tuple[Any, ...], tuple[list[int], dict[int, float], float]],
+        stats: dict[str, int],
+    ) -> float:
+        stats["nodes"] = int(stats.get("nodes", 0)) + 1
+        if songo_ai_game.is_terminal(state):
+            stats["terminal_nodes"] = int(stats.get("terminal_nodes", 0)) + 1
+            return self._terminal_value_for_side_to_move(state)
+
+        signature = self._state_signature(state)
+        cached = infer_cache.get(signature)
+        if cached is None:
+            cached = self._infer_state(state)
+            infer_cache[signature] = cached
+        else:
+            stats["cache_hits"] = int(stats.get("cache_hits", 0)) + 1
+        legal_moves, policy_by_move, state_value = cached
+        if depth_left <= 0 or not legal_moves:
+            stats["leaf_nodes"] = int(stats.get("leaf_nodes", 0)) + 1
+            return float(state_value)
+
+        candidate_moves = self._rank_candidate_moves(
+            legal_moves,
+            policy_by_move,
+            top_k=self._search_top_k_child,
+        )
+        best_score = float("-inf")
+        use_alpha_beta = bool(self._search_alpha_beta)
+        local_alpha = float(alpha)
+        local_beta = float(beta)
+        for move in candidate_moves:
+            child_state = songo_ai_game.simulate_move(state, int(move))
+            child_score = -self._negamax_search(
+                child_state,
+                depth_left=int(depth_left) - 1,
+                alpha=-local_beta,
+                beta=-local_alpha,
+                infer_cache=infer_cache,
+                stats=stats,
+            )
+            if child_score > best_score:
+                best_score = float(child_score)
+            if not use_alpha_beta:
+                continue
+            if child_score > local_alpha:
+                local_alpha = float(child_score)
+            if local_alpha >= local_beta:
+                stats["cutoffs"] = int(stats.get("cutoffs", 0)) + 1
+                break
+        return float(best_score)
+
     def choose(self, state):
-        legal_moves, policy_probs, root_value = self._infer_state(state)
+        infer_cache: dict[tuple[Any, ...], tuple[list[int], dict[int, float], float]] = {}
+        root_signature = self._state_signature(state)
+        legal_moves, policy_by_move, root_value = self._infer_state(state)
+        infer_cache[root_signature] = (legal_moves, policy_by_move, root_value)
         if not legal_moves:
             raise ValueError("Aucun coup legal disponible pour ModelAgent.choose")
 
         if not self._search_enabled:
-            move_index = int(policy_probs.argmax().item())
-            move = move_index + 1
+            move = max(legal_moves, key=lambda m: float(policy_by_move.get(int(m), 0.0)))
             if move not in legal_moves:
                 raise RuntimeError(
                     "ModelAgent produced an illegal argmax move in strict mode | "
@@ -94,28 +199,42 @@ class ModelAgent:
                 )
             return move, {"value": root_value, "search_enabled": False}
 
-        policy_by_move = {move: float(policy_probs[move - 1].item()) for move in legal_moves}
-        ranked_moves = sorted(legal_moves, key=lambda m: policy_by_move.get(m, 0.0), reverse=True)
-        candidate_moves = ranked_moves[: min(len(ranked_moves), self._search_top_k)]
-
-        root_player = int(songo_ai_game.current_player(state))
+        candidate_moves = self._rank_candidate_moves(legal_moves, policy_by_move, top_k=self._search_top_k)
         best_move = candidate_moves[0]
-        best_score = float("-inf")
-        best_child_value = 0.0
+        best_blended_score = float("-inf")
+        best_search_value = float("-inf")
+        search_stats = {"nodes": 0, "leaf_nodes": 0, "terminal_nodes": 0, "cache_hits": 0, "cutoffs": 0}
+        depth_for_children = max(1, int(self._search_depth) - 1)
         for move in candidate_moves:
             child_state = songo_ai_game.simulate_move(state, int(move))
-            child_value = self._child_value_from_root_pov(child_state, root_player=root_player)
+            child_value = -self._negamax_search(
+                child_state,
+                depth_left=depth_for_children,
+                alpha=float("-inf"),
+                beta=float("inf"),
+                infer_cache=infer_cache,
+                stats=search_stats,
+            )
             prior = float(policy_by_move.get(move, 0.0))
             score = (self._search_value_weight * child_value) + (self._search_policy_weight * prior)
-            if score > best_score:
-                best_score = score
+            if score > best_blended_score:
+                best_blended_score = score
                 best_move = int(move)
-                best_child_value = float(child_value)
+                best_search_value = float(child_value)
 
         return best_move, {
             "value": root_value,
             "search_enabled": True,
+            "search_profile": self._search_profile,
+            "search_depth": self._search_depth,
             "search_top_k": self._search_top_k,
-            "search_score": float(best_score),
-            "search_child_value": float(best_child_value),
+            "search_top_k_child": self._search_top_k_child,
+            "search_alpha_beta": bool(self._search_alpha_beta),
+            "search_score": float(best_blended_score),
+            "search_child_value": float(best_search_value),
+            "search_nodes": int(search_stats.get("nodes", 0)),
+            "search_leaf_nodes": int(search_stats.get("leaf_nodes", 0)),
+            "search_terminal_nodes": int(search_stats.get("terminal_nodes", 0)),
+            "search_cache_hits": int(search_stats.get("cache_hits", 0)),
+            "search_cutoffs": int(search_stats.get("cutoffs", 0)),
         }

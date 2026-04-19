@@ -262,14 +262,24 @@ def _build_target_agent(job: JobContext) -> AgentLike:
     else:
         checkpoint_path = _resolve_storage_path(job.paths.drive_root, benchmark_cfg.get("checkpoint_path"), job.job_dir / "model.pt")
     device = str(job.config.get("runtime", {}).get("device", "cpu"))
+    requested_profile = str(benchmark_cfg.get("model_search_profile", "fort_plusplus")).strip().lower() or "fort_plusplus"
+    if requested_profile != "fort_plusplus":
+        job.logger.warning(
+            "model_search_profile=%s ignore (profil unique force: fort_plusplus)",
+            requested_profile,
+        )
     return ModelAgent(
         str(checkpoint_path),
         display_name=target,
         device=device,
         search_enabled=bool(benchmark_cfg.get("model_search_enabled", True)),
-        search_top_k=max(1, int(benchmark_cfg.get("model_search_top_k", 4))),
+        search_top_k=max(1, int(benchmark_cfg.get("model_search_top_k", 6))),
+        search_top_k_child=max(1, int(benchmark_cfg.get("model_search_top_k_child", 4))),
+        search_depth=max(1, int(benchmark_cfg.get("model_search_depth", 3))),
         search_policy_weight=float(benchmark_cfg.get("model_search_policy_weight", 0.35)),
         search_value_weight=float(benchmark_cfg.get("model_search_value_weight", 1.0)),
+        search_profile="fort_plusplus",
+        search_alpha_beta=bool(benchmark_cfg.get("model_search_alpha_beta", True)),
     )
 
 

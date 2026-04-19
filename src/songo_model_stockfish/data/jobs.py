@@ -3263,7 +3263,19 @@ def _build_external_agent_cached(spec: str, models_root_str: str, device: str):
         return MCTSAgent(level)
     if kind == "model":
         model_id, checkpoint_path = _resolve_model_checkpoint_for_generation(level, models_root=Path(models_root_str))
-        return ModelAgent(str(checkpoint_path), display_name=model_id, device=device)
+        return ModelAgent(
+            str(checkpoint_path),
+            display_name=model_id,
+            device=device,
+            search_enabled=True,
+            search_profile="fort_plusplus",
+            search_depth=3,
+            search_top_k=6,
+            search_top_k_child=4,
+            search_alpha_beta=True,
+            search_policy_weight=0.35,
+            search_value_weight=1.0,
+        )
     raise ValueError(f"Unsupported dataset generation agent: {spec}")
 
 

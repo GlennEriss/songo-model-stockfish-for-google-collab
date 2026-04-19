@@ -67,7 +67,7 @@ Il couvre:
 - priorite dataset global pour train/eval:
   - priorite au dataset fusionne `BASE_DATASET_BUILD_ID` si complet
   - fallback sur le plus gros shard de la meme famille
-- benchmark modele avec recherche legere (`model_search_*`) au lieu du pur `argmax` policy
+- benchmark modele en profil `fort_plusplus` (`model_search_*`) au lieu du pur `argmax` policy
 - pipeline 2 passes explicites via:
   - `DATASET_PIPELINE_MODE='two_pass'`
   - `DATASET_PIPELINE_ACTIVE_PASS='A'|'B'`

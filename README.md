@@ -227,7 +227,7 @@ Important pour Colab:
 - en pratique, il faut renseigner `FIRESTORE_CREDENTIALS_PATH` avec un service account JSON
 - en multi-workers, activer `LOW_QUOTA_PROFILE=True` pour limiter les reads/writes Firestore
 - les configs actives train/eval privilegient le dataset global fusionne, puis fallback sur le plus gros shard de la famille
-- le benchmark modele utilise une recherche legere configurable (`model_search_enabled`, `model_search_top_k`, etc.)
+- le benchmark modele utilise un profil de recherche fort (`model_search_profile=fort_plusplus`) configurable (`model_search_depth`, `model_search_top_k`, etc.)
 
 Scripts utiles:
 
