@@ -99,7 +99,7 @@ class ManagedProcess:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def start(self) -> None:
-        print(f"RUN[{self.name}]: {self.command}")
+        print(f"RUN[{self.name}]: {self.command}", flush=True)
         self.started_at = time.time()
         self.popen = subprocess.Popen(
             self.command,
@@ -131,7 +131,7 @@ class ManagedProcess:
         if not self._exit_reported:
             self._exit_reported = True
             elapsed = int(max(0.0, time.time() - self.started_at))
-            print(f"[exit:{self.name}] returncode={rc} | elapsed={elapsed}s")
+            print(f"[exit:{self.name}] returncode={rc} | elapsed={elapsed}s", flush=True)
         return rc
 
     def terminate(self, *, grace_seconds: float = 10.0) -> None:
@@ -155,7 +155,7 @@ def _drain_output(output_q: queue.Queue[tuple[str, str]]) -> None:
             prefix, line = output_q.get_nowait()
         except queue.Empty:
             return
-        print(f"[{prefix}] {line}")
+        print(f"[{prefix}] {line}", flush=True)
 
 
 def _should_start_training(
@@ -190,6 +190,7 @@ def _build_job_command(
 ) -> list[str]:
     cmd = [
         python_bin,
+        "-u",
         str(worktree / "scripts" / "colab" / "run_job.py"),
         command,
         "--worktree",
@@ -221,6 +222,12 @@ def run_streaming_pipeline(
     skip_build: bool,
     state_path: Path | None,
 ) -> dict[str, Any]:
+    try:
+        sys.stdout.reconfigure(line_buffering=True, write_through=True)
+        sys.stderr.reconfigure(line_buffering=True, write_through=True)
+    except Exception:
+        pass
+
     identity_key = str(identity or "").strip() or "unknown_drive_identity"
     build_cfg_path = _resolve_active_config_path(
         worktree=worktree,
@@ -262,6 +269,7 @@ def run_streaming_pipeline(
 
     env = dict(os.environ)
     env["PYTHONPATH"] = str(worktree / "src")
+    env["PYTHONUNBUFFERED"] = "1"
 
     output_q: queue.Queue[tuple[str, str]] = queue.Queue()
     base_processes: list[ManagedProcess] = []
@@ -313,9 +321,9 @@ def run_streaming_pipeline(
         f"train_min_samples={int(train_min_samples)} | "
         f"train_min_delta_samples={int(train_min_delta_samples)} | "
         f"max_train_runs={int(max_train_runs)}"
-    )
-    print(f"registry_path={registry_path}")
-    print(f"state_path={pipeline_state_path}")
+    , flush=True)
+    print(f"registry_path={registry_path}", flush=True)
+    print(f"state_path={pipeline_state_path}", flush=True)
 
     try:
         while True:
@@ -364,7 +372,7 @@ def run_streaming_pipeline(
                     "training cycle started | "
                     f"run_index={train_runs + 1} | "
                     f"started_labeled_samples={labeled_samples}"
-                )
+                , flush=True)
 
             if train_proc is not None:
                 train_rc = train_proc.report_exit_once()
@@ -380,7 +388,7 @@ def run_streaming_pipeline(
                             f"run_index={train_runs} | "
                             f"started_labeled_samples={started_labeled_samples} | "
                             f"current_labeled_samples={latest_labeled}"
-                        )
+                        , flush=True)
                         _write_json(
                             pipeline_state_path,
                             {
@@ -396,7 +404,7 @@ def run_streaming_pipeline(
                             for proc in base_processes:
                                 proc.terminate()
                             raise RuntimeError(message)
-                        print(f"WARNING: {message} | continue_on_train_error=True")
+                        print(f"WARNING: {message} | continue_on_train_error=True", flush=True)
                     train_proc = None
 
             now = time.time()
@@ -421,7 +429,7 @@ def run_streaming_pipeline(
                     f"train_runs={train_runs} | "
                     f"train_state={train_state} | "
                     f"base={' | '.join(base_status) if base_status else '<none>'}"
-                )
+                , flush=True)
                 last_heartbeat = now
 
             base_done = all(proc.poll() is not None for proc in base_processes) if base_processes else True
@@ -442,7 +450,7 @@ def run_streaming_pipeline(
 
             time.sleep(max(1.0, float(poll_seconds)))
     except KeyboardInterrupt:
-        print("interrupt received | stopping child processes...")
+        print("interrupt received | stopping child processes...", flush=True)
         if train_proc is not None:
             train_proc.terminate()
         for proc in base_processes:
@@ -466,7 +474,7 @@ def run_streaming_pipeline(
         "last_trained_labeled_samples": int(last_trained_labeled_samples),
         "train_runs": int(train_runs),
     }
-    print(json.dumps(summary, indent=2, ensure_ascii=True))
+    print(json.dumps(summary, indent=2, ensure_ascii=True), flush=True)
     return summary
 
 

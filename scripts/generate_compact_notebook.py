@@ -80,6 +80,7 @@ cells = [
         subprocess.run(
             [
                 PYTHON_BIN,
+                '-u',
                 str(step_script),
                 'bootstrap',
                 '--git-repo-url',
@@ -136,6 +137,7 @@ cells = [
         subprocess.run(
             [
                 PYTHON_BIN,
+                '-u',
                 f'{WORKTREE}/scripts/colab/notebook_step.py',
                 'generate-configs',
                 '--worktree',
@@ -157,6 +159,7 @@ cells = [
         subprocess.run(
             [
                 PYTHON_BIN,
+                '-u',
                 f'{WORKTREE}/scripts/colab/notebook_step.py',
                 'audit-storage',
             ],
@@ -176,6 +179,7 @@ cells = [
         subprocess.run(
             [
                 PYTHON_BIN,
+                '-u',
                 f'{WORKTREE}/scripts/colab/notebook_step.py',
                 'streaming-pipeline',
                 '--worktree',
@@ -202,6 +206,7 @@ cells = [
         subprocess.run(
             [
                 PYTHON_BIN,
+                '-u',
                 f'{WORKTREE}/scripts/colab/notebook_step.py',
                 'run-job',
                 'train-eval-benchmark',

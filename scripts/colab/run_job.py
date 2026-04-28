@@ -20,7 +20,7 @@ _CONFIG_STEMS = {
 
 
 def _run_live(cmd: list[str], *, cwd: Path, env: dict[str, str], heartbeat_s: int = 30) -> None:
-    print("RUN:", cmd)
+    print("RUN:", cmd, flush=True)
     started = time.time()
     proc = subprocess.Popen(
         cmd,
@@ -34,13 +34,13 @@ def _run_live(cmd: list[str], *, cwd: Path, env: dict[str, str], heartbeat_s: in
     assert proc.stdout is not None
     last_hb = started
     for line in proc.stdout:
-        print(line.rstrip())
+        print(line.rstrip(), flush=True)
         now = time.time()
         if (now - last_hb) >= max(10, int(heartbeat_s)):
-            print(f"[heartbeat] elapsed={int(now-started)}s | process_running=True")
+            print(f"[heartbeat] elapsed={int(now-started)}s | process_running=True", flush=True)
             last_hb = now
     rc = proc.wait()
-    print(f"[exit] returncode={rc} | elapsed={int(time.time()-started)}s")
+    print(f"[exit] returncode={rc} | elapsed={int(time.time()-started)}s", flush=True)
     if rc != 0:
         raise RuntimeError(f"Commande en echec (rc={rc}): {cmd}")
 
@@ -69,9 +69,11 @@ def _run_single_command(
 
     env = dict(os.environ)
     env["PYTHONPATH"] = str(worktree / "src")
+    env["PYTHONUNBUFFERED"] = "1"
     _run_live(
         [
             python_bin,
+            "-u",
             "-m",
             "songo_model_stockfish.cli.main",
             command,
@@ -119,9 +121,10 @@ def _run_train_eval_benchmark(
 
     env = dict(os.environ)
     env["PYTHONPATH"] = str(worktree / "src")
+    env["PYTHONUNBUFFERED"] = "1"
 
     _run_live(
-        [python_bin, "-m", "songo_model_stockfish.cli.main", "train", "--config", str(train_cfg)],
+        [python_bin, "-u", "-m", "songo_model_stockfish.cli.main", "train", "--config", str(train_cfg)],
         cwd=worktree,
         env=env,
         heartbeat_s=int(heartbeat_seconds),
@@ -140,7 +143,7 @@ def _run_train_eval_benchmark(
     model_id = str(latest.get("model_id", "")).strip()
     if not model_id:
         raise RuntimeError("model_id vide dans le registre.")
-    print("model_id entrainé =", model_id)
+    print("model_id entrainé =", model_id, flush=True)
 
     eval_payload = yaml.safe_load(eval_cfg.read_text(encoding="utf-8")) or {}
     eval_payload.setdefault("evaluation", {})
@@ -149,7 +152,7 @@ def _run_train_eval_benchmark(
     eval_runtime.write_text(yaml.safe_dump(eval_payload, sort_keys=False), encoding="utf-8")
 
     _run_live(
-        [python_bin, "-m", "songo_model_stockfish.cli.main", "evaluate", "--config", str(eval_runtime)],
+        [python_bin, "-u", "-m", "songo_model_stockfish.cli.main", "evaluate", "--config", str(eval_runtime)],
         cwd=worktree,
         env=env,
         heartbeat_s=int(heartbeat_seconds),
@@ -162,7 +165,7 @@ def _run_train_eval_benchmark(
     bench_runtime.write_text(yaml.safe_dump(bench_payload, sort_keys=False), encoding="utf-8")
 
     _run_live(
-        [python_bin, "-m", "songo_model_stockfish.cli.main", "benchmark", "--config", str(bench_runtime)],
+        [python_bin, "-u", "-m", "songo_model_stockfish.cli.main", "benchmark", "--config", str(bench_runtime)],
         cwd=worktree,
         env=env,
         heartbeat_s=int(heartbeat_seconds),
@@ -175,13 +178,14 @@ def _run_train_eval_benchmark(
         else {}
     )
     if promoted_meta:
-        print("promoted_model_id =", promoted_meta.get("model_id", "<none>"))
+        print("promoted_model_id =", promoted_meta.get("model_id", "<none>"), flush=True)
         print(
             "promoted_checkpoint =",
             promoted_meta.get("promoted_checkpoint_path", "<none>"),
+            flush=True,
         )
     else:
-        print("Aucun metadata de promotion trouvé.")
+        print("Aucun metadata de promotion trouvé.", flush=True)
 
     return {
         "train_config": str(train_cfg),
