@@ -2,6 +2,15 @@ Scripts Colab pour separer proprement le code GitHub et les artefacts Drive.
 
 Fichiers principaux:
 
+- `bootstrap_workspace.py`
+  Bootstrap Python centralise pour Colab: detection identite, layout workspace Drive, clone/pull du repo et installation des dependances.
+
+- `generate_active_configs.py`
+  Genere les configs actives (`dataset_generation`, `dataset_build`, `train`, `evaluation`, `benchmark`) pour une identite de workspace (`colab_1`, `colab_2`, ...).
+
+- `run_job.py`
+  Runner live (heartbeat + logs stream) pour lancer `dataset-generate`, `dataset-build`, `train`, `evaluate`, `benchmark`, ou la pipeline `train-eval-benchmark`.
+
 - `init_drive_layout.sh`
   Prepare l'arborescence Drive persistante pour `data/`, `jobs/`, `models/`, `reports/` et `logs/`.
 
