@@ -210,15 +210,25 @@ cells = [
         dgen = gen['dataset_generation']
         dgen['generation_mode'] = 'benchmatch'
         dgen['dataset_source_id'] = BASE_SOURCE_ID
-        dgen['raw_dir'] = f'{WORKSPACE_REL}/data/raw/{BASE_SOURCE_ID}'
-        dgen['sampled_dir'] = f'{WORKSPACE_REL}/data/sampled/{BASE_SOURCE_ID}'
+        dgen['output_raw_dir'] = f'{WORKSPACE_REL}/data/raw/{BASE_SOURCE_ID}'
+        dgen['output_sampled_dir'] = f'{WORKSPACE_REL}/data/sampled/{BASE_SOURCE_ID}'
         dgen['target_samples'] = TARGET_SAMPLES
-        dgen['games_per_matchup'] = GAMES_PER_MATCHUP
+        dgen['games'] = GAMES_PER_MATCHUP
         dgen['cycle_matchups_until_target'] = True
         dgen['max_matchup_cycles'] = 0
         dgen['matchups'] = [
-            'minimax:medium', 'minimax:hard', 'minimax:insane',
-            'mcts:medium', 'mcts:hard', 'mcts:insane',
+            'minimax:medium vs minimax:hard',
+            'minimax:hard vs minimax:medium',
+            'mcts:medium vs mcts:hard',
+            'mcts:hard vs mcts:medium',
+            'minimax:medium vs mcts:medium',
+            'minimax:medium vs mcts:hard',
+            'minimax:hard vs mcts:medium',
+            'minimax:hard vs mcts:hard',
+            'mcts:medium vs minimax:medium',
+            'mcts:medium vs minimax:hard',
+            'mcts:hard vs minimax:medium',
+            'mcts:hard vs minimax:hard',
         ]
         gen_active = generated / f'dataset_generation.{DRIVE_IDENTITY_KEY}.active.yaml'
         _save_yaml(gen_active, gen)
@@ -304,48 +314,34 @@ cells = [
         print(' -', bench_active)
         """
     ),
-    md("## 4) Purge datasets existants (optionnel, garde les modèles)"),
+    md("## 4) Audit stockage (aucune purge)"),
     code(
         """
-        import shutil
         from pathlib import Path
 
         DRIVE_ROOT = Path('/content/drive/MyDrive/songo-stockfish')
-        DRY_RUN = True  # Passe a False pour appliquer.
 
-        candidates = [
-            DRIVE_ROOT / 'data' / 'datasets',
-            DRIVE_ROOT / 'data' / 'raw',
-            DRIVE_ROOT / 'data' / 'sampled',
-            DRIVE_ROOT / 'data' / 'label_cache',
+        print('Aucun nettoyage automatique dans ce notebook (purge desactivee).')
+        print('Drive root =', DRIVE_ROOT)
+
+        if not DRIVE_ROOT.exists():
+            raise RuntimeError(f'Drive root introuvable: {DRIVE_ROOT}')
+
+        print('\\nContenu racine:')
+        for item in sorted(DRIVE_ROOT.iterdir(), key=lambda p: p.name):
+            typ = 'DIR ' if item.is_dir() else 'FILE'
+            print(f' - [{typ}] {item.name}')
+
+        print('\\nWorkspaces Colab detectes:')
+        workspaces = [
+            p for p in DRIVE_ROOT.iterdir()
+            if p.is_dir() and (p.name.startswith('colab_') or p.name == 'unknown_drive_identity')
         ]
-        # Datasets des workspaces utilisateurs.
-        for child in DRIVE_ROOT.iterdir():
-            if not child.is_dir():
-                continue
-            if child.name in {'models', 'reports', 'secrets'}:
-                continue
-            candidates.extend(
-                [
-                    child / 'data' / 'datasets',
-                    child / 'data' / 'raw',
-                    child / 'data' / 'sampled',
-                    child / 'data' / 'label_cache',
-                ]
-            )
-
-        removed = 0
-        for p in candidates:
-            if not p.exists():
-                continue
-            print('[candidate]', p)
-            if not DRY_RUN:
-                shutil.rmtree(p, ignore_errors=True)
-                removed += 1
-
-        print('DRY_RUN =', DRY_RUN)
-        if not DRY_RUN:
-            print('Suppression terminee. Dossiers supprimes =', removed)
+        if not workspaces:
+            print(' - aucun')
+        else:
+            for ws in sorted(workspaces, key=lambda p: p.name):
+                print(' -', ws)
         """
     ),
     md("## 5) Lancer la génération de dataset (long run, cumulatif)"),
@@ -353,20 +349,50 @@ cells = [
         """
         import os
         import subprocess
+        import time
         from pathlib import Path
 
         WORKTREE = Path('/content/songo-model-stockfish-for-google-collab')
         PYTHON_BIN = os.environ.get('PYTHON_BIN', 'python3')
         DRIVE_IDENTITY_KEY = os.environ.get('SONGO_DRIVE_IDENTITY_KEY', 'unknown_drive_identity')
         CFG = WORKTREE / 'config' / 'generated' / f'dataset_generation.{DRIVE_IDENTITY_KEY}.active.yaml'
+        HEARTBEAT_SECONDS = 30
 
-        cmd = [
-            PYTHON_BIN, '-m', 'songo_model_stockfish.cli.main',
-            'dataset-generate',
-            '--config', str(CFG),
-        ]
-        print('RUN:', cmd)
-        subprocess.run(cmd, cwd=str(WORKTREE), check=True)
+        def _run_live(cmd: list[str], *, cwd: Path, env: dict, heartbeat_s: int = 30) -> None:
+            print('RUN:', cmd)
+            started = time.time()
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(cwd),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                bufsize=1,
+            )
+            assert proc.stdout is not None
+            last_hb = started
+            for line in proc.stdout:
+                print(line.rstrip())
+                now = time.time()
+                if (now - last_hb) >= max(10, int(heartbeat_s)):
+                    print(f'[heartbeat] elapsed={int(now-started)}s | process_running=True')
+                    last_hb = now
+            rc = proc.wait()
+            print(f'[exit] returncode={rc} | elapsed={int(time.time()-started)}s')
+            if rc != 0:
+                raise RuntimeError(f'Commande en echec (rc={rc}): {cmd}')
+
+        if not CFG.exists():
+            raise FileNotFoundError(f'Config introuvable: {CFG}')
+        env = dict(os.environ)
+        env['PYTHONPATH'] = str(WORKTREE / 'src')
+        _run_live(
+            [PYTHON_BIN, '-m', 'songo_model_stockfish.cli.main', 'dataset-generate', '--config', str(CFG)],
+            cwd=WORKTREE,
+            env=env,
+            heartbeat_s=HEARTBEAT_SECONDS,
+        )
         """
     ),
     md("## 6) Lancer le build dataset (long run, cumulatif)"),
@@ -374,20 +400,50 @@ cells = [
         """
         import os
         import subprocess
+        import time
         from pathlib import Path
 
         WORKTREE = Path('/content/songo-model-stockfish-for-google-collab')
         PYTHON_BIN = os.environ.get('PYTHON_BIN', 'python3')
         DRIVE_IDENTITY_KEY = os.environ.get('SONGO_DRIVE_IDENTITY_KEY', 'unknown_drive_identity')
         CFG = WORKTREE / 'config' / 'generated' / f'dataset_build.{DRIVE_IDENTITY_KEY}.active.yaml'
+        HEARTBEAT_SECONDS = 30
 
-        cmd = [
-            PYTHON_BIN, '-m', 'songo_model_stockfish.cli.main',
-            'dataset-build',
-            '--config', str(CFG),
-        ]
-        print('RUN:', cmd)
-        subprocess.run(cmd, cwd=str(WORKTREE), check=True)
+        def _run_live(cmd: list[str], *, cwd: Path, env: dict, heartbeat_s: int = 30) -> None:
+            print('RUN:', cmd)
+            started = time.time()
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(cwd),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                bufsize=1,
+            )
+            assert proc.stdout is not None
+            last_hb = started
+            for line in proc.stdout:
+                print(line.rstrip())
+                now = time.time()
+                if (now - last_hb) >= max(10, int(heartbeat_s)):
+                    print(f'[heartbeat] elapsed={int(now-started)}s | process_running=True')
+                    last_hb = now
+            rc = proc.wait()
+            print(f'[exit] returncode={rc} | elapsed={int(time.time()-started)}s')
+            if rc != 0:
+                raise RuntimeError(f'Commande en echec (rc={rc}): {cmd}')
+
+        if not CFG.exists():
+            raise FileNotFoundError(f'Config introuvable: {CFG}')
+        env = dict(os.environ)
+        env['PYTHONPATH'] = str(WORKTREE / 'src')
+        _run_live(
+            [PYTHON_BIN, '-m', 'songo_model_stockfish.cli.main', 'dataset-build', '--config', str(CFG)],
+            cwd=WORKTREE,
+            env=env,
+            heartbeat_s=HEARTBEAT_SECONDS,
+        )
         """
     ),
     md("## 7) Train -> Eval -> Benchmark (promotion globale incluse)"),
@@ -397,6 +453,7 @@ cells = [
         import json
         import yaml
         import subprocess
+        import time
         from pathlib import Path
 
         WORKTREE = Path('/content/songo-model-stockfish-for-google-collab')
@@ -407,9 +464,34 @@ cells = [
         EVAL_CFG = WORKTREE / 'config' / 'generated' / f'evaluation.{DRIVE_IDENTITY_KEY}.active.yaml'
         BENCH_CFG = WORKTREE / 'config' / 'generated' / f'benchmark.{DRIVE_IDENTITY_KEY}.active.yaml'
 
+        HEARTBEAT_SECONDS = 30
+
         def _run(cmd):
             print('RUN:', cmd)
-            subprocess.run(cmd, cwd=str(WORKTREE), check=True)
+            env = dict(os.environ)
+            env['PYTHONPATH'] = str(WORKTREE / 'src')
+            started = time.time()
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(WORKTREE),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                bufsize=1,
+            )
+            assert proc.stdout is not None
+            last_hb = started
+            for line in proc.stdout:
+                print(line.rstrip())
+                now = time.time()
+                if (now - last_hb) >= max(10, int(HEARTBEAT_SECONDS)):
+                    print(f'[heartbeat] elapsed={int(now-started)}s | process_running=True')
+                    last_hb = now
+            rc = proc.wait()
+            print(f'[exit] returncode={rc} | elapsed={int(time.time()-started)}s')
+            if rc != 0:
+                raise RuntimeError(f'Commande en echec (rc={rc}): {cmd}')
 
         # 1) Train
         _run([PYTHON_BIN, '-m', 'songo_model_stockfish.cli.main', 'train', '--config', str(TRAIN_CFG)])
