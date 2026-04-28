@@ -173,25 +173,61 @@ cells = [
         import os
         import subprocess
         import sys
+        import time
+        from pathlib import Path
 
         WORKTREE = os.environ.get('SONGO_WORKTREE', '/content/songo-model-stockfish-for-google-collab')
         PYTHON_BIN = os.environ.get('SONGO_PYTHON_BIN', (sys.executable or 'python3'))
-        subprocess.run(
-            [
-                PYTHON_BIN,
-                '-u',
-                f'{WORKTREE}/scripts/colab/notebook_step.py',
-                'streaming-pipeline',
-                '--worktree',
-                WORKTREE,
-                '--disable-auto-train',
-                '--heartbeat-seconds',
-                '30',
-                '--poll-seconds',
-                '20',
-            ],
-            check=True,
-        )
+        LOG_PATH = Path('/content/songo_streaming_pipeline.log')
+        cmd = [
+            PYTHON_BIN,
+            '-u',
+            f'{WORKTREE}/scripts/colab/notebook_step.py',
+            'streaming-pipeline',
+            '--worktree',
+            WORKTREE,
+            '--disable-auto-train',
+            '--heartbeat-seconds',
+            '30',
+            '--poll-seconds',
+            '20',
+        ]
+
+        print('Streaming pipeline log file =', LOG_PATH)
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        existing_size = LOG_PATH.stat().st_size if LOG_PATH.exists() else 0
+        with LOG_PATH.open('a', encoding='utf-8', buffering=1) as log_file:
+            log_file.write('\\n=== START streaming-pipeline ===\\n')
+            log_file.flush()
+            proc = subprocess.Popen(
+                cmd,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env={**os.environ, 'PYTHONUNBUFFERED': '1'},
+            )
+
+        cursor = existing_size
+        while True:
+            if LOG_PATH.exists():
+                with LOG_PATH.open('r', encoding='utf-8', errors='replace') as reader:
+                    reader.seek(cursor)
+                    chunk = reader.read()
+                    if chunk:
+                        print(chunk, end='')
+                    cursor = reader.tell()
+            rc = proc.poll()
+            if rc is not None:
+                if LOG_PATH.exists():
+                    with LOG_PATH.open('r', encoding='utf-8', errors='replace') as reader:
+                        reader.seek(cursor)
+                        tail = reader.read()
+                        if tail:
+                            print(tail, end='')
+                if rc != 0:
+                    raise subprocess.CalledProcessError(rc, cmd)
+                break
+            time.sleep(2.0)
         """
     ),
     md("## 6) Train -> Eval -> Benchmark (manuel)"),
@@ -200,23 +236,59 @@ cells = [
         import os
         import subprocess
         import sys
+        import time
+        from pathlib import Path
 
         WORKTREE = os.environ.get('SONGO_WORKTREE', '/content/songo-model-stockfish-for-google-collab')
         PYTHON_BIN = os.environ.get('SONGO_PYTHON_BIN', (sys.executable or 'python3'))
-        subprocess.run(
-            [
-                PYTHON_BIN,
-                '-u',
-                f'{WORKTREE}/scripts/colab/notebook_step.py',
-                'run-job',
-                'train-eval-benchmark',
-                '--worktree',
-                WORKTREE,
-                '--heartbeat-seconds',
-                '30',
-            ],
-            check=True,
-        )
+        LOG_PATH = Path('/content/songo_train_eval_benchmark.log')
+        cmd = [
+            PYTHON_BIN,
+            '-u',
+            f'{WORKTREE}/scripts/colab/notebook_step.py',
+            'run-job',
+            'train-eval-benchmark',
+            '--worktree',
+            WORKTREE,
+            '--heartbeat-seconds',
+            '30',
+        ]
+
+        print('Train/Eval/Benchmark log file =', LOG_PATH)
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        existing_size = LOG_PATH.stat().st_size if LOG_PATH.exists() else 0
+        with LOG_PATH.open('a', encoding='utf-8', buffering=1) as log_file:
+            log_file.write('\\n=== START train-eval-benchmark ===\\n')
+            log_file.flush()
+            proc = subprocess.Popen(
+                cmd,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env={**os.environ, 'PYTHONUNBUFFERED': '1'},
+            )
+
+        cursor = existing_size
+        while True:
+            if LOG_PATH.exists():
+                with LOG_PATH.open('r', encoding='utf-8', errors='replace') as reader:
+                    reader.seek(cursor)
+                    chunk = reader.read()
+                    if chunk:
+                        print(chunk, end='')
+                    cursor = reader.tell()
+            rc = proc.poll()
+            if rc is not None:
+                if LOG_PATH.exists():
+                    with LOG_PATH.open('r', encoding='utf-8', errors='replace') as reader:
+                        reader.seek(cursor)
+                        tail = reader.read()
+                        if tail:
+                            print(tail, end='')
+                if rc != 0:
+                    raise subprocess.CalledProcessError(rc, cmd)
+                break
+            time.sleep(2.0)
         """
     ),
 ]
