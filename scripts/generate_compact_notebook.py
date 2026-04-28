@@ -39,6 +39,7 @@ cells = [
         4. Audit stockage (aucune purge)
         5. Lancer le pipeline continu dataset (generate + build, sans auto-train)
         6. Déclencher train/eval/benchmark manuellement
+        7. Lancer un tournoi live entre tous les modèles (optionnel)
         """
     ),
     md("## 1) Monter Drive"),
@@ -259,6 +260,68 @@ cells = [
         existing_size = LOG_PATH.stat().st_size if LOG_PATH.exists() else 0
         with LOG_PATH.open('a', encoding='utf-8', buffering=1) as log_file:
             log_file.write('\\n=== START train-eval-benchmark ===\\n')
+            log_file.flush()
+            proc = subprocess.Popen(
+                cmd,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env={**os.environ, 'PYTHONUNBUFFERED': '1'},
+            )
+
+        cursor = existing_size
+        while True:
+            if LOG_PATH.exists():
+                with LOG_PATH.open('r', encoding='utf-8', errors='replace') as reader:
+                    reader.seek(cursor)
+                    chunk = reader.read()
+                    if chunk:
+                        print(chunk, end='')
+                    cursor = reader.tell()
+            rc = proc.poll()
+            if rc is not None:
+                if LOG_PATH.exists():
+                    with LOG_PATH.open('r', encoding='utf-8', errors='replace') as reader:
+                        reader.seek(cursor)
+                        tail = reader.read()
+                        if tail:
+                            print(tail, end='')
+                if rc != 0:
+                    raise subprocess.CalledProcessError(rc, cmd)
+                break
+            time.sleep(2.0)
+        """
+    ),
+    md("## 7) Tournoi des modèles (10 matchs par paire, live)"),
+    code(
+        """
+        import os
+        import subprocess
+        import sys
+        import time
+        from pathlib import Path
+
+        WORKTREE = os.environ.get('SONGO_WORKTREE', '/content/songo-model-stockfish-for-google-collab')
+        PYTHON_BIN = os.environ.get('SONGO_PYTHON_BIN', (sys.executable or 'python3'))
+        LOG_PATH = Path('/content/songo_model_tournament.log')
+        cmd = [
+            PYTHON_BIN,
+            '-u',
+            f'{WORKTREE}/scripts/colab/notebook_step.py',
+            'model-tournament',
+            '--worktree',
+            WORKTREE,
+            '--games-per-pair',
+            '10',
+            '--max-moves',
+            '400',
+        ]
+
+        print('Model tournament log file =', LOG_PATH)
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        existing_size = LOG_PATH.stat().st_size if LOG_PATH.exists() else 0
+        with LOG_PATH.open('a', encoding='utf-8', buffering=1) as log_file:
+            log_file.write('\\n=== START model-tournament ===\\n')
             log_file.flush()
             proc = subprocess.Popen(
                 cmd,

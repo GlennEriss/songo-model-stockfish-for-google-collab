@@ -244,6 +244,10 @@ Flux notebook compact actuel:
   - `notebook_step.py run-job train-eval-benchmark`
   - logs live: `/content/songo_train_eval_benchmark.log`
   - preflight train: dataset resolu, taille dataset, split train/val/test, epochs, batch size
+- cellule 7 (optionnelle):
+  - `notebook_step.py model-tournament --games-per-pair 10`
+  - logs live: `/content/songo_model_tournament.log`
+  - round-robin tous modeles, score 3/1/0, classement live
 
 Scripts utiles:
 

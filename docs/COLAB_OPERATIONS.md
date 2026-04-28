@@ -136,7 +136,10 @@ Important:
    - `notebook_step.py run-job train-eval-benchmark`
 9. monitorer les logs live train/eval/benchmark:
    - `/content/songo_train_eval_benchmark.log`
-10. reprendre si la session tombe
+10. lancer si besoin un tournoi modeles:
+   - `notebook_step.py model-tournament --games-per-pair 10`
+   - logs live: `/content/songo_model_tournament.log`
+11. reprendre si la session tombe
 
 ## 6.1 Workflow par bloc matchup (recommande)
 
@@ -189,6 +192,8 @@ Notebook principal actuel:
   - cellule 6: `run-job train-eval-benchmark` (declenchement manuel)
   - cellule 6: logs live fichier `/content/songo_train_eval_benchmark.log`
   - cellule 6: preflight train visible (dataset, taille, split, epochs, batch size)
+  - cellule 7 (optionnelle): `model-tournament --games-per-pair 10`
+  - cellule 7: logs live fichier `/content/songo_model_tournament.log`
 
 ## 10. Commandes Git a standardiser
 

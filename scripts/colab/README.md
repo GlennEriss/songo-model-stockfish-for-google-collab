@@ -18,6 +18,9 @@ Fichiers principaux:
   Orchestrateur continu: lance `dataset-generate` et `dataset-build` en parallele.
   Option `--disable-auto-train` pour laisser le declenchement `train-eval-benchmark` en manuel.
 
+- `run_model_tournament.py`
+  Lance un tournoi round-robin entre tous les modeles du registre (`model_registry.json`) avec score 3/1/0, logs live par partie et export JSON detaille.
+
 - `init_drive_layout.sh`
   Prepare l'arborescence Drive persistante pour `data/`, `jobs/`, `models/`, `reports/` et `logs/`.
 
@@ -49,6 +52,7 @@ Workflow notebook compact actuel (`notebooks/colab_compact.ipynb`):
    - `dataset-generate` + `dataset-build` en parallele
    - auto-train desactive via `--disable-auto-train`
 6. lancer train/eval/benchmark manuellement (`notebook_step.py run-job train-eval-benchmark`)
+7. lancer le tournoi modeles (`notebook_step.py model-tournament`)
 
 Logs live notebook:
 
@@ -57,6 +61,9 @@ Logs live notebook:
   - affichage live par lecture continue du fichier (tail)
 - cellule 6:
   - fichier: `/content/songo_train_eval_benchmark.log`
+  - affichage live par lecture continue du fichier (tail)
+- cellule 7:
+  - fichier: `/content/songo_model_tournament.log`
   - affichage live par lecture continue du fichier (tail)
 
 Detail utile pour cellule 6:

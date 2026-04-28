@@ -159,6 +159,30 @@ def main() -> int:
     streaming.add_argument("--summary-path", default="")
     streaming.add_argument("--print-json", action="store_true")
 
+    tournament = subparsers.add_parser("model-tournament")
+    tournament.add_argument("--worktree", default="/content/songo-model-stockfish-for-google-collab")
+    tournament.add_argument(
+        "--drive-root",
+        default=(str(os.environ.get("SONGO_DRIVE_ROOT", "")).strip() or "/content/drive/MyDrive/songo-stockfish"),
+    )
+    tournament.add_argument(
+        "--identity",
+        default=(str(os.environ.get("SONGO_DRIVE_IDENTITY_KEY", "")).strip() or "unknown_drive_identity"),
+    )
+    tournament.add_argument("--games-per-pair", type=int, default=10)
+    tournament.add_argument("--max-moves", type=int, default=400)
+    tournament.add_argument("--max-models", type=int, default=0)
+    tournament.add_argument("--device", default="")
+    tournament.add_argument("--search-enabled", choices=["auto", "true", "false"], default="auto")
+    tournament.add_argument("--search-alpha-beta", choices=["auto", "true", "false"], default="auto")
+    tournament.add_argument("--search-depth", type=int, default=0)
+    tournament.add_argument("--search-top-k", type=int, default=0)
+    tournament.add_argument("--search-top-k-child", type=int, default=0)
+    tournament.add_argument("--search-policy-weight", type=float, default=None)
+    tournament.add_argument("--search-value-weight", type=float, default=None)
+    tournament.add_argument("--summary-path", default="")
+    tournament.add_argument("--print-json", action="store_true")
+
     args = parser.parse_args()
     step = str(args.step)
 
@@ -214,6 +238,28 @@ def main() -> int:
             skip_generate=bool(args.skip_generate),
             skip_build=bool(args.skip_build),
             state_path=(Path(str(args.state_path)) if str(args.state_path).strip() else None),
+        )
+        _write_summary(summary, str(args.summary_path), bool(args.print_json))
+        return 0
+
+    if step == "model-tournament":
+        from run_model_tournament import run_model_tournament
+
+        summary = run_model_tournament(
+            worktree=Path(str(args.worktree)),
+            drive_root=Path(str(args.drive_root)),
+            identity=str(args.identity),
+            games_per_pair=int(args.games_per_pair),
+            max_moves=int(args.max_moves),
+            max_models=int(args.max_models),
+            device=str(args.device),
+            search_enabled_choice=str(args.search_enabled),
+            search_alpha_beta_choice=str(args.search_alpha_beta),
+            search_depth=int(args.search_depth),
+            search_top_k=int(args.search_top_k),
+            search_top_k_child=int(args.search_top_k_child),
+            search_policy_weight=(None if args.search_policy_weight is None else float(args.search_policy_weight)),
+            search_value_weight=(None if args.search_value_weight is None else float(args.search_value_weight)),
         )
         _write_summary(summary, str(args.summary_path), bool(args.print_json))
         return 0

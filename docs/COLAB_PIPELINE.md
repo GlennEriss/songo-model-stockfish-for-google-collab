@@ -64,6 +64,10 @@ Il couvre:
   - lancement manuel `notebook_step.py run-job train-eval-benchmark`
   - logs live par fichier `/content/songo_train_eval_benchmark.log`
   - preflight train affiche (dataset resolu, taille, split, epochs, batch size)
+- cellule 7 (optionnelle):
+  - lancement `notebook_step.py model-tournament --games-per-pair 10`
+  - round-robin entre tous les modeles du registre (score 3/1/0)
+  - logs live par fichier `/content/songo_model_tournament.log`
 - reprise auto via `job_id` + checkpoints
 
 ## Point de cadrage important
