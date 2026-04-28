@@ -110,6 +110,8 @@ cells = [
             'SONGO_ENFORCE_DRIVE_ROOT_WRITES': '1',
             'SONGO_DRIVE_IDENTITY_KEY': DRIVE_IDENTITY_KEY,
             'SONGO_DRIVE_WORKSPACE_ROOT': str(DRIVE_WORKSPACE_ROOT),
+            'SONGO_WORKTREE': str(WORKTREE),
+            'SONGO_PYTHON_BIN': PYTHON_BIN,
         }
         for _k, _v in env_updates.items():
             os.environ[_k] = _v
@@ -124,19 +126,19 @@ cells = [
     md("## 3) Générer configs actives minimalistes"),
     code(
         """
+        import os
         import subprocess
         import sys
-        from pathlib import Path
 
-        WORKTREE = Path('/content/songo-model-stockfish-for-google-collab')
-        PYTHON_BIN = sys.executable or 'python3'
+        WORKTREE = os.environ.get('SONGO_WORKTREE', '/content/songo-model-stockfish-for-google-collab')
+        PYTHON_BIN = os.environ.get('SONGO_PYTHON_BIN', (sys.executable or 'python3'))
         subprocess.run(
             [
                 PYTHON_BIN,
-                str(WORKTREE / 'scripts' / 'colab' / 'notebook_step.py'),
+                f'{WORKTREE}/scripts/colab/notebook_step.py',
                 'generate-configs',
                 '--worktree',
-                str(WORKTREE),
+                WORKTREE,
             ],
             check=True,
         )
