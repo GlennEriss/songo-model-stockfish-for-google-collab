@@ -11,6 +11,9 @@ Fichiers principaux:
 - `run_job.py`
   Runner live (heartbeat + logs stream) pour lancer `dataset-generate`, `dataset-build`, `train`, `evaluate`, `benchmark`, ou la pipeline `train-eval-benchmark`.
 
+- `notebook_step.py`
+  Wrapper CLI pour cellules Colab compactes: `bootstrap`, `generate-configs`, `audit-storage`, `run-job`.
+
 - `init_drive_layout.sh`
   Prepare l'arborescence Drive persistante pour `data/`, `jobs/`, `models/`, `reports/` et `logs/`.
 

@@ -74,19 +74,27 @@ cells = [
                 shutil.rmtree(WORKTREE)
             subprocess.run(['git', 'clone', '--branch', GIT_BRANCH, GIT_REPO_URL, str(WORKTREE)], check=True)
 
-        bootstrap_script = WORKTREE / 'scripts' / 'colab' / 'bootstrap_workspace.py'
+        step_script = WORKTREE / 'scripts' / 'colab' / 'notebook_step.py'
         summary_path = Path('/tmp/songo_bootstrap_summary.json')
         subprocess.run(
             [
                 PYTHON_BIN,
-                str(bootstrap_script),
-                '--git-repo-url', GIT_REPO_URL,
-                '--git-branch', GIT_BRANCH,
-                '--worktree', str(WORKTREE),
-                '--drive-project-name', DRIVE_PROJECT_NAME,
-                '--colab-identity', COLAB_IDENTITY,
-                '--python-bin', PYTHON_BIN,
-                '--summary-path', str(summary_path),
+                str(step_script),
+                'bootstrap',
+                '--git-repo-url',
+                GIT_REPO_URL,
+                '--git-branch',
+                GIT_BRANCH,
+                '--worktree',
+                str(WORKTREE),
+                '--drive-project-name',
+                DRIVE_PROJECT_NAME,
+                '--colab-identity',
+                COLAB_IDENTITY,
+                '--python-bin',
+                PYTHON_BIN,
+                '--summary-path',
+                str(summary_path),
             ],
             check=True,
         )
@@ -97,10 +105,14 @@ cells = [
         DRIVE_WORKSPACE_ROOT = Path(summary['drive_workspace_root'])
 
         # Propagation kernel notebook pour les cellules suivantes.
-        os.environ['SONGO_DRIVE_ROOT'] = str(DRIVE_ROOT)
-        os.environ['SONGO_ENFORCE_DRIVE_ROOT_WRITES'] = '1'
-        os.environ['SONGO_DRIVE_IDENTITY_KEY'] = DRIVE_IDENTITY_KEY
-        os.environ['SONGO_DRIVE_WORKSPACE_ROOT'] = str(DRIVE_WORKSPACE_ROOT)
+        env_updates = {
+            'SONGO_DRIVE_ROOT': str(DRIVE_ROOT),
+            'SONGO_ENFORCE_DRIVE_ROOT_WRITES': '1',
+            'SONGO_DRIVE_IDENTITY_KEY': DRIVE_IDENTITY_KEY,
+            'SONGO_DRIVE_WORKSPACE_ROOT': str(DRIVE_WORKSPACE_ROOT),
+        }
+        for _k, _v in env_updates.items():
+            os.environ[_k] = _v
 
         print('DRIVE_ROOT           =', DRIVE_ROOT)
         print('COLAB_IDENTITY       =', COLAB_IDENTITY or '<auto>')
@@ -112,88 +124,62 @@ cells = [
     md("## 3) Générer configs actives minimalistes"),
     code(
         """
-        import json
-        import os
         import subprocess
         import sys
         from pathlib import Path
 
         WORKTREE = Path('/content/songo-model-stockfish-for-google-collab')
         PYTHON_BIN = sys.executable or 'python3'
-        DRIVE_ROOT = Path(os.environ.get('SONGO_DRIVE_ROOT', '/content/drive/MyDrive/songo-stockfish'))
-        DRIVE_IDENTITY_KEY = str(os.environ.get('SONGO_DRIVE_IDENTITY_KEY', '')).strip() or 'unknown_drive_identity'
-
-        script = WORKTREE / 'scripts' / 'colab' / 'generate_active_configs.py'
-        summary_path = Path('/tmp/songo_active_configs_summary.json')
         subprocess.run(
             [
                 PYTHON_BIN,
-                str(script),
-                '--worktree', str(WORKTREE),
-                '--drive-root', str(DRIVE_ROOT),
-                '--identity', DRIVE_IDENTITY_KEY,
-                '--summary-path', str(summary_path),
+                str(WORKTREE / 'scripts' / 'colab' / 'notebook_step.py'),
+                'generate-configs',
+                '--worktree',
+                str(WORKTREE),
             ],
             check=True,
         )
-
-        summary = json.loads(summary_path.read_text(encoding='utf-8'))
-        print('Configs actives:')
-        for _name, _path in summary.get('active_configs', {}).items():
-            print(' -', _path)
         """
     ),
     md("## 4) Audit stockage (aucune purge)"),
     code(
         """
-        from pathlib import Path
-        import os
-
-        DRIVE_ROOT = Path(os.environ.get('SONGO_DRIVE_ROOT', '/content/drive/MyDrive/songo-stockfish'))
-
-        print('Aucun nettoyage automatique dans ce notebook (purge desactivee).')
-        print('Drive root =', DRIVE_ROOT)
-
-        if not DRIVE_ROOT.exists():
-            raise RuntimeError(f'Drive root introuvable: {DRIVE_ROOT}')
-
-        print('\\nContenu racine:')
-        for item in sorted(DRIVE_ROOT.iterdir(), key=lambda p: p.name):
-            typ = 'DIR ' if item.is_dir() else 'FILE'
-            print(f' - [{typ}] {item.name}')
-
-        print('\\nWorkspaces Colab detectes:')
-        workspaces = [
-            p for p in DRIVE_ROOT.iterdir()
-            if p.is_dir() and (p.name.startswith('colab_') or p.name == 'unknown_drive_identity')
-        ]
-        if not workspaces:
-            print(' - aucun')
-        else:
-            for ws in sorted(workspaces, key=lambda p: p.name):
-                print(' -', ws)
-        """
-    ),
-    md("## 5) Lancer la génération de dataset (long run, cumulatif)"),
-    code(
-        """
-        import os
         import subprocess
         import sys
         from pathlib import Path
 
         WORKTREE = Path('/content/songo-model-stockfish-for-google-collab')
         PYTHON_BIN = sys.executable or 'python3'
-        DRIVE_IDENTITY_KEY = str(os.environ.get('SONGO_DRIVE_IDENTITY_KEY', '')).strip() or 'unknown_drive_identity'
-
         subprocess.run(
             [
                 PYTHON_BIN,
-                str(WORKTREE / 'scripts' / 'colab' / 'run_job.py'),
+                str(WORKTREE / 'scripts' / 'colab' / 'notebook_step.py'),
+                'audit-storage',
+            ],
+            check=True,
+        )
+        """
+    ),
+    md("## 5) Lancer la génération de dataset (long run, cumulatif)"),
+    code(
+        """
+        import subprocess
+        import sys
+        from pathlib import Path
+
+        WORKTREE = Path('/content/songo-model-stockfish-for-google-collab')
+        PYTHON_BIN = sys.executable or 'python3'
+        subprocess.run(
+            [
+                PYTHON_BIN,
+                str(WORKTREE / 'scripts' / 'colab' / 'notebook_step.py'),
+                'run-job',
                 'dataset-generate',
-                '--worktree', str(WORKTREE),
-                '--identity', DRIVE_IDENTITY_KEY,
-                '--heartbeat-seconds', '30',
+                '--worktree',
+                str(WORKTREE),
+                '--heartbeat-seconds',
+                '30',
             ],
             check=True,
         )
@@ -202,23 +188,22 @@ cells = [
     md("## 6) Lancer le build dataset (long run, cumulatif)"),
     code(
         """
-        import os
         import subprocess
         import sys
         from pathlib import Path
 
         WORKTREE = Path('/content/songo-model-stockfish-for-google-collab')
         PYTHON_BIN = sys.executable or 'python3'
-        DRIVE_IDENTITY_KEY = str(os.environ.get('SONGO_DRIVE_IDENTITY_KEY', '')).strip() or 'unknown_drive_identity'
-
         subprocess.run(
             [
                 PYTHON_BIN,
-                str(WORKTREE / 'scripts' / 'colab' / 'run_job.py'),
+                str(WORKTREE / 'scripts' / 'colab' / 'notebook_step.py'),
+                'run-job',
                 'dataset-build',
-                '--worktree', str(WORKTREE),
-                '--identity', DRIVE_IDENTITY_KEY,
-                '--heartbeat-seconds', '30',
+                '--worktree',
+                str(WORKTREE),
+                '--heartbeat-seconds',
+                '30',
             ],
             check=True,
         )
@@ -227,25 +212,22 @@ cells = [
     md("## 7) Train -> Eval -> Benchmark (promotion globale incluse)"),
     code(
         """
-        import os
         import subprocess
         import sys
         from pathlib import Path
 
         WORKTREE = Path('/content/songo-model-stockfish-for-google-collab')
         PYTHON_BIN = sys.executable or 'python3'
-        DRIVE_IDENTITY_KEY = str(os.environ.get('SONGO_DRIVE_IDENTITY_KEY', '')).strip() or 'unknown_drive_identity'
-        DRIVE_ROOT = Path(os.environ.get('SONGO_DRIVE_ROOT', '/content/drive/MyDrive/songo-stockfish'))
-
         subprocess.run(
             [
                 PYTHON_BIN,
-                str(WORKTREE / 'scripts' / 'colab' / 'run_job.py'),
+                str(WORKTREE / 'scripts' / 'colab' / 'notebook_step.py'),
+                'run-job',
                 'train-eval-benchmark',
-                '--worktree', str(WORKTREE),
-                '--identity', DRIVE_IDENTITY_KEY,
-                '--drive-root', str(DRIVE_ROOT),
-                '--heartbeat-seconds', '30',
+                '--worktree',
+                str(WORKTREE),
+                '--heartbeat-seconds',
+                '30',
             ],
             check=True,
         )
