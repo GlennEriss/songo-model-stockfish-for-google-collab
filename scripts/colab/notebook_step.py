@@ -9,6 +9,7 @@ from typing import Any
 
 from bootstrap_workspace import bootstrap_workspace
 from generate_active_configs import generate_active_configs
+from run_streaming_pipeline import run_streaming_pipeline
 from run_job import _run_single_command, _run_train_eval_benchmark
 
 
@@ -130,6 +131,34 @@ def main() -> int:
     run_job.add_argument("--summary-path", default="")
     run_job.add_argument("--print-json", action="store_true")
 
+    streaming = subparsers.add_parser("streaming-pipeline")
+    streaming.add_argument("--worktree", default="/content/songo-model-stockfish-for-google-collab")
+    streaming.add_argument(
+        "--identity",
+        default=(str(os.environ.get("SONGO_DRIVE_IDENTITY_KEY", "")).strip() or "unknown_drive_identity"),
+    )
+    streaming.add_argument("--python-bin", default=(sys.executable or os.environ.get("PYTHON_BIN", "python3")))
+    streaming.add_argument(
+        "--drive-root",
+        default=(str(os.environ.get("SONGO_DRIVE_ROOT", "")).strip() or "/content/drive/MyDrive/songo-stockfish"),
+    )
+    streaming.add_argument("--heartbeat-seconds", type=int, default=30)
+    streaming.add_argument("--poll-seconds", type=float, default=20.0)
+    streaming.add_argument("--train-min-samples", type=int, default=int(os.environ.get("SONGO_STREAM_TRAIN_MIN_SAMPLES", "50000")))
+    streaming.add_argument(
+        "--train-min-delta-samples",
+        type=int,
+        default=int(os.environ.get("SONGO_STREAM_TRAIN_MIN_DELTA_SAMPLES", "50000")),
+    )
+    streaming.add_argument("--max-train-runs", type=int, default=int(os.environ.get("SONGO_STREAM_MAX_TRAIN_RUNS", "0")))
+    streaming.add_argument("--disable-auto-train", action="store_true")
+    streaming.add_argument("--continue-on-train-error", action="store_true")
+    streaming.add_argument("--skip-generate", action="store_true")
+    streaming.add_argument("--skip-build", action="store_true")
+    streaming.add_argument("--state-path", default="")
+    streaming.add_argument("--summary-path", default="")
+    streaming.add_argument("--print-json", action="store_true")
+
     args = parser.parse_args()
     step = str(args.step)
 
@@ -166,6 +195,26 @@ def main() -> int:
 
     if step == "audit-storage":
         summary = _run_audit_storage(drive_root=Path(str(args.drive_root)))
+        _write_summary(summary, str(args.summary_path), bool(args.print_json))
+        return 0
+
+    if step == "streaming-pipeline":
+        summary = run_streaming_pipeline(
+            python_bin=str(args.python_bin),
+            worktree=Path(str(args.worktree)),
+            identity=str(args.identity),
+            drive_root=Path(str(args.drive_root)),
+            heartbeat_seconds=int(args.heartbeat_seconds),
+            poll_seconds=float(args.poll_seconds),
+            train_min_samples=int(args.train_min_samples),
+            train_min_delta_samples=int(args.train_min_delta_samples),
+            max_train_runs=int(args.max_train_runs),
+            disable_auto_train=bool(args.disable_auto_train),
+            continue_on_train_error=bool(args.continue_on_train_error),
+            skip_generate=bool(args.skip_generate),
+            skip_build=bool(args.skip_build),
+            state_path=(Path(str(args.state_path)) if str(args.state_path).strip() else None),
+        )
         _write_summary(summary, str(args.summary_path), bool(args.print_json))
         return 0
 

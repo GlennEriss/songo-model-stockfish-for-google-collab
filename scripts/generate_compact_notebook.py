@@ -36,8 +36,9 @@ cells = [
         1. Monter Drive
         2. Préparer / mettre à jour le projet (script centralisé)
         3. Générer configs actives par identité Colab (script centralisé)
-        4. Lancer dataset (génération + build)
-        5. Entraîner, évaluer, benchmarker, promotion globale
+        4. Audit stockage (aucune purge)
+        5. Lancer le pipeline continu dataset (generate + build, sans auto-train)
+        6. Déclencher train/eval/benchmark manuellement
         """
     ),
     md("## 1) Monter Drive"),
@@ -163,7 +164,7 @@ cells = [
         )
         """
     ),
-    md("## 5) Lancer la génération de dataset (long run, cumulatif)"),
+    md("## 5) Pipeline continu dataset (sans auto-train)"),
     code(
         """
         import os
@@ -176,42 +177,20 @@ cells = [
             [
                 PYTHON_BIN,
                 f'{WORKTREE}/scripts/colab/notebook_step.py',
-                'run-job',
-                'dataset-generate',
+                'streaming-pipeline',
                 '--worktree',
                 WORKTREE,
+                '--disable-auto-train',
                 '--heartbeat-seconds',
                 '30',
+                '--poll-seconds',
+                '20',
             ],
             check=True,
         )
         """
     ),
-    md("## 6) Lancer le build dataset (long run, cumulatif)"),
-    code(
-        """
-        import os
-        import subprocess
-        import sys
-
-        WORKTREE = os.environ.get('SONGO_WORKTREE', '/content/songo-model-stockfish-for-google-collab')
-        PYTHON_BIN = os.environ.get('SONGO_PYTHON_BIN', (sys.executable or 'python3'))
-        subprocess.run(
-            [
-                PYTHON_BIN,
-                f'{WORKTREE}/scripts/colab/notebook_step.py',
-                'run-job',
-                'dataset-build',
-                '--worktree',
-                WORKTREE,
-                '--heartbeat-seconds',
-                '30',
-            ],
-            check=True,
-        )
-        """
-    ),
-    md("## 7) Train -> Eval -> Benchmark (promotion globale incluse)"),
+    md("## 6) Train -> Eval -> Benchmark (manuel)"),
     code(
         """
         import os
