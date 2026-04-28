@@ -127,10 +127,16 @@ Important:
 3. installer les dependances
 4. definir `DRIVE_ROOT`, `RUNTIME_STATE_MODE`, `RUNTIME_LOCAL_ROOT` et `FIRESTORE_CREDENTIALS_PATH`
 5. activer Redis pour le temps reel + Firestore pour le durable
-6. lancer le pipeline (`dataset-generate` + `dataset-build`) avec `job_id` dedie worker
-7. activer le mode quota economique (`LOW_QUOTA_PROFILE=True`) en multi-Colab
-8. garder un seul notebook de monitoring live (Redis-first) pour eviter les lectures Firestore redondantes
-9. reprendre si la session tombe
+6. lancer le pipeline continu dataset:
+   - `notebook_step.py streaming-pipeline --disable-auto-train`
+   - execute `dataset-generate` + `dataset-build` en parallele
+7. monitorer les logs live en notebook:
+   - `/content/songo_streaming_pipeline.log`
+8. declencher manuellement train/eval/benchmark:
+   - `notebook_step.py run-job train-eval-benchmark`
+9. monitorer les logs live train/eval/benchmark:
+   - `/content/songo_train_eval_benchmark.log`
+10. reprendre si la session tombe
 
 ## 6.1 Workflow par bloc matchup (recommande)
 
@@ -178,11 +184,11 @@ Notebook principal actuel:
 - `notebooks/colab_compact.ipynb`
   - bootstrap runtime
   - generation des configs actives
-  - lancement parallele `dataset-generate` + `dataset-build`
-  - monitoring global Redis-first + Firestore snapshot
-  - health check workers actifs/inactifs
-  - train/eval configures sur dataset global prioritaire (sinon plus gros shard famille)
-  - benchmark modele avec recherche legere configurable (`model_search_enabled`, `model_search_top_k`)
+  - cellule 5: `streaming-pipeline --disable-auto-train` (generate + build en parallele)
+  - cellule 5: logs live fichier `/content/songo_streaming_pipeline.log`
+  - cellule 6: `run-job train-eval-benchmark` (declenchement manuel)
+  - cellule 6: logs live fichier `/content/songo_train_eval_benchmark.log`
+  - cellule 6: preflight train visible (dataset, taille, split, epochs, batch size)
 
 ## 10. Commandes Git a standardiser
 

@@ -38,3 +38,31 @@ Principe de base:
 - le code s'execute depuis `/content/songo-model-stockfish-for-google-collab`
 - les artefacts critiques vivent dans `/content/drive/MyDrive/songo-stockfish`
 - un `git pull` ne doit jamais supprimer datasets, checkpoints ou resumes de jobs
+
+Workflow notebook compact actuel (`notebooks/colab_compact.ipynb`):
+
+1. monter Drive
+2. bootstrap workspace (`notebook_step.py bootstrap`)
+3. generer les configs actives (`notebook_step.py generate-configs`)
+4. audit stockage (`notebook_step.py audit-storage`)
+5. lancer le pipeline continu dataset (`notebook_step.py streaming-pipeline`)
+   - `dataset-generate` + `dataset-build` en parallele
+   - auto-train desactive via `--disable-auto-train`
+6. lancer train/eval/benchmark manuellement (`notebook_step.py run-job train-eval-benchmark`)
+
+Logs live notebook:
+
+- cellule 5:
+  - fichier: `/content/songo_streaming_pipeline.log`
+  - affichage live par lecture continue du fichier (tail)
+- cellule 6:
+  - fichier: `/content/songo_train_eval_benchmark.log`
+  - affichage live par lecture continue du fichier (tail)
+
+Detail utile pour cellule 6:
+
+- le mode `train-eval-benchmark` affiche un preflight train avant lancement:
+  - dataset resolu
+  - taille (`labeled_samples`, `target_labeled_samples`, split train/val/test)
+  - mode de selection dataset
+  - epochs et batch size planifies

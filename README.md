@@ -215,7 +215,12 @@ Donc:
 Le projet contient maintenant une couche Colab dediee pour mettre a jour le code sans toucher aux artefacts persistants:
 
 - `notebooks/colab_compact.ipynb`
-  Notebook principal pour monter Drive, generer les configs actives, lancer `dataset-generate` + `dataset-build` en parallele, monitorer la progression globale, puis enchainer train/evaluation/benchmark.
+  Notebook principal pour:
+  - monter Drive
+  - generer les configs actives
+  - lancer un pipeline continu dataset (`dataset-generate` + `dataset-build`) sans auto-train
+  - declencher `train/evaluation/benchmark` manuellement
+  - suivre les logs live via fichiers de log affiches dans les cellules
 
 Important pour Colab:
 
@@ -229,6 +234,16 @@ Important pour Colab:
 - en multi-workers, activer `LOW_QUOTA_PROFILE=True` pour limiter les reads/writes Firestore
 - les configs actives train/eval privilegient le dataset global fusionne, puis fallback sur le plus gros shard de la famille
 - le benchmark modele utilise un profil de recherche fort (`model_search_profile=fort_plusplus`) configurable (`model_search_depth`, `model_search_top_k`, etc.)
+
+Flux notebook compact actuel:
+
+- cellule 5:
+  - `notebook_step.py streaming-pipeline --disable-auto-train`
+  - logs live: `/content/songo_streaming_pipeline.log`
+- cellule 6:
+  - `notebook_step.py run-job train-eval-benchmark`
+  - logs live: `/content/songo_train_eval_benchmark.log`
+  - preflight train: dataset resolu, taille dataset, split train/val/test, epochs, batch size
 
 Scripts utiles:
 
