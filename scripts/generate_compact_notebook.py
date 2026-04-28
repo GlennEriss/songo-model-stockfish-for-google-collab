@@ -214,20 +214,20 @@ cells = [
     md("## 7) Train -> Eval -> Benchmark (promotion globale incluse)"),
     code(
         """
+        import os
         import subprocess
         import sys
-        from pathlib import Path
 
-        WORKTREE = Path('/content/songo-model-stockfish-for-google-collab')
-        PYTHON_BIN = sys.executable or 'python3'
+        WORKTREE = os.environ.get('SONGO_WORKTREE', '/content/songo-model-stockfish-for-google-collab')
+        PYTHON_BIN = os.environ.get('SONGO_PYTHON_BIN', (sys.executable or 'python3'))
         subprocess.run(
             [
                 PYTHON_BIN,
-                str(WORKTREE / 'scripts' / 'colab' / 'notebook_step.py'),
+                f'{WORKTREE}/scripts/colab/notebook_step.py',
                 'run-job',
                 'train-eval-benchmark',
                 '--worktree',
-                str(WORKTREE),
+                WORKTREE,
                 '--heartbeat-seconds',
                 '30',
             ],
