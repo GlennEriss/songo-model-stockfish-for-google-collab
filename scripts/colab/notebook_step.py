@@ -200,6 +200,8 @@ def main() -> int:
     tournament.add_argument("--search-top-k-child", type=int, default=0)
     tournament.add_argument("--search-policy-weight", type=float, default=None)
     tournament.add_argument("--search-value-weight", type=float, default=None)
+    tournament.add_argument("--prune-last-model", dest="prune_last_model", action="store_true", default=True)
+    tournament.add_argument("--keep-last-model", dest="prune_last_model", action="store_false")
     tournament.add_argument("--summary-path", default="")
     tournament.add_argument("--print-json", action="store_true")
 
@@ -294,6 +296,7 @@ def main() -> int:
             search_top_k_child=int(args.search_top_k_child),
             search_policy_weight=(None if args.search_policy_weight is None else float(args.search_policy_weight)),
             search_value_weight=(None if args.search_value_weight is None else float(args.search_value_weight)),
+            prune_last_model=bool(args.prune_last_model),
         )
         _write_summary(summary, str(args.summary_path), bool(args.print_json))
         return 0

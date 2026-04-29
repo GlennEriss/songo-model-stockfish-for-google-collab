@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -116,6 +117,22 @@ def _resolve_checkpoint_path(checkpoint_raw: str, *, models_root: Path) -> Path:
     return models_root.parent / candidate
 
 
+def _path_within(path: Path, base: Path) -> bool:
+    try:
+        path.resolve().relative_to(base.resolve())
+        return True
+    except Exception:
+        pass
+    try:
+        path_text = os.path.normpath(str(Path(path).expanduser()))
+        base_text = os.path.normpath(str(Path(base).expanduser()))
+        if path_text == base_text:
+            return True
+        return path_text.startswith(base_text.rstrip(os.sep) + os.sep)
+    except Exception:
+        return False
+
+
 def _collect_models(*, models_root: Path, max_models: int) -> list[dict[str, Any]]:
     from songo_model_stockfish.ops.model_registry import load_registry
 
@@ -151,6 +168,114 @@ def _collect_models(*, models_root: Path, max_models: int) -> list[dict[str, Any
     if max_models > 0:
         normalized = normalized[-int(max_models) :]
     return normalized
+
+
+def _resolve_optional_path(path_text: str, *, models_root: Path) -> Path | None:
+    text = str(path_text or "").strip()
+    if not text:
+        return None
+    candidate = Path(text)
+    if candidate.is_absolute():
+        return candidate.resolve(strict=False)
+    return (models_root.parent / candidate).resolve(strict=False)
+
+
+def _prune_last_ranked_model(*, ranking: list[dict[str, Any]], models_root: Path) -> dict[str, Any]:
+    from songo_model_stockfish.ops.model_registry import load_registry, save_registry
+
+    summary: dict[str, Any] = {
+        "enabled": True,
+        "executed": False,
+        "removed_model_id": "",
+        "removed_rank": None,
+        "removed_points": None,
+        "deleted_paths": [],
+        "skipped_paths": [],
+        "errors": [],
+    }
+
+    if len(ranking) < 2:
+        summary["errors"] = ["prune skipped: moins de 2 modeles classes."]
+        return summary
+
+    worst = ranking[-1] if ranking else {}
+    removed_model_id = str(worst.get("model_id", "")).strip()
+    if not removed_model_id:
+        summary["errors"] = ["prune skipped: model_id du dernier classement vide."]
+        return summary
+
+    registry = load_registry(models_root)
+    models = list(registry.get("models", [])) if isinstance(registry, dict) else []
+
+    removed_record: dict[str, Any] | None = None
+    kept: list[dict[str, Any]] = []
+    for item in models:
+        if not isinstance(item, dict):
+            continue
+        model_id = str(item.get("model_id", "")).strip()
+        if model_id == removed_model_id and removed_record is None:
+            removed_record = dict(item)
+            continue
+        kept.append(dict(item))
+
+    if removed_record is None:
+        summary["errors"] = [f"prune skipped: modele {removed_model_id} introuvable dans model_registry."]
+        return summary
+
+    for idx, item in enumerate(kept, start=1):
+        item["rank"] = int(idx)
+    registry["models"] = kept
+    save_registry(models_root, registry)
+
+    candidate_paths: list[Path] = []
+    checkpoint_path = _resolve_optional_path(str(removed_record.get("checkpoint_path", "")), models_root=models_root)
+    model_card_path = _resolve_optional_path(str(removed_record.get("model_card_path", "")), models_root=models_root)
+    if checkpoint_path is not None:
+        candidate_paths.append(checkpoint_path)
+    if model_card_path is not None:
+        candidate_paths.append(model_card_path)
+    candidate_paths.append((models_root / "final" / f"{removed_model_id}.pt").resolve(strict=False))
+    candidate_paths.append((models_root / "final" / f"{removed_model_id}.model_card.json").resolve(strict=False))
+
+    dedup_paths: list[Path] = []
+    seen: set[str] = set()
+    for path in candidate_paths:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup_paths.append(path)
+
+    deleted_paths: list[str] = []
+    skipped_paths: list[str] = []
+    errors: list[str] = []
+    for path in dedup_paths:
+        if not path.exists():
+            continue
+        if not _path_within(path, models_root):
+            skipped_paths.append(f"{path} (hors models_root)")
+            continue
+        try:
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+            deleted_paths.append(str(path))
+        except Exception as exc:
+            errors.append(f"{path} ({exc})")
+
+    summary.update(
+        {
+            "executed": True,
+            "removed_model_id": removed_model_id,
+            "removed_rank": int(worst.get("rank", 0) or 0),
+            "removed_points": int(worst.get("points", 0) or 0),
+            "deleted_paths": deleted_paths,
+            "skipped_paths": skipped_paths,
+            "errors": errors,
+        }
+    )
+    return summary
 
 
 def _empty_model_stats(model_id: str) -> dict[str, Any]:
@@ -462,6 +587,7 @@ def run_model_tournament(
     search_top_k_child: int,
     search_policy_weight: float | None,
     search_value_weight: float | None,
+    prune_last_model: bool,
 ) -> dict[str, Any]:
     from songo_model_stockfish.benchmark.model_agent import ModelAgent
 
@@ -662,6 +788,18 @@ def run_model_tournament(
     ranking = _build_ranking(model_stats)
     ended = time.time()
     winner_model_id = str(ranking[0]["model_id"]) if ranking else ""
+    prune_summary = {
+        "enabled": bool(prune_last_model),
+        "executed": False,
+        "removed_model_id": "",
+        "removed_rank": None,
+        "removed_points": None,
+        "deleted_paths": [],
+        "skipped_paths": [],
+        "errors": [],
+    }
+    if bool(prune_last_model):
+        prune_summary = _prune_last_ranked_model(ranking=ranking, models_root=models_root)
 
     payload = {
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ended)),
@@ -675,6 +813,7 @@ def run_model_tournament(
         "auto_actions": {
             "winner_model_id": winner_model_id,
             "scoring": "win=3, draw=1, loss=0",
+            "prune_last_model": prune_summary,
         },
         "games": games_payload,
         "elapsed_seconds": float(ended - started),
@@ -693,11 +832,26 @@ def run_model_tournament(
     print("\n=== Tournoi termine ===", flush=True)
     _print_ranking_table(ranking)
     print("winner_model_id =", winner_model_id or "<none>", flush=True)
+    if bool(prune_last_model):
+        print(
+            "pruned_model_id =",
+            str(prune_summary.get("removed_model_id", "")).strip() or "<none>",
+            flush=True,
+        )
+        print(
+            "prune_deleted_files =",
+            len(list(prune_summary.get("deleted_paths", []))),
+            flush=True,
+        )
+        prune_errors = list(prune_summary.get("errors", []))
+        if prune_errors:
+            print("prune_errors =", prune_errors, flush=True)
     print("summary_path    =", summary_path, flush=True)
     print("latest_path     =", latest_path, flush=True)
 
     return {
         "winner_model_id": winner_model_id,
+        "prune_last_model": prune_summary,
         "summary_path": str(summary_path),
         "latest_path": str(latest_path),
         "total_games": int(total_games),
@@ -727,6 +881,8 @@ def main() -> int:
     parser.add_argument("--search-top-k-child", type=int, default=0)
     parser.add_argument("--search-policy-weight", type=float, default=None)
     parser.add_argument("--search-value-weight", type=float, default=None)
+    parser.add_argument("--prune-last-model", dest="prune_last_model", action="store_true", default=True)
+    parser.add_argument("--keep-last-model", dest="prune_last_model", action="store_false")
     parser.add_argument("--summary-path", default="")
     parser.add_argument("--print-json", action="store_true")
     args = parser.parse_args()
@@ -746,6 +902,7 @@ def main() -> int:
         search_top_k_child=int(args.search_top_k_child),
         search_policy_weight=(None if args.search_policy_weight is None else float(args.search_policy_weight)),
         search_value_weight=(None if args.search_value_weight is None else float(args.search_value_weight)),
+        prune_last_model=bool(args.prune_last_model),
     )
 
     if str(args.summary_path or "").strip():

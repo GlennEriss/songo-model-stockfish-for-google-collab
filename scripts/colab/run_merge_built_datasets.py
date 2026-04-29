@@ -266,6 +266,72 @@ def _patch_train_eval_active_configs(
     }
 
 
+def _format_bytes(num_bytes: int) -> str:
+    size = float(max(0, int(num_bytes)))
+    units = ["B", "KB", "MB", "GB", "TB"]
+    idx = 0
+    while size >= 1024.0 and idx < (len(units) - 1):
+        size /= 1024.0
+        idx += 1
+    return f"{size:.2f}{units[idx]}"
+
+
+def _compute_dataset_disk_bytes(output_dir: Path) -> int:
+    total = 0
+    for name in ("train.npz", "validation.npz", "test.npz", "dataset_metadata.json"):
+        path = output_dir / name
+        if path.exists() and path.is_file():
+            total += int(path.stat().st_size)
+    return total
+
+
+def _read_merged_dataset_stats(*, merged_dataset_id: str, merged_output_dir: Path, global_registry_path: Path) -> dict[str, Any]:
+    train_samples = 0
+    validation_samples = 0
+    test_samples = 0
+    labeled_samples = 0
+
+    metadata_path = merged_output_dir / "dataset_metadata.json"
+    metadata = _load_json(metadata_path, {})
+    if metadata:
+        splits = metadata.get("splits", {})
+        if isinstance(splits, dict):
+            train_samples = int(((splits.get("train", {}) or {}).get("samples", 0) or 0))
+            validation_samples = int(((splits.get("validation", {}) or {}).get("samples", 0) or 0))
+            test_samples = int(((splits.get("test", {}) or {}).get("samples", 0) or 0))
+        labeled_samples = int(metadata.get("labeled_samples", 0) or 0)
+
+    if labeled_samples <= 0:
+        registry = _load_json(global_registry_path, {"dataset_sources": [], "built_datasets": []})
+        built_entries = registry.get("built_datasets", [])
+        if isinstance(built_entries, list):
+            for entry in built_entries:
+                if not isinstance(entry, dict):
+                    continue
+                if str(entry.get("dataset_id", "")).strip() != str(merged_dataset_id).strip():
+                    continue
+                labeled_samples = int(entry.get("labeled_samples", 0) or 0)
+                splits = entry.get("splits", {})
+                if isinstance(splits, dict):
+                    train_samples = int(((splits.get("train", {}) or {}).get("samples", train_samples) or train_samples))
+                    validation_samples = int(((splits.get("validation", {}) or {}).get("samples", validation_samples) or validation_samples))
+                    test_samples = int(((splits.get("test", {}) or {}).get("samples", test_samples) or test_samples))
+                break
+
+    if labeled_samples <= 0:
+        labeled_samples = int(train_samples + validation_samples + test_samples)
+
+    disk_bytes = _compute_dataset_disk_bytes(merged_output_dir)
+    return {
+        "labeled_samples": int(labeled_samples),
+        "train_samples": int(train_samples),
+        "validation_samples": int(validation_samples),
+        "test_samples": int(test_samples),
+        "disk_bytes": int(disk_bytes),
+        "disk_human": _format_bytes(disk_bytes),
+    }
+
+
 def run_merge_built_datasets(
     *,
     python_bin: str,
@@ -286,9 +352,9 @@ def run_merge_built_datasets(
         drive_root=drive_root,
         source_dataset_id_prefix=str(source_dataset_id_prefix or "").strip(),
     )
-    if len(source_entries) < 2:
+    if len(source_entries) < 1:
         raise RuntimeError(
-            "Fusion impossible: au moins 2 datasets builds valides sont requis "
+            "Fusion impossible: aucun dataset build valide detecte "
             f"(trouves={len(source_entries)})."
         )
 
@@ -299,6 +365,12 @@ def run_merge_built_datasets(
         f"| dataset_count={len(source_dataset_ids)} | source_prefix={source_dataset_id_prefix}",
         flush=True,
     )
+    if len(source_dataset_ids) == 1:
+        print(
+            "merge-built-datasets info | un seul dataset source detecte: "
+            "une fusion finale mono-source sera generee pour garder un dataset cible unique.",
+            flush=True,
+        )
     for item in source_entries:
         print(
             " - "
@@ -367,6 +439,24 @@ def run_merge_built_datasets(
         heartbeat_s=int(heartbeat_seconds),
     )
 
+    merged_stats = _read_merged_dataset_stats(
+        merged_dataset_id=merged_dataset_id,
+        merged_output_dir=merged_output_dir,
+        global_registry_path=global_registry_path,
+    )
+    print(
+        "merged dataset size "
+        f"| dataset_id={merged_dataset_id} "
+        f"| labeled_samples={int(merged_stats.get('labeled_samples', 0))} "
+        f"| split_samples(train/val/test)="
+        f"{int(merged_stats.get('train_samples', 0))}/"
+        f"{int(merged_stats.get('validation_samples', 0))}/"
+        f"{int(merged_stats.get('test_samples', 0))} "
+        f"| disk={merged_stats.get('disk_human', '0B')} "
+        f"| output_dir={merged_output_dir}",
+        flush=True,
+    )
+
     patched = _patch_train_eval_active_configs(
         worktree=worktree,
         identity=identity_key,
@@ -382,6 +472,7 @@ def run_merge_built_datasets(
         "global_registry_path": str(global_registry_path),
         "merge_config_path": str(generated_cfg_path),
         "merged_output_dir": str(merged_output_dir),
+        "merged_dataset_stats": merged_stats,
         "patched_active_configs": patched,
     }
 
