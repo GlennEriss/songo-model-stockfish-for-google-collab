@@ -132,14 +132,19 @@ Important:
    - execute `dataset-generate` + `dataset-build` en parallele
 7. monitorer les logs live en notebook:
    - `/content/songo_streaming_pipeline.log`
-8. declencher manuellement train/eval/benchmark:
+8. fusionner les datasets builds `colab_*`:
+   - `notebook_step.py merge-built-datasets`
+   - dedupe `sample_ids` + ecrasement de la fusion precedente
+9. monitorer les logs live de fusion:
+   - `/content/songo_merge_built_datasets.log`
+10. declencher manuellement train/eval/benchmark:
    - `notebook_step.py run-job train-eval-benchmark`
-9. monitorer les logs live train/eval/benchmark:
+11. monitorer les logs live train/eval/benchmark:
    - `/content/songo_train_eval_benchmark.log`
-10. lancer si besoin un tournoi modeles:
+12. lancer si besoin un tournoi modeles:
    - `notebook_step.py model-tournament --games-per-pair 10`
    - logs live: `/content/songo_model_tournament.log`
-11. reprendre si la session tombe
+13. reprendre si la session tombe
 
 ## 6.1 Workflow par bloc matchup (recommande)
 
@@ -189,11 +194,13 @@ Notebook principal actuel:
   - generation des configs actives
   - cellule 5: `streaming-pipeline --disable-auto-train` (generate + build en parallele)
   - cellule 5: logs live fichier `/content/songo_streaming_pipeline.log`
-  - cellule 6: `run-job train-eval-benchmark` (declenchement manuel)
-  - cellule 6: logs live fichier `/content/songo_train_eval_benchmark.log`
-  - cellule 6: preflight train visible (dataset, taille, split, epochs, batch size)
-  - cellule 7 (optionnelle): `model-tournament --games-per-pair 10`
-  - cellule 7: logs live fichier `/content/songo_model_tournament.log`
+  - cellule 6: `merge-built-datasets` (fusion globale des builds colabs, dedupe, overwrite)
+  - cellule 6: logs live fichier `/content/songo_merge_built_datasets.log`
+  - cellule 7: `run-job train-eval-benchmark` (declenchement manuel)
+  - cellule 7: logs live fichier `/content/songo_train_eval_benchmark.log`
+  - cellule 7: preflight train visible (dataset, taille, split, epochs, batch size)
+  - cellule 8 (optionnelle): `model-tournament --games-per-pair 10`
+  - cellule 8: logs live fichier `/content/songo_model_tournament.log`
 
 ## 10. Commandes Git a standardiser
 

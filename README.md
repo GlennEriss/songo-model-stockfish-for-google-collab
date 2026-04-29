@@ -241,10 +241,15 @@ Flux notebook compact actuel:
   - `notebook_step.py streaming-pipeline --disable-auto-train`
   - logs live: `/content/songo_streaming_pipeline.log`
 - cellule 6:
+  - `notebook_step.py merge-built-datasets`
+  - fusion des datasets builds `colab_*` en dataset global unique (dedupe `sample_ids`)
+  - ecrasement de l'ancienne fusion
+  - logs live: `/content/songo_merge_built_datasets.log`
+- cellule 7:
   - `notebook_step.py run-job train-eval-benchmark`
   - logs live: `/content/songo_train_eval_benchmark.log`
   - preflight train: dataset resolu, taille dataset, split train/val/test, epochs, batch size
-- cellule 7 (optionnelle):
+- cellule 8 (optionnelle):
   - `notebook_step.py model-tournament --games-per-pair 10`
   - logs live: `/content/songo_model_tournament.log`
   - round-robin tous modeles, score 3/1/0, classement live

@@ -9,6 +9,7 @@ from typing import Any
 
 from bootstrap_workspace import bootstrap_workspace
 from generate_active_configs import generate_active_configs
+from run_merge_built_datasets import run_merge_built_datasets
 from run_streaming_pipeline import run_streaming_pipeline
 from run_job import _run_single_command, _run_train_eval_benchmark
 
@@ -159,6 +160,25 @@ def main() -> int:
     streaming.add_argument("--summary-path", default="")
     streaming.add_argument("--print-json", action="store_true")
 
+    merge_built = subparsers.add_parser("merge-built-datasets")
+    merge_built.add_argument("--worktree", default="/content/songo-model-stockfish-for-google-collab")
+    merge_built.add_argument(
+        "--drive-root",
+        default=(str(os.environ.get("SONGO_DRIVE_ROOT", "")).strip() or "/content/drive/MyDrive/songo-stockfish"),
+    )
+    merge_built.add_argument(
+        "--identity",
+        default=(str(os.environ.get("SONGO_DRIVE_IDENTITY_KEY", "")).strip() or "unknown_drive_identity"),
+    )
+    merge_built.add_argument("--python-bin", default=(sys.executable or os.environ.get("PYTHON_BIN", "python3")))
+    merge_built.add_argument("--merged-dataset-id", default="dataset_full_matrix_merged_all_colabs")
+    merge_built.add_argument("--source-dataset-id-prefix", default="dataset_full_matrix_colab_")
+    merge_built.add_argument("--dedupe-sample-ids", dest="dedupe_sample_ids", action="store_true", default=True)
+    merge_built.add_argument("--keep-duplicate-sample-ids", dest="dedupe_sample_ids", action="store_false")
+    merge_built.add_argument("--heartbeat-seconds", type=int, default=30)
+    merge_built.add_argument("--summary-path", default="")
+    merge_built.add_argument("--print-json", action="store_true")
+
     tournament = subparsers.add_parser("model-tournament")
     tournament.add_argument("--worktree", default="/content/songo-model-stockfish-for-google-collab")
     tournament.add_argument(
@@ -238,6 +258,20 @@ def main() -> int:
             skip_generate=bool(args.skip_generate),
             skip_build=bool(args.skip_build),
             state_path=(Path(str(args.state_path)) if str(args.state_path).strip() else None),
+        )
+        _write_summary(summary, str(args.summary_path), bool(args.print_json))
+        return 0
+
+    if step == "merge-built-datasets":
+        summary = run_merge_built_datasets(
+            python_bin=str(args.python_bin),
+            worktree=Path(str(args.worktree)),
+            drive_root=Path(str(args.drive_root)),
+            identity=str(args.identity),
+            merged_dataset_id=str(args.merged_dataset_id),
+            source_dataset_id_prefix=str(args.source_dataset_id_prefix),
+            dedupe_sample_ids=bool(args.dedupe_sample_ids),
+            heartbeat_seconds=int(args.heartbeat_seconds),
         )
         _write_summary(summary, str(args.summary_path), bool(args.print_json))
         return 0
