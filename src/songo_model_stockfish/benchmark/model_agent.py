@@ -101,35 +101,35 @@ class ModelAgent:
         )
 
     @staticmethod
-    def _terminal_value_for_side_to_move(state: Any) -> float:
+    def _terminal_value_for_root_player(state: Any, *, root_player: int) -> float:
         winner = songo_ai_game.winner(state)
         if winner is None:
             return 0.0
-        side_to_move = int(songo_ai_game.current_player(state))
-        return 1.0 if int(winner) == side_to_move else -1.0
+        return 1.0 if int(winner) == int(root_player) else -1.0
 
     @staticmethod
     def _rank_candidate_moves(legal_moves: list[int], policy_by_move: dict[int, float], *, top_k: int) -> list[int]:
         ranked = sorted(legal_moves, key=lambda m: float(policy_by_move.get(int(m), 0.0)), reverse=True)
         return ranked[: min(len(ranked), max(1, int(top_k)))]
 
-    def _child_value_from_root_pov(self, child_state: Any, *, root_player: int) -> float:
-        # Terminal fast-path: exact outcome from root player's perspective.
-        if songo_ai_game.is_terminal(child_state):
-            winner = songo_ai_game.winner(child_state)
-            if winner is None:
-                return 0.0
-            return 1.0 if int(winner) == int(root_player) else -1.0
+    @staticmethod
+    def _value_from_root_pov(
+        state_value: float,
+        *,
+        side_to_move: int,
+        root_player: int,
+    ) -> float:
+        # Network value is always predicted from side-to-move perspective.
+        if int(side_to_move) == int(root_player):
+            return float(state_value)
+        return -float(state_value)
 
-        _legal_moves, _policy_probs, child_value = self._infer_state(child_state)
-        # Value is learned from side-to-move perspective; after one ply it's opponent to move.
-        return -float(child_value)
-
-    def _negamax_search(
+    def _minimax_search(
         self,
         state: Any,
         *,
         depth_left: int,
+        root_player: int,
         alpha: float,
         beta: float,
         infer_cache: dict[tuple[Any, ...], tuple[list[int], dict[int, float], float]],
@@ -138,7 +138,7 @@ class ModelAgent:
         stats["nodes"] = int(stats.get("nodes", 0)) + 1
         if songo_ai_game.is_terminal(state):
             stats["terminal_nodes"] = int(stats.get("terminal_nodes", 0)) + 1
-            return self._terminal_value_for_side_to_move(state)
+            return self._terminal_value_for_root_player(state, root_player=int(root_player))
 
         signature = self._state_signature(state)
         cached = infer_cache.get(signature)
@@ -150,33 +150,66 @@ class ModelAgent:
         legal_moves, policy_by_move, state_value = cached
         if depth_left <= 0 or not legal_moves:
             stats["leaf_nodes"] = int(stats.get("leaf_nodes", 0)) + 1
-            return float(state_value)
+            side_to_move = int(songo_ai_game.current_player(state))
+            return self._value_from_root_pov(
+                float(state_value),
+                side_to_move=side_to_move,
+                root_player=int(root_player),
+            )
 
         candidate_moves = self._rank_candidate_moves(
             legal_moves,
             policy_by_move,
             top_k=self._search_top_k_child,
         )
-        best_score = float("-inf")
         use_alpha_beta = bool(self._search_alpha_beta)
+        side_to_move = int(songo_ai_game.current_player(state))
+        maximizing = int(side_to_move) == int(root_player)
         local_alpha = float(alpha)
         local_beta = float(beta)
+
+        if maximizing:
+            best_score = float("-inf")
+            for move in candidate_moves:
+                child_state = songo_ai_game.simulate_move(state, int(move))
+                child_score = self._minimax_search(
+                    child_state,
+                    depth_left=int(depth_left) - 1,
+                    root_player=int(root_player),
+                    alpha=local_alpha,
+                    beta=local_beta,
+                    infer_cache=infer_cache,
+                    stats=stats,
+                )
+                if child_score > best_score:
+                    best_score = float(child_score)
+                if not use_alpha_beta:
+                    continue
+                if child_score > local_alpha:
+                    local_alpha = float(child_score)
+                if local_alpha >= local_beta:
+                    stats["cutoffs"] = int(stats.get("cutoffs", 0)) + 1
+                    break
+            return float(best_score)
+
+        best_score = float("inf")
         for move in candidate_moves:
             child_state = songo_ai_game.simulate_move(state, int(move))
-            child_score = -self._negamax_search(
+            child_score = self._minimax_search(
                 child_state,
                 depth_left=int(depth_left) - 1,
-                alpha=-local_beta,
-                beta=-local_alpha,
+                root_player=int(root_player),
+                alpha=local_alpha,
+                beta=local_beta,
                 infer_cache=infer_cache,
                 stats=stats,
             )
-            if child_score > best_score:
+            if child_score < best_score:
                 best_score = float(child_score)
             if not use_alpha_beta:
                 continue
-            if child_score > local_alpha:
-                local_alpha = float(child_score)
+            if child_score < local_beta:
+                local_beta = float(child_score)
             if local_alpha >= local_beta:
                 stats["cutoffs"] = int(stats.get("cutoffs", 0)) + 1
                 break
@@ -205,11 +238,13 @@ class ModelAgent:
         best_search_value = float("-inf")
         search_stats = {"nodes": 0, "leaf_nodes": 0, "terminal_nodes": 0, "cache_hits": 0, "cutoffs": 0}
         depth_for_children = max(1, int(self._search_depth) - 1)
+        root_player = int(songo_ai_game.current_player(state))
         for move in candidate_moves:
             child_state = songo_ai_game.simulate_move(state, int(move))
-            child_value = -self._negamax_search(
+            child_value = self._minimax_search(
                 child_state,
                 depth_left=depth_for_children,
+                root_player=root_player,
                 alpha=float("-inf"),
                 beta=float("inf"),
                 infer_cache=infer_cache,
