@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -204,6 +206,65 @@ def _run_live(cmd: list[str], *, cwd: Path, env: dict[str, str], heartbeat_s: in
         raise RuntimeError(f"Commande en echec (rc={rc}): {cmd}")
 
 
+def _extract_return_code_from_exception(exc: Exception) -> int | None:
+    text = str(exc or "")
+    match = re.search(r"rc=(-?\d+)", text)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except Exception:
+        return None
+
+
+def _detect_colab_compute_mode() -> str:
+    override = str(os.environ.get("SONGO_COLAB_COMPUTE_MODE", "")).strip().lower()
+    if override in {"cpu", "tpu"}:
+        return override
+    tpu_addr = str(os.environ.get("COLAB_TPU_ADDR", "")).strip()
+    if tpu_addr:
+        return "tpu"
+    return "cpu"
+
+
+def _apply_benchmark_safe_mode(payload: dict[str, Any]) -> dict[str, Any]:
+    out = copy.deepcopy(payload)
+    out.setdefault("benchmark", {})
+    benchmark_cfg = dict(out.get("benchmark", {}) or {})
+    benchmark_cfg["parallel_enabled"] = False
+    benchmark_cfg["parallel_backend"] = "sequential"
+    benchmark_cfg["parallel_workers"] = 1
+    out["benchmark"] = benchmark_cfg
+    return out
+
+
+def _resolve_benchmark_cpu_worker_cap() -> int:
+    raw = str(os.environ.get("SONGO_BENCHMARK_CPU_WORKER_CAP", "2")).strip()
+    try:
+        value = int(raw)
+    except Exception:
+        value = 2
+    return max(1, value)
+
+
+def _apply_benchmark_compute_tuning(payload: dict[str, Any], *, compute_mode: str) -> dict[str, Any]:
+    out = copy.deepcopy(payload)
+    out.setdefault("benchmark", {})
+    benchmark_cfg = dict(out.get("benchmark", {}) or {})
+
+    if compute_mode == "cpu":
+        cap = _resolve_benchmark_cpu_worker_cap()
+        configured_workers = int(benchmark_cfg.get("parallel_workers", cap) or cap)
+        tuned_workers = max(1, min(configured_workers, cap))
+        benchmark_cfg["parallel_workers"] = tuned_workers
+        if tuned_workers <= 1:
+            benchmark_cfg["parallel_enabled"] = False
+            benchmark_cfg["parallel_backend"] = "sequential"
+
+    out["benchmark"] = benchmark_cfg
+    return out
+
+
 def _resolve_active_config_path(*, worktree: Path, identity: str, command: str) -> Path:
     stem = _CONFIG_STEMS[str(command)]
     return worktree / "config" / "generated" / f"{stem}.{identity}.active.yaml"
@@ -326,15 +387,62 @@ def _run_train_eval_benchmark(
     bench_payload = yaml.safe_load(bench_cfg.read_text(encoding="utf-8")) or {}
     bench_payload.setdefault("benchmark", {})
     bench_payload["benchmark"]["target"] = model_id
+    compute_mode = _detect_colab_compute_mode()
+    bench_payload = _apply_benchmark_compute_tuning(bench_payload, compute_mode=compute_mode)
     bench_runtime = bench_cfg.with_name(bench_cfg.stem + ".runtime.yaml")
     bench_runtime.write_text(yaml.safe_dump(bench_payload, sort_keys=False), encoding="utf-8")
 
-    _run_live(
-        [python_bin, "-u", "-m", "songo_model_stockfish.cli.main", "benchmark", "--config", str(bench_runtime)],
-        cwd=worktree,
-        env=env,
-        heartbeat_s=int(heartbeat_seconds),
+    runtime_bench_cfg = dict(bench_payload.get("benchmark", {}) or {})
+    print(
+        "benchmark runtime config | "
+        f"compute_mode={compute_mode} | "
+        f"parallel_enabled={runtime_bench_cfg.get('parallel_enabled', True)} | "
+        f"parallel_backend={runtime_bench_cfg.get('parallel_backend', 'thread')} | "
+        f"parallel_workers={runtime_bench_cfg.get('parallel_workers', '<auto>')}",
+        flush=True,
     )
+
+    benchmark_runtime_used = bench_runtime
+    benchmark_safe_fallback_used = False
+    benchmark_safe_fallback_reason = ""
+    benchmark_cmd = [python_bin, "-u", "-m", "songo_model_stockfish.cli.main", "benchmark", "--config", str(bench_runtime)]
+    try:
+        _run_live(
+            benchmark_cmd,
+            cwd=worktree,
+            env=env,
+            heartbeat_s=int(heartbeat_seconds),
+        )
+    except RuntimeError as exc:
+        rc = _extract_return_code_from_exception(exc)
+        # -9 and 137 are common SIGKILL exits on Colab (often OOM).
+        if rc not in {-9, 137}:
+            raise
+        benchmark_safe_fallback_used = True
+        benchmark_safe_fallback_reason = f"benchmark_primary_failed_rc_{rc}"
+        print(
+            "benchmark primary run killed; fallback safe-mode activated | "
+            f"rc={rc} | mode=sequential",
+            flush=True,
+        )
+        safe_payload = _apply_benchmark_safe_mode(bench_payload)
+        safe_runtime = bench_cfg.with_name(bench_cfg.stem + ".runtime.safe.yaml")
+        safe_runtime.write_text(yaml.safe_dump(safe_payload, sort_keys=False), encoding="utf-8")
+        safe_bench_cfg = dict(safe_payload.get("benchmark", {}) or {})
+        print(
+            "benchmark fallback config | "
+            f"parallel_enabled={safe_bench_cfg.get('parallel_enabled', False)} | "
+            f"parallel_backend={safe_bench_cfg.get('parallel_backend', 'sequential')} | "
+            f"parallel_workers={safe_bench_cfg.get('parallel_workers', 1)}",
+            flush=True,
+        )
+        _run_live(
+            [python_bin, "-u", "-m", "songo_model_stockfish.cli.main", "benchmark", "--config", str(safe_runtime)],
+            cwd=worktree,
+            env=env,
+            heartbeat_s=int(heartbeat_seconds),
+        )
+        benchmark_runtime_used = safe_runtime
 
     promoted_meta_path = drive_root / "models" / "promoted" / "best" / "metadata.json"
     promoted_meta = (
@@ -355,7 +463,9 @@ def _run_train_eval_benchmark(
     return {
         "train_config": str(train_cfg),
         "eval_runtime_config": str(eval_runtime),
-        "benchmark_runtime_config": str(bench_runtime),
+        "benchmark_runtime_config": str(benchmark_runtime_used),
+        "benchmark_safe_fallback_used": benchmark_safe_fallback_used,
+        "benchmark_safe_fallback_reason": benchmark_safe_fallback_reason,
         "model_id": model_id,
         "promoted_meta_path": str(promoted_meta_path),
     }

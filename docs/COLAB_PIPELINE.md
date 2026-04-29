@@ -59,20 +59,20 @@ Il couvre:
 - cellule 5:
   - lancement `notebook_step.py streaming-pipeline --disable-auto-train`
   - orchestration continue `dataset-generate` + `dataset-build` en parallele
-  - logs live par fichier `/content/songo_streaming_pipeline.log`
+  - logs live par fichier `${SONGO_DRIVE_WORKSPACE_ROOT}/logs/notebook/songo_streaming_pipeline.log`
 - cellule 6:
   - lancement `notebook_step.py merge-built-datasets`
   - fusion globale des datasets builds `colab_*`
   - dedupe des `sample_ids` et ecrasement de l'ancienne fusion
-  - logs live par fichier `/content/songo_merge_built_datasets.log`
+  - logs live par fichier `${SONGO_DRIVE_WORKSPACE_ROOT}/logs/notebook/songo_merge_built_datasets.log`
 - cellule 7:
   - lancement manuel `notebook_step.py run-job train-eval-benchmark`
-  - logs live par fichier `/content/songo_train_eval_benchmark.log`
+  - logs live par fichier `${SONGO_DRIVE_WORKSPACE_ROOT}/logs/notebook/songo_train_eval_benchmark.log`
   - preflight train affiche (dataset resolu, taille, split, epochs, batch size)
 - cellule 8 (optionnelle):
   - lancement `notebook_step.py model-tournament --games-per-pair 10`
   - round-robin entre tous les modeles du registre (score 3/1/0)
-  - logs live par fichier `/content/songo_model_tournament.log`
+  - logs live par fichier `${SONGO_DRIVE_WORKSPACE_ROOT}/logs/notebook/songo_model_tournament.log`
 - reprise auto via `job_id` + checkpoints
 
 ## Point de cadrage important

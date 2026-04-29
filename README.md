@@ -234,25 +234,30 @@ Important pour Colab:
 - en multi-workers, activer `LOW_QUOTA_PROFILE=True` pour limiter les reads/writes Firestore
 - les configs actives train/eval privilegient le dataset global fusionne, puis fallback sur le plus gros shard de la famille
 - le benchmark modele utilise un profil de recherche fort (`model_search_profile=fort_plusplus`) configurable (`model_search_depth`, `model_search_top_k`, etc.)
+- la recherche cote `ModelAgent` du profil `fort_plusplus` est en minimax explicite (avec alpha-beta optionnel)
 
 Flux notebook compact actuel:
 
 - cellule 5:
   - `notebook_step.py streaming-pipeline --disable-auto-train`
-  - logs live: `/content/songo_streaming_pipeline.log`
+  - logs live: `${SONGO_DRIVE_WORKSPACE_ROOT}/logs/notebook/songo_streaming_pipeline.log`
 - cellule 6:
   - `notebook_step.py merge-built-datasets`
   - fusion des datasets builds `colab_*` en dataset global unique (dedupe `sample_ids`)
   - ecrasement de l'ancienne fusion
-  - logs live: `/content/songo_merge_built_datasets.log`
+  - logs live: `${SONGO_DRIVE_WORKSPACE_ROOT}/logs/notebook/songo_merge_built_datasets.log`
 - cellule 7:
   - `notebook_step.py run-job train-eval-benchmark`
-  - logs live: `/content/songo_train_eval_benchmark.log`
+  - logs live: `${SONGO_DRIVE_WORKSPACE_ROOT}/logs/notebook/songo_train_eval_benchmark.log`
   - preflight train: dataset resolu, taille dataset, split train/val/test, epochs, batch size
 - cellule 8 (optionnelle):
   - `notebook_step.py model-tournament --games-per-pair 10`
-  - logs live: `/content/songo_model_tournament.log`
+  - logs live: `${SONGO_DRIVE_WORKSPACE_ROOT}/logs/notebook/songo_model_tournament.log`
   - round-robin tous modeles, score 3/1/0, classement live
+
+Note:
+
+- ancien chemin historique des logs notebook: `/content/songo_*.log` (ephemere runtime Colab)
 
 Scripts utiles:
 

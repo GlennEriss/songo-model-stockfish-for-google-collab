@@ -151,7 +151,7 @@ Inference benchmark actuelle cote modele:
 
 - profile `fort_plusplus` (seul profile supporte)
 - top-k racine + top-k enfant
-- negamax multi-ply + alpha-beta optionnel
+- minimax multi-ply + alpha-beta optionnel
 
 ## 8. Comment rendre le modele plus fort
 

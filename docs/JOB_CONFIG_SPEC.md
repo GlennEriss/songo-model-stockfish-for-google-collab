@@ -297,7 +297,7 @@ Champs benchmark model search:
 
 - `model_search_enabled`: active la recherche cote `ModelAgent` (desactivee => prior policy seule)
 - `model_search_profile`: profil de recherche. Valeur supportee: `fort_plusplus`
-- `model_search_depth`: profondeur de recherche negamax (plies)
+- `model_search_depth`: profondeur de recherche minimax (plies)
 - `model_search_top_k`: nombre de coups candidats explores a la racine (tries par prior policy)
 - `model_search_top_k_child`: largeur de branchement sur les noeuds internes
 - `model_search_alpha_beta`: active le pruning alpha-beta

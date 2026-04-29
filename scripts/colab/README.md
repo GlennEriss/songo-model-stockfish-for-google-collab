@@ -64,17 +64,21 @@ Workflow notebook compact actuel (`notebooks/colab_compact.ipynb`):
 Logs live notebook:
 
 - cellule 5:
-  - fichier: `/content/songo_streaming_pipeline.log`
+  - fichier: `${SONGO_DRIVE_WORKSPACE_ROOT}/logs/notebook/songo_streaming_pipeline.log`
   - affichage live par lecture continue du fichier (tail)
 - cellule 6:
-  - fichier: `/content/songo_merge_built_datasets.log`
+  - fichier: `${SONGO_DRIVE_WORKSPACE_ROOT}/logs/notebook/songo_merge_built_datasets.log`
   - affichage live par lecture continue du fichier (tail)
 - cellule 7:
-  - fichier: `/content/songo_train_eval_benchmark.log`
+  - fichier: `${SONGO_DRIVE_WORKSPACE_ROOT}/logs/notebook/songo_train_eval_benchmark.log`
   - affichage live par lecture continue du fichier (tail)
 - cellule 8:
-  - fichier: `/content/songo_model_tournament.log`
+  - fichier: `${SONGO_DRIVE_WORKSPACE_ROOT}/logs/notebook/songo_model_tournament.log`
   - affichage live par lecture continue du fichier (tail)
+
+Note:
+
+- ancien comportement (avant migration) : logs notebook sous `/content/songo_*.log` (ephemeres runtime Colab)
 
 Detail utile pour cellule 7:
 
