@@ -244,18 +244,48 @@ cells = [
         WORKTREE = os.environ.get('SONGO_WORKTREE', '/content/songo-model-stockfish-for-google-collab')
         PYTHON_BIN = os.environ.get('SONGO_PYTHON_BIN', (sys.executable or 'python3'))
         LOG_PATH = Path('/content/songo_merge_built_datasets.log')
-        cmd = [
-            PYTHON_BIN,
-            '-u',
-            f'{WORKTREE}/scripts/colab/notebook_step.py',
-            'merge-built-datasets',
-            '--worktree',
-            WORKTREE,
-            '--heartbeat-seconds',
-            '30',
-        ]
+        NOTEBOOK_STEP = f'{WORKTREE}/scripts/colab/notebook_step.py'
+        MERGE_SCRIPT = f'{WORKTREE}/scripts/colab/run_merge_built_datasets.py'
+
+        help_proc = subprocess.run(
+            [PYTHON_BIN, NOTEBOOK_STEP, '-h'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+        help_text = help_proc.stdout or ''
+        has_merge_subcommand = ('merge-built-datasets' in help_text)
+
+        if has_merge_subcommand:
+            cmd = [
+                PYTHON_BIN,
+                '-u',
+                NOTEBOOK_STEP,
+                'merge-built-datasets',
+                '--worktree',
+                WORKTREE,
+                '--heartbeat-seconds',
+                '30',
+            ]
+        elif Path(MERGE_SCRIPT).exists():
+            cmd = [
+                PYTHON_BIN,
+                '-u',
+                MERGE_SCRIPT,
+                '--worktree',
+                WORKTREE,
+                '--heartbeat-seconds',
+                '30',
+            ]
+        else:
+            raise RuntimeError(
+                'merge-built-datasets indisponible dans ce repo. '
+                'Mets le repo a jour (cellule 2) puis relance.'
+            )
 
         print('Merge built datasets log file =', LOG_PATH)
+        print('Command =', cmd)
         LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         existing_size = LOG_PATH.stat().st_size if LOG_PATH.exists() else 0
         with LOG_PATH.open('a', encoding='utf-8', buffering=1) as log_file:
