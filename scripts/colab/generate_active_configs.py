@@ -22,6 +22,64 @@ def _save_yaml(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
 
 
+def _safe_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def _detect_colab_compute_mode() -> str:
+    override = str(os.environ.get("SONGO_COLAB_COMPUTE_MODE", "")).strip().lower()
+    if override in {"cpu", "tpu"}:
+        return override
+    tpu_addr = str(os.environ.get("COLAB_TPU_ADDR", "")).strip()
+    if tpu_addr:
+        return "tpu"
+    return "cpu"
+
+
+def _cap_parallel_workers(cfg: dict[str, Any], *, cap: int) -> dict[str, Any]:
+    out = copy.deepcopy(cfg)
+    runtime_cfg = dict(out.get("runtime", {}) or {})
+    runtime_cfg["num_workers"] = max(1, min(_safe_int(runtime_cfg.get("num_workers", cap), cap), cap))
+    out["runtime"] = runtime_cfg
+
+    train_cfg = dict(out.get("train", {}) or {})
+    if train_cfg:
+        train_cfg["num_workers"] = max(1, min(_safe_int(train_cfg.get("num_workers", cap), cap), cap))
+        out["train"] = train_cfg
+
+    eval_cfg = dict(out.get("evaluation", {}) or {})
+    if eval_cfg:
+        eval_cfg["num_workers"] = max(1, min(_safe_int(eval_cfg.get("num_workers", cap), cap), cap))
+        out["evaluation"] = eval_cfg
+
+    gen_cfg = dict(out.get("dataset_generation", {}) or {})
+    if gen_cfg:
+        gen_cfg["max_pending_futures"] = max(
+            1,
+            min(_safe_int(gen_cfg.get("max_pending_futures", cap), cap), max(1, cap)),
+        )
+        out["dataset_generation"] = gen_cfg
+
+    build_cfg = dict(out.get("dataset_build", {}) or {})
+    if build_cfg:
+        build_cfg["num_workers"] = max(1, min(_safe_int(build_cfg.get("num_workers", cap), cap), cap))
+        build_cfg["max_pending_futures"] = max(
+            1,
+            min(_safe_int(build_cfg.get("max_pending_futures", cap * 2), cap * 2), max(1, cap * 2)),
+        )
+        out["dataset_build"] = build_cfg
+
+    bench_cfg = dict(out.get("benchmark", {}) or {})
+    if bench_cfg and ("parallel_workers" in bench_cfg):
+        bench_cfg["parallel_workers"] = max(1, min(_safe_int(bench_cfg.get("parallel_workers", cap), cap), cap))
+        out["benchmark"] = bench_cfg
+
+    return out
+
+
 def _inject_storage(cfg: dict[str, Any], *, drive_root: Path, workspace_rel: str) -> dict[str, Any]:
     out = copy.deepcopy(cfg)
     out.setdefault("storage", {})
@@ -50,6 +108,8 @@ def generate_active_configs(
 ) -> dict[str, Any]:
     drive_identity_key = str(identity or "").strip() or "unknown_drive_identity"
     workspace_rel = drive_identity_key
+    compute_mode = _detect_colab_compute_mode()
+    worker_cap = 4 if compute_mode == "cpu" else None
 
     base_source_id = f"sampled_full_matrix_{drive_identity_key}"
     base_dataset_id = f"dataset_full_matrix_{drive_identity_key}"
@@ -66,6 +126,8 @@ def generate_active_configs(
         drive_root=drive_root,
         workspace_rel=workspace_rel,
     )
+    if worker_cap is not None:
+        gen = _cap_parallel_workers(gen, cap=int(worker_cap))
     gen.setdefault("job", {})
     gen["job"]["resume"] = True
     gen["job"]["run_type"] = "dataset_generate"
@@ -102,6 +164,8 @@ def generate_active_configs(
         drive_root=drive_root,
         workspace_rel=workspace_rel,
     )
+    if worker_cap is not None:
+        build = _cap_parallel_workers(build, cap=int(worker_cap))
     build.setdefault("job", {})
     build["job"]["resume"] = True
     build["job"]["run_type"] = "dataset_build"
@@ -127,6 +191,8 @@ def generate_active_configs(
         drive_root=drive_root,
         workspace_rel=workspace_rel,
     )
+    if worker_cap is not None:
+        train = _cap_parallel_workers(train, cap=int(worker_cap))
     train.setdefault("job", {})
     train["job"]["run_type"] = "train"
     train["job"]["resume"] = True
@@ -148,6 +214,8 @@ def generate_active_configs(
         drive_root=drive_root,
         workspace_rel=workspace_rel,
     )
+    if worker_cap is not None:
+        eval_cfg = _cap_parallel_workers(eval_cfg, cap=int(worker_cap))
     eval_cfg.setdefault("job", {})
     eval_cfg["job"]["run_type"] = "evaluation"
     eval_cfg["job"]["resume"] = True
@@ -164,6 +232,8 @@ def generate_active_configs(
         drive_root=drive_root,
         workspace_rel=workspace_rel,
     )
+    if worker_cap is not None:
+        bench = _cap_parallel_workers(bench, cap=int(worker_cap))
     bench.setdefault("job", {})
     bench["job"]["run_type"] = "benchmark"
     bench["job"]["resume"] = True
@@ -185,6 +255,8 @@ def generate_active_configs(
     summary: dict[str, Any] = {
         "drive_identity_key": drive_identity_key,
         "workspace_rel": workspace_rel,
+        "compute_mode": compute_mode,
+        "worker_cap": int(worker_cap) if worker_cap is not None else None,
         "target_samples": int(target_samples),
         "target_labeled_samples": int(target_labeled_samples),
         "games_per_matchup": int(games_per_matchup),
@@ -203,6 +275,9 @@ def generate_active_configs(
     print(" -", summary["active_configs"]["train"])
     print(" -", summary["active_configs"]["evaluation"])
     print(" -", summary["active_configs"]["benchmark"])
+    print("Compute mode:", compute_mode)
+    if worker_cap is not None:
+        print("Parallel workers cap:", worker_cap)
     return summary
 
 

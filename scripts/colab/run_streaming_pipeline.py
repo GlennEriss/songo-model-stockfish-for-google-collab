@@ -54,30 +54,65 @@ def _resolve_storage_root(*, drive_root: Path, configured: Any, fallback_relativ
     return drive_root / rel_or_abs
 
 
-def _read_dataset_progress(*, registry_path: Path, dataset_id: str) -> dict[str, Any]:
+def _resolve_latest_dataset_build_state_path(*, jobs_root: Path, identity: str) -> Path | None:
+    prefix = f"dataset_build_{str(identity or '').strip() or 'unknown_drive_identity'}"
+    if not jobs_root.exists():
+        return None
+    candidates: list[Path] = []
+    try:
+        for job_dir in jobs_root.iterdir():
+            if not job_dir.is_dir():
+                continue
+            if not job_dir.name.startswith(prefix):
+                continue
+            state_path = job_dir / "state.json"
+            if state_path.exists():
+                candidates.append(state_path)
+    except Exception:
+        return None
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0.0, reverse=True)
+    return candidates[0]
+
+
+def _read_dataset_progress(*, registry_path: Path, dataset_id: str, fallback_state_path: Path | None = None) -> dict[str, Any]:
     registry = _read_json(registry_path, {"dataset_sources": [], "built_datasets": []})
     built_entries = registry.get("built_datasets", [])
     if not isinstance(built_entries, list):
         built_entries = []
-    for entry in built_entries:
-        if not isinstance(entry, dict):
-            continue
-        if str(entry.get("dataset_id", "")).strip() != dataset_id:
-            continue
-        return {
-            "dataset_id": dataset_id,
-            "labeled_samples": int(entry.get("labeled_samples", 0) or 0),
-            "target_labeled_samples": int(entry.get("target_labeled_samples", 0) or 0),
-            "build_status": str(entry.get("build_status", "")).strip().lower(),
-            "updated_at": str(entry.get("updated_at", "")).strip(),
-        }
-    return {
+    progress = {
         "dataset_id": dataset_id,
         "labeled_samples": 0,
         "target_labeled_samples": 0,
         "build_status": "",
         "updated_at": "",
     }
+    for entry in built_entries:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("dataset_id", "")).strip() != dataset_id:
+            continue
+        progress = {
+            "dataset_id": dataset_id,
+            "labeled_samples": int(entry.get("labeled_samples", 0) or 0),
+            "target_labeled_samples": int(entry.get("target_labeled_samples", 0) or 0),
+            "build_status": str(entry.get("build_status", "")).strip().lower(),
+            "updated_at": str(entry.get("updated_at", "")).strip(),
+        }
+        break
+
+    if fallback_state_path is not None and fallback_state_path.exists():
+        state_payload = _read_json(fallback_state_path, {})
+        state_labeled = int(state_payload.get("labeled_samples", 0) or 0)
+        state_target = int(state_payload.get("target_labeled_samples", 0) or 0)
+        if state_labeled > int(progress.get("labeled_samples", 0) or 0):
+            progress["labeled_samples"] = state_labeled
+        if state_target > int(progress.get("target_labeled_samples", 0) or 0):
+            progress["target_labeled_samples"] = state_target
+        if (not str(progress.get("build_status", "")).strip()) and state_labeled > 0:
+            progress["build_status"] = "partial"
+    return progress
 
 
 def _stream_output(prefix: str, stream, output_q: queue.Queue[tuple[str, str]]) -> None:
@@ -339,7 +374,15 @@ def run_streaming_pipeline(
                             other.terminate()
                     raise RuntimeError(f"Processus en echec: {proc.name} (rc={rc})")
 
-            progress = _read_dataset_progress(registry_path=registry_path, dataset_id=dataset_id)
+            build_state_path = _resolve_latest_dataset_build_state_path(
+                jobs_root=jobs_root,
+                identity=identity_key,
+            )
+            progress = _read_dataset_progress(
+                registry_path=registry_path,
+                dataset_id=dataset_id,
+                fallback_state_path=build_state_path,
+            )
             labeled_samples = int(progress.get("labeled_samples", 0) or 0)
             build_status = str(progress.get("build_status", "")).strip().lower()
 
@@ -381,7 +424,15 @@ def run_streaming_pipeline(
                         started_labeled_samples = int(train_proc.metadata.get("started_labeled_samples", 0) or 0)
                         last_trained_labeled_samples = max(last_trained_labeled_samples, started_labeled_samples)
                         train_runs += 1
-                        latest_progress = _read_dataset_progress(registry_path=registry_path, dataset_id=dataset_id)
+                        latest_state_path = _resolve_latest_dataset_build_state_path(
+                            jobs_root=jobs_root,
+                            identity=identity_key,
+                        )
+                        latest_progress = _read_dataset_progress(
+                            registry_path=registry_path,
+                            dataset_id=dataset_id,
+                            fallback_state_path=latest_state_path,
+                        )
                         latest_labeled = int(latest_progress.get("labeled_samples", 0) or 0)
                         print(
                             "training cycle completed | "
@@ -460,7 +511,15 @@ def run_streaming_pipeline(
         _drain_output(output_q)
 
     elapsed = int(max(0.0, time.time() - started))
-    final_progress = _read_dataset_progress(registry_path=registry_path, dataset_id=dataset_id)
+    final_state_path = _resolve_latest_dataset_build_state_path(
+        jobs_root=jobs_root,
+        identity=identity_key,
+    )
+    final_progress = _read_dataset_progress(
+        registry_path=registry_path,
+        dataset_id=dataset_id,
+        fallback_state_path=final_state_path,
+    )
     summary = {
         "status": "completed",
         "elapsed_seconds": elapsed,

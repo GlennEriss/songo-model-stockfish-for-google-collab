@@ -2890,12 +2890,27 @@ def _append_jsonl(path: Path, payloads: list[dict[str, Any]]) -> None:
             handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
 
 
-def _iter_jsonl(path: Path):
-    with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if line:
-                yield json.loads(line)
+def _iter_jsonl(path: Path, *, open_retries: int = 1, retry_delay_seconds: float = 0.0):
+    retries = max(1, int(open_retries))
+    delay = max(0.0, float(retry_delay_seconds))
+    for attempt in range(1, retries + 1):
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if line:
+                        yield json.loads(line)
+            return
+        except FileNotFoundError:
+            if attempt >= retries:
+                raise
+            if delay > 0.0:
+                time.sleep(delay)
+        except OSError:
+            if attempt >= retries:
+                raise
+            if delay > 0.0:
+                time.sleep(delay)
 
 
 def _count_jsonl_lines(path: Path) -> int:
@@ -4557,7 +4572,13 @@ def _label_samples_from_file(
     hard_examples_outcome_focus: float = 0.35,
     hard_examples_weight_multiplier: float = 2.0,
 ) -> tuple[int, list[dict[str, Any]], int, int]:
-    source_samples = list(_iter_jsonl(Path(sampled_file_path)))
+    source_samples = list(
+        _iter_jsonl(
+            Path(sampled_file_path),
+            open_retries=8,
+            retry_delay_seconds=0.5,
+        )
+    )
     source_count = len(source_samples)
     labeled_samples: list[dict[str, Any]] = []
     skipped_terminal = 0
@@ -4670,7 +4691,13 @@ def _prepare_prelabeled_samples_from_file(
     hard_examples_outcome_focus: float = 0.35,
     hard_examples_weight_multiplier: float = 2.0,
 ) -> tuple[int, list[dict[str, Any]], int, int, int]:
-    source_samples = list(_iter_jsonl(Path(sampled_file_path)))
+    source_samples = list(
+        _iter_jsonl(
+            Path(sampled_file_path),
+            open_retries=8,
+            retry_delay_seconds=0.5,
+        )
+    )
     source_count = len(source_samples)
     prepared_samples: list[dict[str, Any]] = []
     skipped_terminal = 0
@@ -6988,6 +7015,8 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
     hard_examples_weight_multiplier = max(1.0, float(cfg.get("hard_examples_weight_multiplier", 2.0)))
     dedupe_sample_ids = _as_bool(cfg.get("dedupe_sample_ids", True), default=True)
     export_partial_every_n_files = max(1, int(cfg.get("export_partial_every_n_files", 250)))
+    missing_source_file_retry_attempts = max(1, int(cfg.get("missing_source_file_retry_attempts", 5)))
+    missing_source_file_retry_delay_seconds = max(0.0, float(cfg.get("missing_source_file_retry_delay_seconds", 2.0)))
     progressive_global_merge_enabled = _as_bool(cfg.get("progressive_global_merge_enabled", False), default=False)
     progressive_global_merge_dataset_id = str(cfg.get("progressive_global_merge_dataset_id", "")).strip()
     progressive_global_merge_source_dataset_id_prefix = str(
@@ -8024,17 +8053,74 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
     def _process_pending_files_batch(pending_batch: list[dict[str, Any]]) -> None:
         if not pending_batch or _target_reached():
             return
+        def _handle_missing_source_file(
+            file_item: dict[str, Any],
+            *,
+            mode: str,
+            pending_queue: list[dict[str, Any]] | None,
+        ) -> None:
+            relative_name = str(file_item.get("relative_name", ""))
+            sampled_file_path = Path(file_item.get("sampled_file", ""))
+            retry_count = int(file_item.get("__missing_source_retries", 0) or 0) + 1
+            file_item["__missing_source_retries"] = retry_count
+            job.logger.warning(
+                "dataset build source file missing | file=%s | mode=%s | retry=%s/%s | path=%s",
+                relative_name,
+                mode,
+                retry_count,
+                missing_source_file_retry_attempts,
+                sampled_file_path,
+            )
+            job.write_event(
+                "dataset_build_source_file_missing",
+                file=relative_name,
+                mode=mode,
+                retry_count=retry_count,
+                retry_limit=missing_source_file_retry_attempts,
+                sampled_file_path=str(sampled_file_path),
+            )
+            if retry_count < missing_source_file_retry_attempts:
+                if pending_queue is not None:
+                    pending_queue.append(file_item)
+                if missing_source_file_retry_delay_seconds > 0.0:
+                    time.sleep(missing_source_file_retry_delay_seconds)
+                return
+            if follow_source_updates:
+                known_relative_names.discard(relative_name)
+                job.logger.warning(
+                    "dataset build source file deferred after retries | file=%s | mode=%s | action=wait_next_refresh",
+                    relative_name,
+                    mode,
+                )
+                job.write_event(
+                    "dataset_build_source_file_deferred",
+                    file=relative_name,
+                    mode=mode,
+                    action="wait_next_refresh",
+                )
+                return
+            raise FileNotFoundError(f"Fichier source introuvable apres retries: {sampled_file_path}")
         if num_workers <= 1:
-            for file_item in pending_batch:
+            pending_queue = list(pending_batch)
+            while pending_queue:
+                file_item = pending_queue.pop(0)
                 job.logger.info(
                     "dataset build file started | %s/%s | file=%s | mode=sequential",
                     file_item["file_index"],
                     len(sampled_files),
                     file_item["relative_name"],
                 )
-                source_count, file_samples, skipped_terminal, skipped_no_legal, skipped_invalid = _extract_samples_from_file(
-                    Path(file_item["sampled_file"])
-                )
+                try:
+                    source_count, file_samples, skipped_terminal, skipped_no_legal, skipped_invalid = _extract_samples_from_file(
+                        Path(file_item["sampled_file"])
+                    )
+                except FileNotFoundError:
+                    _handle_missing_source_file(
+                        file_item,
+                        mode="sequential",
+                        pending_queue=pending_queue,
+                    )
+                    continue
                 _materialize_labeled_file(
                     file_item,
                     source_count,
@@ -8123,7 +8209,15 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
                         )
                         for future in done:
                             file_item = future_map.pop(future)
-                            result_payload = future.result()
+                            try:
+                                result_payload = future.result()
+                            except FileNotFoundError:
+                                _handle_missing_source_file(
+                                    file_item,
+                                    mode="parallel",
+                                    pending_queue=pending_queue,
+                                )
+                                continue
                             if effective_build_mode == "source_prelabeled":
                                 source_count, file_samples, skipped_terminal, skipped_no_legal, skipped_invalid = result_payload
                             else:
@@ -8162,16 +8256,26 @@ def run_dataset_build(job: JobContext) -> dict[str, object]:
                     remaining_fallback=len(failed_pending),
                     error=str(exc),
                 )
-                for file_item in failed_pending:
+                fallback_queue = list(failed_pending)
+                while fallback_queue:
+                    file_item = fallback_queue.pop(0)
                     job.logger.info(
                         "dataset build file started | %s/%s | file=%s | mode=sequential_fallback",
                         file_item["file_index"],
                         len(sampled_files),
                         file_item["relative_name"],
                     )
-                    source_count, file_samples, skipped_terminal, skipped_no_legal, skipped_invalid = _extract_samples_from_file(
-                        Path(file_item["sampled_file"])
-                    )
+                    try:
+                        source_count, file_samples, skipped_terminal, skipped_no_legal, skipped_invalid = _extract_samples_from_file(
+                            Path(file_item["sampled_file"])
+                        )
+                    except FileNotFoundError:
+                        _handle_missing_source_file(
+                            file_item,
+                            mode="sequential_fallback",
+                            pending_queue=fallback_queue,
+                        )
+                        continue
                     _materialize_labeled_file(
                         file_item,
                         source_count,
