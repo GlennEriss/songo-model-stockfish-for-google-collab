@@ -40,6 +40,28 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
     write_json_atomic(path, payload, ensure_ascii=True, indent=2)
 
 
+def _write_npz_compressed(path: Path, **arrays: Any) -> None:
+    guard_write_path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    last_exc: OSError | None = None
+    for attempt in range(3):
+        try:
+            np.savez_compressed(path, **arrays)
+            return
+        except FileNotFoundError as exc:
+            # Google Drive FUSE can transiently lose parent directories during long runs.
+            last_exc = exc
+            path.parent.mkdir(parents=True, exist_ok=True)
+            time.sleep(0.02 * (attempt + 1))
+        except OSError as exc:
+            last_exc = exc
+            path.parent.mkdir(parents=True, exist_ok=True)
+            time.sleep(0.02 * (attempt + 1))
+    if last_exc is not None:
+        raise last_exc
+    raise OSError(f"Echec ecriture NPZ: {path}")
+
+
 def _path_within(path: Path, base: Path) -> bool:
     try:
         path.resolve().relative_to(base.resolve())
@@ -2149,7 +2171,7 @@ def _export_built_dataset_snapshot(
             if hard_example_weight_list
             else np.ones((0,), dtype=np.float32)
         )
-        np.savez_compressed(
+        _write_npz_compressed(
             output_root / f"{split_name}.npz",
             x=x,
             legal_mask=legal_mask,
@@ -8603,7 +8625,7 @@ def run_dataset_merge_final(job: JobContext, *, cfg_override: dict[str, Any] | N
                 split_items,
                 dedupe_sample_ids=dedupe_sample_ids,
             )
-            np.savez_compressed(output_root / f"{split_name}.npz", **merged_arrays)
+            _write_npz_compressed(output_root / f"{split_name}.npz", **merged_arrays)
             split_summary[split_name] = {
                 "games": int(split_metrics["unique_games"]),
                 "samples": int(split_metrics["kept_samples"]),
