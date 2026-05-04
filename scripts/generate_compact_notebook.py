@@ -41,7 +41,7 @@ cells = [
         6. Fusionner les datasets builds des colabs
         7. Configurer GCP / Vertex (project, bucket, compute)
         8. Publier dataset fusionne + models vers GCS
-        9. Déclencher Train + Eval sur Vertex AI
+        9. Déclencher Train + Eval sur Vertex AI (sans Docker local Colab)
         10. Déclencher Benchmatch sur Vertex AI (cellule séparée)
         """
     ),
@@ -337,9 +337,9 @@ cells = [
         """
         import os
         # A ajuster une fois (ou relancer avec de nouvelles valeurs).
-        os.environ.setdefault('SONGO_VERTEX_PROJECT_ID', '')
+        os.environ.setdefault('SONGO_VERTEX_PROJECT_ID', 'songo-model-ai')
         os.environ.setdefault('SONGO_VERTEX_REGION', 'us-central1')
-        os.environ.setdefault('SONGO_VERTEX_GCS_BUCKET', '')
+        os.environ.setdefault('SONGO_VERTEX_GCS_BUCKET', 'songo-model-ai-vertex-bucket-001')
         os.environ.setdefault('SONGO_VERTEX_GCS_PREFIX', 'songo-stockfish')
 
         # Compute train/eval Vertex.
@@ -349,7 +349,7 @@ cells = [
         os.environ.setdefault('SONGO_VERTEX_EXECUTOR_IMAGE_URI', 'us-docker.pkg.dev/vertex-ai/training/pytorch-gpu.2-4.py310:latest')
 
         # Optionnel.
-        os.environ.setdefault('SONGO_VERTEX_SERVICE_ACCOUNT', '')
+        os.environ.setdefault('SONGO_VERTEX_SERVICE_ACCOUNT', 'songo-vertex-runtime@songo-model-ai.iam.gserviceaccount.com')
         os.environ.setdefault('SONGO_VERTEX_STREAM_LOGS', '0')
 
         print('SONGO_VERTEX_PROJECT_ID =', os.environ.get('SONGO_VERTEX_PROJECT_ID', ''))
@@ -360,6 +360,7 @@ cells = [
         print('SONGO_VERTEX_ACCEL_TYPE =', os.environ.get('SONGO_VERTEX_ACCELERATOR_TYPE', ''))
         print('SONGO_VERTEX_ACCEL_CNT  =', os.environ.get('SONGO_VERTEX_ACCELERATOR_COUNT', ''))
         print('SONGO_VERTEX_IMAGE      =', os.environ.get('SONGO_VERTEX_EXECUTOR_IMAGE_URI', ''))
+        print('SONGO_VERTEX_SA         =', os.environ.get('SONGO_VERTEX_SERVICE_ACCOUNT', ''))
         print('SONGO_VERTEX_STREAM_LOGS=', os.environ.get('SONGO_VERTEX_STREAM_LOGS', '0'))
 
         if not os.environ.get('SONGO_VERTEX_PROJECT_ID', '').strip():

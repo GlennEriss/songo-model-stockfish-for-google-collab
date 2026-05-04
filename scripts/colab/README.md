@@ -25,7 +25,7 @@ Fichiers principaux:
   Publie automatiquement le dataset fusionne vers GCS, met a jour un pointeur `latest.json`, et peut synchroniser `models/` vers GCS pour les jobs Vertex.
 
 - `submit_vertex_custom_job.py`
-  Genere des configs runtime Vertex (storage sous `/gcs/...`) puis soumet des Custom Jobs Vertex AI pour `train-eval` et `benchmark`.
+  Genere des configs runtime Vertex (storage sous `/gcs/...`), publie un package Python sur GCS (`python-package-uris`), puis soumet des Custom Jobs Vertex AI pour `train-eval` et `benchmark` sans dependre de Docker local cote Colab.
 
 - `run_model_tournament.py`
   Lance un tournoi round-robin entre tous les modeles du registre (`model_registry.json`) avec score 3/1/0, logs live par partie et export JSON detaille.
@@ -96,8 +96,7 @@ Notes:
 
 Detail utile pour cellule 9:
 
-- le mode `train-eval` execute dans Vertex via `run-job train-eval`:
-  - preflight train (dataset resolu, mode de selection, epochs, batch size)
-  - train
-  - eval du modele fraichement entraine
-  - promotion appliquee selon la logique existante du registre modeles
+- le mode `train-eval` execute dans Vertex via `songo_model_stockfish.ops.vertex_entrypoint`:
+  - train (`python -m songo_model_stockfish.cli.main train --config ...`)
+  - eval (`python -m songo_model_stockfish.cli.main evaluate --config ...`)
+  - promotion appliquee selon la logique existante du registre modeles (pendant l'eval)

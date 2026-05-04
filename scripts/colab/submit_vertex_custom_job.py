@@ -4,7 +4,10 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
+import tarfile
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -248,18 +251,17 @@ def _prepare_benchmark_runtime_config(
 
 def _build_worker_pool_spec(
     *,
-    worktree: Path,
     machine_type: str,
     executor_image_uri: str,
     accelerator_type: str,
     accelerator_count: int,
+    python_module: str,
 ) -> str:
     fields = [
         f"machine-type={machine_type}",
         "replica-count=1",
         f"executor-image-uri={executor_image_uri}",
-        f"local-package-path={worktree}",
-        "script=scripts/colab/notebook_step.py",
+        f"python-module={python_module}",
     ]
     accel_type = str(accelerator_type or "").strip()
     accel_count = int(accelerator_count)
@@ -279,11 +281,82 @@ def _extract_custom_job_id(create_output: str) -> str:
     return candidate
 
 
-def _to_rel_path(path: Path, *, root: Path) -> str:
-    try:
-        return str(path.resolve(strict=False).relative_to(root.resolve(strict=False)))
-    except Exception:
-        return str(path)
+def _build_source_package_archive(*, worktree: Path, identity_key: str) -> Path:
+    src_pkg_dir = worktree / "src" / "songo_model_stockfish"
+    if not src_pkg_dir.exists():
+        raise FileNotFoundError(f"Package source introuvable: {src_pkg_dir}")
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    version = f"0.0.0.dev{ts}"
+    package_basename = f"songo-vertex-app-{identity_key}-{ts}"
+    output_dir = worktree / "config" / "generated" / "vertex" / "packages"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    archive_path = output_dir / f"{package_basename}.tar.gz"
+
+    with tempfile.TemporaryDirectory(prefix="songo_vertex_pkg_") as tmp:
+        pkg_root = Path(tmp) / package_basename
+        (pkg_root / "src").mkdir(parents=True, exist_ok=True)
+        shutil.copytree(
+            src_pkg_dir,
+            pkg_root / "src" / "songo_model_stockfish",
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+        )
+        (pkg_root / "setup.py").write_text(
+            (
+                "from setuptools import find_packages, setup\n\n"
+                "setup(\n"
+                "    name='songo-vertex-app',\n"
+                f"    version='{version}',\n"
+                "    description='Songo Vertex Python package',\n"
+                "    package_dir={'': 'src'},\n"
+                "    packages=find_packages(where='src'),\n"
+                "    install_requires=[\n"
+                "        'PyYAML>=6.0',\n"
+                "        'tqdm>=4.66',\n"
+                "        'google-cloud-firestore>=2.16',\n"
+                "        'upstash-redis>=1.4.0',\n"
+                "    ],\n"
+                "    include_package_data=False,\n"
+                ")\n"
+            ),
+            encoding="utf-8",
+        )
+        (pkg_root / "README.md").write_text(
+            "Songo Vertex package generated for Custom Job submission.\n",
+            encoding="utf-8",
+        )
+        with tarfile.open(archive_path, mode="w:gz") as tar:
+            tar.add(pkg_root, arcname=package_basename)
+
+    return archive_path
+
+
+def _upload_file_to_gcs(
+    *,
+    worktree: Path,
+    local_path: Path,
+    destination_uri: str,
+    heartbeat_seconds: int,
+) -> str:
+    env = dict(os.environ)
+    env["PYTHONUNBUFFERED"] = "1"
+    _run_live_capture(
+        ["gcloud", "storage", "cp", str(local_path), destination_uri],
+        cwd=worktree,
+        env=env,
+        heartbeat_s=int(heartbeat_seconds),
+    )
+    return destination_uri
+
+
+def _to_gcs_fuse_path(gs_uri: str) -> str:
+    text = str(gs_uri or "").strip()
+    if not text.startswith("gs://"):
+        raise ValueError(f"URI GCS invalide: {text}")
+    suffix = text[len("gs://") :].strip().strip("/")
+    if not suffix:
+        raise ValueError(f"URI GCS invalide: {text}")
+    return f"/gcs/{suffix}"
 
 
 def _submit_custom_job(
@@ -293,6 +366,7 @@ def _submit_custom_job(
     region: str,
     display_name: str,
     worker_pool_spec: str,
+    python_package_uris: list[str],
     args_list: list[str],
     service_account: str,
     labels: dict[str, str],
@@ -303,6 +377,9 @@ def _submit_custom_job(
 
     labels_arg = ",".join([f"{k}={v}" for k, v in labels.items() if k and v])
     args_csv = ",".join(args_list)
+    package_uris_csv = ",".join([str(uri).strip() for uri in (python_package_uris or []) if str(uri).strip()])
+    if not package_uris_csv:
+        raise ValueError("Aucun python package URI fourni pour le job Vertex.")
 
     cmd = [
         "gcloud",
@@ -313,6 +390,7 @@ def _submit_custom_job(
         f"--region={region}",
         f"--display-name={display_name}",
         f"--worker-pool-spec={worker_pool_spec}",
+        f"--python-package-uris={package_uris_csv}",
         f"--args={args_csv}",
         "--format=value(name)",
     ]
@@ -388,7 +466,7 @@ def run_submit_vertex_custom_job(
     identity_key = str(identity or "").strip() or "unknown_drive_identity"
 
     resolved_dataset_id = str(dataset_id or "").strip()
-    if not resolved_dataset_id:
+    if command_name == "train-eval" and not resolved_dataset_id:
         pointer_uri = str(dataset_pointer_uri or "").strip()
         if not pointer_uri:
             pointer_uri = _build_gs_uri(bucket, "data", "datasets", "merged", "latest.json", prefix=prefix)
@@ -401,12 +479,27 @@ def run_submit_vertex_custom_job(
     use_gpu = bool(str(accelerator_type or "").strip()) and int(accelerator_count) > 0
     vertex_drive_root = _build_vertex_drive_root(bucket, prefix)
 
+    package_archive_local = _build_source_package_archive(worktree=worktree, identity_key=identity_key)
+    package_archive_uri = _build_gs_uri(
+        bucket,
+        "code",
+        "python_packages",
+        package_archive_local.name,
+        prefix=prefix,
+    )
+    _upload_file_to_gcs(
+        worktree=worktree,
+        local_path=package_archive_local,
+        destination_uri=package_archive_uri,
+        heartbeat_seconds=int(heartbeat_seconds),
+    )
+
     worker_pool_spec = _build_worker_pool_spec(
-        worktree=worktree.resolve(strict=False),
         machine_type=str(machine_type),
         executor_image_uri=str(executor_image_uri),
         accelerator_type=str(accelerator_type),
         accelerator_count=int(accelerator_count),
+        python_module="songo_model_stockfish.ops.vertex_entrypoint",
     )
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
@@ -424,24 +517,45 @@ def run_submit_vertex_custom_job(
             vertex_drive_root=vertex_drive_root,
             use_gpu=use_gpu,
         )
+        train_runtime_gs_uri = _build_gs_uri(
+            bucket,
+            "config",
+            "generated",
+            "vertex",
+            train_runtime_path.name,
+            prefix=prefix,
+        )
+        eval_runtime_gs_uri = _build_gs_uri(
+            bucket,
+            "config",
+            "generated",
+            "vertex",
+            eval_runtime_path.name,
+            prefix=prefix,
+        )
+        _upload_file_to_gcs(
+            worktree=worktree,
+            local_path=train_runtime_path,
+            destination_uri=train_runtime_gs_uri,
+            heartbeat_seconds=int(heartbeat_seconds),
+        )
+        _upload_file_to_gcs(
+            worktree=worktree,
+            local_path=eval_runtime_path,
+            destination_uri=eval_runtime_gs_uri,
+            heartbeat_seconds=int(heartbeat_seconds),
+        )
+
         args_list = [
-            "run-job",
             "train-eval",
-            "--worktree",
-            ".",
-            "--identity",
-            identity_key,
-            "--python-bin",
-            "python3",
+            "--train-config",
+            _to_gcs_fuse_path(train_runtime_gs_uri),
+            "--eval-config",
+            _to_gcs_fuse_path(eval_runtime_gs_uri),
             "--heartbeat-seconds",
             str(int(heartbeat_seconds)),
-            "--drive-root",
-            vertex_drive_root,
-            "--train-config",
-            _to_rel_path(train_runtime_path, root=worktree),
-            "--eval-config",
-            _to_rel_path(eval_runtime_path, root=worktree),
         ]
+
         display_name = f"songo-train-eval-{identity_key}-{ts}"
         custom_job_id = _submit_custom_job(
             worktree=worktree,
@@ -449,6 +563,7 @@ def run_submit_vertex_custom_job(
             region=str(region),
             display_name=display_name,
             worker_pool_spec=worker_pool_spec,
+            python_package_uris=[package_archive_uri],
             args_list=args_list,
             service_account=str(service_account),
             labels=labels,
@@ -473,6 +588,13 @@ def run_submit_vertex_custom_job(
             "runtime_configs": {
                 "train": str(train_runtime_path),
                 "evaluation": str(eval_runtime_path),
+                "train_gcs_uri": train_runtime_gs_uri,
+                "evaluation_gcs_uri": eval_runtime_gs_uri,
+            },
+            "python_package": {
+                "local_archive": str(package_archive_local),
+                "gcs_uri": package_archive_uri,
+                "python_module": "songo_model_stockfish.ops.vertex_entrypoint",
             },
             "worker_pool_spec": worker_pool_spec,
             "stream_logs": bool(stream_logs),
@@ -486,22 +608,29 @@ def run_submit_vertex_custom_job(
             use_gpu=use_gpu,
             benchmark_target=str(benchmark_target or "auto_latest"),
         )
+        benchmark_runtime_gs_uri = _build_gs_uri(
+            bucket,
+            "config",
+            "generated",
+            "vertex",
+            benchmark_runtime_path.name,
+            prefix=prefix,
+        )
+        _upload_file_to_gcs(
+            worktree=worktree,
+            local_path=benchmark_runtime_path,
+            destination_uri=benchmark_runtime_gs_uri,
+            heartbeat_seconds=int(heartbeat_seconds),
+        )
+
         args_list = [
-            "run-job",
             "benchmark",
-            "--worktree",
-            ".",
-            "--identity",
-            identity_key,
-            "--python-bin",
-            "python3",
+            "--config",
+            _to_gcs_fuse_path(benchmark_runtime_gs_uri),
             "--heartbeat-seconds",
             str(int(heartbeat_seconds)),
-            "--drive-root",
-            vertex_drive_root,
-            "--config",
-            _to_rel_path(benchmark_runtime_path, root=worktree),
         ]
+
         display_name = f"songo-benchmark-{identity_key}-{ts}"
         custom_job_id = _submit_custom_job(
             worktree=worktree,
@@ -509,6 +638,7 @@ def run_submit_vertex_custom_job(
             region=str(region),
             display_name=display_name,
             worker_pool_spec=worker_pool_spec,
+            python_package_uris=[package_archive_uri],
             args_list=args_list,
             service_account=str(service_account),
             labels=labels,
@@ -532,6 +662,12 @@ def run_submit_vertex_custom_job(
             "vertex_drive_root": vertex_drive_root,
             "runtime_configs": {
                 "benchmark": str(benchmark_runtime_path),
+                "benchmark_gcs_uri": benchmark_runtime_gs_uri,
+            },
+            "python_package": {
+                "local_archive": str(package_archive_local),
+                "gcs_uri": package_archive_uri,
+                "python_module": "songo_model_stockfish.ops.vertex_entrypoint",
             },
             "worker_pool_spec": worker_pool_spec,
             "stream_logs": bool(stream_logs),
