@@ -306,7 +306,7 @@ def _run_single_command(
     )
 
 
-def _run_train_eval_benchmark(
+def _run_train_eval(
     *,
     python_bin: str,
     worktree: Path,
@@ -314,7 +314,6 @@ def _run_train_eval_benchmark(
     heartbeat_seconds: int,
     train_config: Path | None,
     eval_config: Path | None,
-    benchmark_config: Path | None,
     drive_root: Path,
 ) -> dict[str, Any]:
     import yaml
@@ -329,13 +328,7 @@ def _run_train_eval_benchmark(
         identity=identity,
         command="evaluate",
     )
-    bench_cfg = benchmark_config or _resolve_active_config_path(
-        worktree=worktree,
-        identity=identity,
-        command="benchmark",
-    )
-
-    for cfg in [train_cfg, eval_cfg, bench_cfg]:
+    for cfg in [train_cfg, eval_cfg]:
         if not cfg.exists():
             raise FileNotFoundError(f"Config introuvable: {cfg}")
 
@@ -383,6 +376,48 @@ def _run_train_eval_benchmark(
         env=env,
         heartbeat_s=int(heartbeat_seconds),
     )
+
+    return {
+        "train_config": str(train_cfg),
+        "eval_runtime_config": str(eval_runtime),
+        "model_id": model_id,
+    }
+
+
+def _run_train_eval_benchmark(
+    *,
+    python_bin: str,
+    worktree: Path,
+    identity: str,
+    heartbeat_seconds: int,
+    train_config: Path | None,
+    eval_config: Path | None,
+    benchmark_config: Path | None,
+    drive_root: Path,
+) -> dict[str, Any]:
+    import yaml
+
+    train_eval_summary = _run_train_eval(
+        python_bin=python_bin,
+        worktree=worktree,
+        identity=identity,
+        heartbeat_seconds=heartbeat_seconds,
+        train_config=train_config,
+        eval_config=eval_config,
+        drive_root=drive_root,
+    )
+    model_id = str(train_eval_summary["model_id"])
+
+    bench_cfg = benchmark_config or _resolve_active_config_path(
+        worktree=worktree,
+        identity=identity,
+        command="benchmark",
+    )
+    if not bench_cfg.exists():
+        raise FileNotFoundError(f"Config introuvable: {bench_cfg}")
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(worktree / "src")
+    env["PYTHONUNBUFFERED"] = "1"
 
     bench_payload = yaml.safe_load(bench_cfg.read_text(encoding="utf-8")) or {}
     bench_payload.setdefault("benchmark", {})
@@ -461,8 +496,8 @@ def _run_train_eval_benchmark(
         print("Aucun metadata de promotion trouvé.", flush=True)
 
     return {
-        "train_config": str(train_cfg),
-        "eval_runtime_config": str(eval_runtime),
+        "train_config": str(train_eval_summary["train_config"]),
+        "eval_runtime_config": str(train_eval_summary["eval_runtime_config"]),
         "benchmark_runtime_config": str(benchmark_runtime_used),
         "benchmark_safe_fallback_used": benchmark_safe_fallback_used,
         "benchmark_safe_fallback_reason": benchmark_safe_fallback_reason,
@@ -481,6 +516,7 @@ def main() -> int:
             "train",
             "evaluate",
             "benchmark",
+            "train-eval",
             "train-eval-benchmark",
         ],
     )
@@ -503,6 +539,18 @@ def main() -> int:
     identity = str(args.identity)
     python_bin = str(args.python_bin)
     heartbeat_seconds = int(args.heartbeat_seconds)
+
+    if command == "train-eval":
+        _run_train_eval(
+            python_bin=python_bin,
+            worktree=worktree,
+            identity=identity,
+            heartbeat_seconds=heartbeat_seconds,
+            train_config=(Path(str(args.train_config)) if str(args.train_config).strip() else None),
+            eval_config=(Path(str(args.eval_config)) if str(args.eval_config).strip() else None),
+            drive_root=Path(str(args.drive_root)),
+        )
+        return 0
 
     if command == "train-eval-benchmark":
         _run_train_eval_benchmark(

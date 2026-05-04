@@ -11,7 +11,7 @@ from bootstrap_workspace import bootstrap_workspace
 from generate_active_configs import generate_active_configs
 from run_merge_built_datasets import run_merge_built_datasets
 from run_streaming_pipeline import run_streaming_pipeline
-from run_job import _run_single_command, _run_train_eval_benchmark
+from run_job import _run_single_command, _run_train_eval, _run_train_eval_benchmark
 
 
 def _write_summary(summary: dict[str, Any], summary_path: str, print_json: bool) -> None:
@@ -111,6 +111,7 @@ def main() -> int:
             "train",
             "evaluate",
             "benchmark",
+            "train-eval",
             "train-eval-benchmark",
         ],
     )
@@ -302,6 +303,19 @@ def main() -> int:
         return 0
 
     command = str(args.command)
+    if command == "train-eval":
+        summary = _run_train_eval(
+            python_bin=str(args.python_bin),
+            worktree=Path(str(args.worktree)),
+            identity=str(args.identity),
+            heartbeat_seconds=int(args.heartbeat_seconds),
+            train_config=(Path(str(args.train_config)) if str(args.train_config).strip() else None),
+            eval_config=(Path(str(args.eval_config)) if str(args.eval_config).strip() else None),
+            drive_root=Path(str(args.drive_root)),
+        )
+        _write_summary(summary, str(args.summary_path), bool(args.print_json))
+        return 0
+
     if command == "train-eval-benchmark":
         summary = _run_train_eval_benchmark(
             python_bin=str(args.python_bin),
