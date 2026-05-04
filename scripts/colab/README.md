@@ -12,14 +12,20 @@ Fichiers principaux:
   Runner live (heartbeat + logs stream) pour lancer `dataset-generate`, `dataset-build`, `train`, `evaluate`, `benchmark`, `train-eval`, ou la pipeline `train-eval-benchmark`.
 
 - `notebook_step.py`
-  Wrapper CLI pour cellules Colab compactes: `bootstrap`, `generate-configs`, `audit-storage`, `run-job`, `streaming-pipeline`, `merge-built-datasets`, `model-tournament`.
+  Wrapper CLI pour cellules Colab compactes: `bootstrap`, `generate-configs`, `audit-storage`, `run-job`, `streaming-pipeline`, `merge-built-datasets`, `publish-merged-dataset-gcs`, `vertex-custom-job`, `model-tournament`.
 
 - `run_streaming_pipeline.py`
   Orchestrateur continu: lance `dataset-generate` et `dataset-build` en parallele.
-  Option `--disable-auto-train` pour laisser le declenchement `train-eval` et `benchmark` en manuel.
+  Option `--disable-auto-train` pour laisser le declenchement train/eval/benchmark hors pipeline dataset.
 
 - `run_merge_built_datasets.py`
   Fusionne les datasets builds de tous les workspaces Colab (`colab_*`), dedupe les `sample_ids`, ecrase la fusion precedente, puis repointe les configs train/eval actives vers le dataset fusionne.
+
+- `publish_merged_dataset_to_gcs.py`
+  Publie automatiquement le dataset fusionne vers GCS, met a jour un pointeur `latest.json`, et peut synchroniser `models/` vers GCS pour les jobs Vertex.
+
+- `submit_vertex_custom_job.py`
+  Genere des configs runtime Vertex (storage sous `/gcs/...`) puis soumet des Custom Jobs Vertex AI pour `train-eval` et `benchmark`.
 
 - `run_model_tournament.py`
   Lance un tournoi round-robin entre tous les modeles du registre (`model_registry.json`) avec score 3/1/0, logs live par partie et export JSON detaille.
@@ -42,7 +48,7 @@ Fichiers principaux:
 Principe de base:
 
 - le code s'execute depuis `/content/songo-model-stockfish-for-google-collab`
-- les artefacts critiques vivent dans `/content/drive/MyDrive/songo-stockfish`
+- les artefacts critiques locaux vivent dans `/content/drive/MyDrive/songo-stockfish`
 - un `git pull` ne doit jamais supprimer datasets, checkpoints ou resumes de jobs
 
 Workflow notebook compact actuel (`notebooks/colab_compact.ipynb`):
@@ -58,36 +64,40 @@ Workflow notebook compact actuel (`notebooks/colab_compact.ipynb`):
    - dedupe des `sample_ids`
    - ecrasement de l'ancien dataset fusionne
    - patch auto des configs train/eval actives pour utiliser le dataset fusionne
-7. lancer train/eval manuellement (`notebook_step.py run-job train-eval`)
-8. lancer benchmatch manuellement (`notebook_step.py run-job benchmark`)
-9. lancer le tournoi modeles (`notebook_step.py model-tournament`)
+7. configurer GCP / Vertex (project, bucket, machine, accel)
+8. publier dataset fusionne + models vers GCS (`notebook_step.py publish-merged-dataset-gcs`)
+9. lancer train/eval sur Vertex AI (`notebook_step.py vertex-custom-job train-eval`)
+10. lancer benchmatch sur Vertex AI (`notebook_step.py vertex-custom-job benchmark`)
 
 Logs live notebook:
 
 - cellule 5:
-  - fichier: `${SONGO_DRIVE_WORKSPACE_ROOT}/logs/notebook/songo_streaming_pipeline.log`
+  - fichier: `/content/songo_streaming_pipeline.log`
   - affichage live par lecture continue du fichier (tail)
 - cellule 6:
-  - fichier: `${SONGO_DRIVE_WORKSPACE_ROOT}/logs/notebook/songo_merge_built_datasets.log`
+  - fichier: `/content/songo_merge_built_datasets.log`
   - affichage live par lecture continue du fichier (tail)
 - cellule 7:
-  - fichier: `${SONGO_DRIVE_WORKSPACE_ROOT}/logs/notebook/songo_train_eval.log`
-  - affichage live par lecture continue du fichier (tail)
+  - pas de job long (validation variables GCP/Vertex)
 - cellule 8:
-  - fichier: `${SONGO_DRIVE_WORKSPACE_ROOT}/logs/notebook/songo_benchmark.log`
+  - fichier: `/content/songo_publish_dataset_gcs.log`
   - affichage live par lecture continue du fichier (tail)
 - cellule 9:
-  - fichier: `${SONGO_DRIVE_WORKSPACE_ROOT}/logs/notebook/songo_model_tournament.log`
+  - fichier: `/content/songo_vertex_train_eval.log`
+  - affichage live par lecture continue du fichier (tail)
+- cellule 10:
+  - fichier: `/content/songo_vertex_benchmark.log`
   - affichage live par lecture continue du fichier (tail)
 
-Note:
+Notes:
 
-- ancien comportement (avant migration) : logs notebook sous `/content/songo_*.log` (ephemeres runtime Colab)
+- ancien comportement (avant migration) : train/eval/benchmark/tournoi executes localement sur Colab
+- nouveau comportement : le notebook conserve la generation + fusion dataset, puis delègue train/eval/benchmark a Vertex AI
 
-Detail utile pour cellule 7:
+Detail utile pour cellule 9:
 
-- le mode `train-eval` affiche un preflight train avant lancement:
-  - dataset resolu
-  - taille (`labeled_samples`, `target_labeled_samples`, split train/val/test)
-  - mode de selection dataset
-  - epochs et batch size planifies
+- le mode `train-eval` execute dans Vertex via `run-job train-eval`:
+  - preflight train (dataset resolu, mode de selection, epochs, batch size)
+  - train
+  - eval du modele fraichement entraine
+  - promotion appliquee selon la logique existante du registre modeles

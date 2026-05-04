@@ -9,9 +9,11 @@ from typing import Any
 
 from bootstrap_workspace import bootstrap_workspace
 from generate_active_configs import generate_active_configs
+from publish_merged_dataset_to_gcs import run_publish_merged_dataset_to_gcs
 from run_merge_built_datasets import run_merge_built_datasets
 from run_streaming_pipeline import run_streaming_pipeline
 from run_job import _run_single_command, _run_train_eval, _run_train_eval_benchmark
+from submit_vertex_custom_job import run_submit_vertex_custom_job
 
 
 def _write_summary(summary: dict[str, Any], summary_path: str, print_json: bool) -> None:
@@ -180,6 +182,63 @@ def main() -> int:
     merge_built.add_argument("--summary-path", default="")
     merge_built.add_argument("--print-json", action="store_true")
 
+    publish_merged = subparsers.add_parser("publish-merged-dataset-gcs")
+    publish_merged.add_argument("--worktree", default="/content/songo-model-stockfish-for-google-collab")
+    publish_merged.add_argument(
+        "--drive-root",
+        default=(str(os.environ.get("SONGO_DRIVE_ROOT", "")).strip() or "/content/drive/MyDrive/songo-stockfish"),
+    )
+    publish_merged.add_argument("--merged-dataset-id", default="dataset_full_matrix_merged_all_colabs")
+    publish_merged.add_argument("--merge-summary-path", default="")
+    publish_merged.add_argument("--gcs-bucket", default=(str(os.environ.get("SONGO_VERTEX_GCS_BUCKET", "")).strip()))
+    publish_merged.add_argument("--gcs-prefix", default=(str(os.environ.get("SONGO_VERTEX_GCS_PREFIX", "songo-stockfish")).strip()))
+    publish_merged.add_argument("--sync-models", dest="sync_models", action="store_true", default=True)
+    publish_merged.add_argument("--skip-sync-models", dest="sync_models", action="store_false")
+    publish_merged.add_argument("--heartbeat-seconds", type=int, default=30)
+    publish_merged.add_argument("--summary-path", default="")
+    publish_merged.add_argument("--print-json", action="store_true")
+
+    vertex_job = subparsers.add_parser("vertex-custom-job")
+    vertex_job.add_argument("command", choices=["train-eval", "benchmark"])
+    vertex_job.add_argument("--worktree", default="/content/songo-model-stockfish-for-google-collab")
+    vertex_job.add_argument(
+        "--identity",
+        default=(str(os.environ.get("SONGO_DRIVE_IDENTITY_KEY", "")).strip() or "unknown_drive_identity"),
+    )
+    vertex_job.add_argument("--project-id", default=(str(os.environ.get("SONGO_VERTEX_PROJECT_ID", "")).strip()))
+    vertex_job.add_argument("--region", default=(str(os.environ.get("SONGO_VERTEX_REGION", "us-central1")).strip()))
+    vertex_job.add_argument("--gcs-bucket", default=(str(os.environ.get("SONGO_VERTEX_GCS_BUCKET", "")).strip()))
+    vertex_job.add_argument("--gcs-prefix", default=(str(os.environ.get("SONGO_VERTEX_GCS_PREFIX", "songo-stockfish")).strip()))
+    vertex_job.add_argument("--dataset-id", default=(str(os.environ.get("SONGO_VERTEX_DATASET_ID", "")).strip()))
+    vertex_job.add_argument(
+        "--dataset-pointer-uri",
+        default=(str(os.environ.get("SONGO_VERTEX_DATASET_POINTER_URI", "")).strip()),
+    )
+    vertex_job.add_argument("--machine-type", default=(str(os.environ.get("SONGO_VERTEX_MACHINE_TYPE", "n1-standard-8")).strip()))
+    vertex_job.add_argument(
+        "--accelerator-type",
+        default=(str(os.environ.get("SONGO_VERTEX_ACCELERATOR_TYPE", "NVIDIA_TESLA_T4")).strip()),
+    )
+    vertex_job.add_argument("--accelerator-count", type=int, default=int(os.environ.get("SONGO_VERTEX_ACCELERATOR_COUNT", "1")))
+    vertex_job.add_argument(
+        "--executor-image-uri",
+        default=(
+            str(
+                os.environ.get(
+                    "SONGO_VERTEX_EXECUTOR_IMAGE_URI",
+                    "us-docker.pkg.dev/vertex-ai/training/pytorch-gpu.2-4.py310:latest",
+                )
+            ).strip()
+        ),
+    )
+    vertex_job.add_argument("--service-account", default=(str(os.environ.get("SONGO_VERTEX_SERVICE_ACCOUNT", "")).strip()))
+    vertex_job.add_argument("--benchmark-target", default=(str(os.environ.get("SONGO_VERTEX_BENCHMARK_TARGET", "auto_latest")).strip()))
+    vertex_job.add_argument("--stream-logs", dest="stream_logs", action="store_true", default=False)
+    vertex_job.add_argument("--no-stream-logs", dest="stream_logs", action="store_false")
+    vertex_job.add_argument("--heartbeat-seconds", type=int, default=30)
+    vertex_job.add_argument("--summary-path", default="")
+    vertex_job.add_argument("--print-json", action="store_true")
+
     tournament = subparsers.add_parser("model-tournament")
     tournament.add_argument("--worktree", default="/content/songo-model-stockfish-for-google-collab")
     tournament.add_argument(
@@ -274,6 +333,43 @@ def main() -> int:
             merged_dataset_id=str(args.merged_dataset_id),
             source_dataset_id_prefix=str(args.source_dataset_id_prefix),
             dedupe_sample_ids=bool(args.dedupe_sample_ids),
+            heartbeat_seconds=int(args.heartbeat_seconds),
+        )
+        _write_summary(summary, str(args.summary_path), bool(args.print_json))
+        return 0
+
+    if step == "publish-merged-dataset-gcs":
+        summary = run_publish_merged_dataset_to_gcs(
+            worktree=Path(str(args.worktree)),
+            drive_root=Path(str(args.drive_root)),
+            merged_dataset_id=str(args.merged_dataset_id),
+            merge_summary_path=(Path(str(args.merge_summary_path)) if str(args.merge_summary_path).strip() else None),
+            gcs_bucket=str(args.gcs_bucket),
+            gcs_prefix=str(args.gcs_prefix),
+            sync_models=bool(args.sync_models),
+            heartbeat_seconds=int(args.heartbeat_seconds),
+        )
+        _write_summary(summary, str(args.summary_path), bool(args.print_json))
+        return 0
+
+    if step == "vertex-custom-job":
+        summary = run_submit_vertex_custom_job(
+            command=str(args.command),
+            worktree=Path(str(args.worktree)),
+            identity=str(args.identity),
+            project_id=str(args.project_id),
+            region=str(args.region),
+            gcs_bucket=str(args.gcs_bucket),
+            gcs_prefix=str(args.gcs_prefix),
+            dataset_id=str(args.dataset_id),
+            dataset_pointer_uri=str(args.dataset_pointer_uri),
+            machine_type=str(args.machine_type),
+            accelerator_type=str(args.accelerator_type),
+            accelerator_count=int(args.accelerator_count),
+            executor_image_uri=str(args.executor_image_uri),
+            service_account=str(args.service_account),
+            benchmark_target=str(args.benchmark_target),
+            stream_logs=bool(args.stream_logs),
             heartbeat_seconds=int(args.heartbeat_seconds),
         )
         _write_summary(summary, str(args.summary_path), bool(args.print_json))

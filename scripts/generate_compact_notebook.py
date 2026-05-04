@@ -39,9 +39,10 @@ cells = [
         4. Audit stockage (aucune purge)
         5. Lancer le pipeline continu dataset (generate + build, sans auto-train)
         6. Fusionner les datasets builds des colabs
-        7. Déclencher train/eval manuellement
-        8. Déclencher le benchmatch manuellement (cellule séparée)
-        9. Lancer un tournoi live entre tous les modèles (optionnel)
+        7. Configurer GCP / Vertex (project, bucket, compute)
+        8. Publier dataset fusionne + models vers GCS
+        9. Déclencher Train + Eval sur Vertex AI
+        10. Déclencher Benchmatch sur Vertex AI (cellule séparée)
         """
     ),
     md("## 1) Monter Drive"),
@@ -245,6 +246,7 @@ cells = [
         WORKTREE = os.environ.get('SONGO_WORKTREE', '/content/songo-model-stockfish-for-google-collab')
         PYTHON_BIN = os.environ.get('SONGO_PYTHON_BIN', (sys.executable or 'python3'))
         LOG_PATH = Path('/content/songo_merge_built_datasets.log')
+        MERGE_SUMMARY_PATH = Path('/tmp/songo_merge_built_datasets_summary.json')
         NOTEBOOK_STEP = f'{WORKTREE}/scripts/colab/notebook_step.py'
         MERGE_SCRIPT = f'{WORKTREE}/scripts/colab/run_merge_built_datasets.py'
 
@@ -266,6 +268,8 @@ cells = [
                 'merge-built-datasets',
                 '--worktree',
                 WORKTREE,
+                '--summary-path',
+                str(MERGE_SUMMARY_PATH),
                 '--heartbeat-seconds',
                 '30',
             ]
@@ -276,6 +280,8 @@ cells = [
                 MERGE_SCRIPT,
                 '--worktree',
                 WORKTREE,
+                '--summary-path',
+                str(MERGE_SUMMARY_PATH),
                 '--heartbeat-seconds',
                 '30',
             ]
@@ -319,11 +325,50 @@ cells = [
                             print(tail, end='')
                 if rc != 0:
                     raise subprocess.CalledProcessError(rc, cmd)
+                if MERGE_SUMMARY_PATH.exists():
+                    os.environ['SONGO_MERGE_SUMMARY_PATH'] = str(MERGE_SUMMARY_PATH)
+                    print('MERGE_SUMMARY_PATH =', MERGE_SUMMARY_PATH)
                 break
             time.sleep(2.0)
         """
     ),
-    md("## 7) Train -> Eval (manuel, sans benchmatch)"),
+    md("## 7) Config Vertex / GCS"),
+    code(
+        """
+        import os
+        # A ajuster une fois (ou relancer avec de nouvelles valeurs).
+        os.environ.setdefault('SONGO_VERTEX_PROJECT_ID', '')
+        os.environ.setdefault('SONGO_VERTEX_REGION', 'us-central1')
+        os.environ.setdefault('SONGO_VERTEX_GCS_BUCKET', '')
+        os.environ.setdefault('SONGO_VERTEX_GCS_PREFIX', 'songo-stockfish')
+
+        # Compute train/eval Vertex.
+        os.environ.setdefault('SONGO_VERTEX_MACHINE_TYPE', 'n1-standard-8')
+        os.environ.setdefault('SONGO_VERTEX_ACCELERATOR_TYPE', 'NVIDIA_TESLA_T4')
+        os.environ.setdefault('SONGO_VERTEX_ACCELERATOR_COUNT', '1')
+        os.environ.setdefault('SONGO_VERTEX_EXECUTOR_IMAGE_URI', 'us-docker.pkg.dev/vertex-ai/training/pytorch-gpu.2-4.py310:latest')
+
+        # Optionnel.
+        os.environ.setdefault('SONGO_VERTEX_SERVICE_ACCOUNT', '')
+        os.environ.setdefault('SONGO_VERTEX_STREAM_LOGS', '0')
+
+        print('SONGO_VERTEX_PROJECT_ID =', os.environ.get('SONGO_VERTEX_PROJECT_ID', ''))
+        print('SONGO_VERTEX_REGION     =', os.environ.get('SONGO_VERTEX_REGION', ''))
+        print('SONGO_VERTEX_GCS_BUCKET =', os.environ.get('SONGO_VERTEX_GCS_BUCKET', ''))
+        print('SONGO_VERTEX_GCS_PREFIX =', os.environ.get('SONGO_VERTEX_GCS_PREFIX', ''))
+        print('SONGO_VERTEX_MACHINE    =', os.environ.get('SONGO_VERTEX_MACHINE_TYPE', ''))
+        print('SONGO_VERTEX_ACCEL_TYPE =', os.environ.get('SONGO_VERTEX_ACCELERATOR_TYPE', ''))
+        print('SONGO_VERTEX_ACCEL_CNT  =', os.environ.get('SONGO_VERTEX_ACCELERATOR_COUNT', ''))
+        print('SONGO_VERTEX_IMAGE      =', os.environ.get('SONGO_VERTEX_EXECUTOR_IMAGE_URI', ''))
+        print('SONGO_VERTEX_STREAM_LOGS=', os.environ.get('SONGO_VERTEX_STREAM_LOGS', '0'))
+
+        if not os.environ.get('SONGO_VERTEX_PROJECT_ID', '').strip():
+            raise RuntimeError('SONGO_VERTEX_PROJECT_ID vide. Renseigne la variable dans cette cellule.')
+        if not os.environ.get('SONGO_VERTEX_GCS_BUCKET', '').strip():
+            raise RuntimeError('SONGO_VERTEX_GCS_BUCKET vide. Renseigne la variable dans cette cellule.')
+        """
+    ),
+    md("## 8) Publier le dataset fusionne vers GCS"),
     code(
         """
         import os
@@ -334,24 +379,100 @@ cells = [
 
         WORKTREE = os.environ.get('SONGO_WORKTREE', '/content/songo-model-stockfish-for-google-collab')
         PYTHON_BIN = os.environ.get('SONGO_PYTHON_BIN', (sys.executable or 'python3'))
-        LOG_PATH = Path('/content/songo_train_eval.log')
+        LOG_PATH = Path('/content/songo_publish_dataset_gcs.log')
+        SUMMARY_PATH = Path('/tmp/songo_publish_dataset_gcs_summary.json')
+        MERGE_SUMMARY_PATH = os.environ.get('SONGO_MERGE_SUMMARY_PATH', '/tmp/songo_merge_built_datasets_summary.json')
         cmd = [
             PYTHON_BIN,
             '-u',
             f'{WORKTREE}/scripts/colab/notebook_step.py',
-            'run-job',
+            'publish-merged-dataset-gcs',
+            '--worktree',
+            WORKTREE,
+            '--merge-summary-path',
+            MERGE_SUMMARY_PATH,
+            '--summary-path',
+            str(SUMMARY_PATH),
+            '--heartbeat-seconds',
+            '30',
+        ]
+
+        print('Publish dataset->GCS log file =', LOG_PATH)
+        print('Publish summary path =', SUMMARY_PATH)
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        existing_size = LOG_PATH.stat().st_size if LOG_PATH.exists() else 0
+        with LOG_PATH.open('a', encoding='utf-8', buffering=1) as log_file:
+            log_file.write('\\n=== START publish-merged-dataset-gcs ===\\n')
+            log_file.flush()
+            proc = subprocess.Popen(
+                cmd,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env={**os.environ, 'PYTHONUNBUFFERED': '1'},
+            )
+
+        cursor = existing_size
+        while True:
+            if LOG_PATH.exists():
+                with LOG_PATH.open('r', encoding='utf-8', errors='replace') as reader:
+                    reader.seek(cursor)
+                    chunk = reader.read()
+                    if chunk:
+                        print(chunk, end='')
+                    cursor = reader.tell()
+            rc = proc.poll()
+            if rc is not None:
+                if LOG_PATH.exists():
+                    with LOG_PATH.open('r', encoding='utf-8', errors='replace') as reader:
+                        reader.seek(cursor)
+                        tail = reader.read()
+                        if tail:
+                            print(tail, end='')
+                if rc != 0:
+                    raise subprocess.CalledProcessError(rc, cmd)
+                if SUMMARY_PATH.exists():
+                    os.environ['SONGO_PUBLISH_DATASET_GCS_SUMMARY_PATH'] = str(SUMMARY_PATH)
+                    print('PUBLISH_SUMMARY_PATH =', SUMMARY_PATH)
+                break
+            time.sleep(2.0)
+        """
+    ),
+    md("## 9) Train + Eval sur Vertex AI"),
+    code(
+        """
+        import os
+        import subprocess
+        import sys
+        import time
+        from pathlib import Path
+
+        WORKTREE = os.environ.get('SONGO_WORKTREE', '/content/songo-model-stockfish-for-google-collab')
+        PYTHON_BIN = os.environ.get('SONGO_PYTHON_BIN', (sys.executable or 'python3'))
+        LOG_PATH = Path('/content/songo_vertex_train_eval.log')
+        SUMMARY_PATH = Path('/tmp/songo_vertex_train_eval_summary.json')
+        cmd = [
+            PYTHON_BIN,
+            '-u',
+            f'{WORKTREE}/scripts/colab/notebook_step.py',
+            'vertex-custom-job',
             'train-eval',
             '--worktree',
             WORKTREE,
+            '--summary-path',
+            str(SUMMARY_PATH),
             '--heartbeat-seconds',
             '30',
         ]
+        if os.environ.get('SONGO_VERTEX_STREAM_LOGS', '0').strip().lower() in {'1', 'true', 'yes', 'on'}:
+            cmd.append('--stream-logs')
 
-        print('Train/Eval log file =', LOG_PATH)
+        print('Vertex train+eval log file =', LOG_PATH)
+        print('Vertex summary path =', SUMMARY_PATH)
         LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         existing_size = LOG_PATH.stat().st_size if LOG_PATH.exists() else 0
         with LOG_PATH.open('a', encoding='utf-8', buffering=1) as log_file:
-            log_file.write('\\n=== START train-eval ===\\n')
+            log_file.write('\\n=== START vertex-custom-job train-eval ===\\n')
             log_file.flush()
             proc = subprocess.Popen(
                 cmd,
@@ -380,11 +501,14 @@ cells = [
                             print(tail, end='')
                 if rc != 0:
                     raise subprocess.CalledProcessError(rc, cmd)
+                if SUMMARY_PATH.exists():
+                    os.environ['SONGO_VERTEX_TRAIN_EVAL_SUMMARY_PATH'] = str(SUMMARY_PATH)
+                    print('VERTEX_TRAIN_EVAL_SUMMARY_PATH =', SUMMARY_PATH)
                 break
             time.sleep(2.0)
         """
     ),
-    md("## 8) Benchmatch manuel (après train+eval)"),
+    md("## 10) Benchmatch sur Vertex AI (manuel, apres train+eval)"),
     code(
         """
         import os
@@ -395,24 +519,36 @@ cells = [
 
         WORKTREE = os.environ.get('SONGO_WORKTREE', '/content/songo-model-stockfish-for-google-collab')
         PYTHON_BIN = os.environ.get('SONGO_PYTHON_BIN', (sys.executable or 'python3'))
-        LOG_PATH = Path('/content/songo_benchmark.log')
+        LOG_PATH = Path('/content/songo_vertex_benchmark.log')
+        SUMMARY_PATH = Path('/tmp/songo_vertex_benchmark_summary.json')
         cmd = [
             PYTHON_BIN,
             '-u',
             f'{WORKTREE}/scripts/colab/notebook_step.py',
-            'run-job',
+            'vertex-custom-job',
             'benchmark',
             '--worktree',
             WORKTREE,
+            '--machine-type',
+            'e2-standard-8',
+            '--accelerator-count',
+            '0',
+            '--executor-image-uri',
+            'us-docker.pkg.dev/vertex-ai/training/pytorch-cpu.2-4.py310:latest',
+            '--summary-path',
+            str(SUMMARY_PATH),
             '--heartbeat-seconds',
             '30',
         ]
+        if os.environ.get('SONGO_VERTEX_STREAM_LOGS', '0').strip().lower() in {'1', 'true', 'yes', 'on'}:
+            cmd.append('--stream-logs')
 
-        print('Benchmark log file =', LOG_PATH)
+        print('Vertex benchmark log file =', LOG_PATH)
+        print('Vertex summary path =', SUMMARY_PATH)
         LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         existing_size = LOG_PATH.stat().st_size if LOG_PATH.exists() else 0
         with LOG_PATH.open('a', encoding='utf-8', buffering=1) as log_file:
-            log_file.write('\\n=== START benchmark ===\\n')
+            log_file.write('\\n=== START vertex-custom-job benchmark ===\\n')
             log_file.flush()
             proc = subprocess.Popen(
                 cmd,
@@ -441,68 +577,9 @@ cells = [
                             print(tail, end='')
                 if rc != 0:
                     raise subprocess.CalledProcessError(rc, cmd)
-                break
-            time.sleep(2.0)
-        """
-    ),
-    md("## 9) Tournoi des modèles (10 matchs par paire, live)"),
-    code(
-        """
-        import os
-        import subprocess
-        import sys
-        import time
-        from pathlib import Path
-
-        WORKTREE = os.environ.get('SONGO_WORKTREE', '/content/songo-model-stockfish-for-google-collab')
-        PYTHON_BIN = os.environ.get('SONGO_PYTHON_BIN', (sys.executable or 'python3'))
-        LOG_PATH = Path('/content/songo_model_tournament.log')
-        cmd = [
-            PYTHON_BIN,
-            '-u',
-            f'{WORKTREE}/scripts/colab/notebook_step.py',
-            'model-tournament',
-            '--worktree',
-            WORKTREE,
-            '--games-per-pair',
-            '10',
-            '--max-moves',
-            '400',
-        ]
-
-        print('Model tournament log file =', LOG_PATH)
-        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        existing_size = LOG_PATH.stat().st_size if LOG_PATH.exists() else 0
-        with LOG_PATH.open('a', encoding='utf-8', buffering=1) as log_file:
-            log_file.write('\\n=== START model-tournament ===\\n')
-            log_file.flush()
-            proc = subprocess.Popen(
-                cmd,
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                text=True,
-                env={**os.environ, 'PYTHONUNBUFFERED': '1'},
-            )
-
-        cursor = existing_size
-        while True:
-            if LOG_PATH.exists():
-                with LOG_PATH.open('r', encoding='utf-8', errors='replace') as reader:
-                    reader.seek(cursor)
-                    chunk = reader.read()
-                    if chunk:
-                        print(chunk, end='')
-                    cursor = reader.tell()
-            rc = proc.poll()
-            if rc is not None:
-                if LOG_PATH.exists():
-                    with LOG_PATH.open('r', encoding='utf-8', errors='replace') as reader:
-                        reader.seek(cursor)
-                        tail = reader.read()
-                        if tail:
-                            print(tail, end='')
-                if rc != 0:
-                    raise subprocess.CalledProcessError(rc, cmd)
+                if SUMMARY_PATH.exists():
+                    os.environ['SONGO_VERTEX_BENCHMARK_SUMMARY_PATH'] = str(SUMMARY_PATH)
+                    print('VERTEX_BENCHMARK_SUMMARY_PATH =', SUMMARY_PATH)
                 break
             time.sleep(2.0)
         """
