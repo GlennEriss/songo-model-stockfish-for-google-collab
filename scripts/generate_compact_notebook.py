@@ -344,10 +344,11 @@ cells = [
         os.environ.setdefault('SONGO_VERTEX_GCS_PREFIX', 'songo-stockfish')
 
         # Compute train/eval Vertex.
-        os.environ.setdefault('SONGO_VERTEX_MACHINE_TYPE', 'n1-standard-8')
-        os.environ.setdefault('SONGO_VERTEX_ACCELERATOR_TYPE', 'NVIDIA_TESLA_T4')
-        os.environ.setdefault('SONGO_VERTEX_ACCELERATOR_COUNT', '1')
-        os.environ.setdefault('SONGO_VERTEX_EXECUTOR_IMAGE_URI', 'us-docker.pkg.dev/vertex-ai/training/pytorch-gpu.2-4.py310:latest')
+        # Defaut robuste: CPU (evite les erreurs de quota GPU T4).
+        os.environ.setdefault('SONGO_VERTEX_MACHINE_TYPE', 'e2-standard-16')
+        os.environ.setdefault('SONGO_VERTEX_ACCELERATOR_TYPE', '')
+        os.environ.setdefault('SONGO_VERTEX_ACCELERATOR_COUNT', '0')
+        os.environ.setdefault('SONGO_VERTEX_EXECUTOR_IMAGE_URI', 'us-docker.pkg.dev/vertex-ai/training/pytorch-xla.2-4.py310:latest')
 
         # Optionnel.
         os.environ.setdefault('SONGO_VERTEX_SERVICE_ACCOUNT', 'songo-vertex-runtime@songo-model-ai.iam.gserviceaccount.com')

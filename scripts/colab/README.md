@@ -65,6 +65,7 @@ Workflow notebook compact actuel (`notebooks/colab_compact.ipynb`):
    - ecrasement de l'ancien dataset fusionne
    - patch auto des configs train/eval actives pour utiliser le dataset fusionne
 7. configurer GCP / Vertex (project, bucket, machine, accel)
+   - recommandation par defaut: mode CPU (`e2-standard-16`, `accelerator_count=0`, image `pytorch-xla.2-4.py310`) pour eviter les blocages de quota GPU
 8. authentifier gcloud dans Colab (obligatoire avant GCS/Vertex)
 9. publier dataset fusionne + models vers GCS (`notebook_step.py publish-merged-dataset-gcs`)
 10. lancer train/eval sur Vertex AI (`notebook_step.py vertex-custom-job train-eval`)
