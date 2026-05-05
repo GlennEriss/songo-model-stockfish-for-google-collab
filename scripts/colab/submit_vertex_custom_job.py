@@ -179,6 +179,107 @@ def _verify_train_eval_dataset_artifacts(
         )
 
 
+def _gcs_object_exists(
+    *,
+    worktree: Path,
+    object_uri: str,
+) -> bool:
+    uri = str(object_uri or "").strip()
+    if not uri:
+        return False
+    env = dict(os.environ)
+    env["PYTHONUNBUFFERED"] = "1"
+    cmd = ["gcloud", "storage", "ls", uri]
+    print("RUN:", cmd, flush=True)
+    proc = subprocess.run(
+        cmd,
+        cwd=str(worktree),
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=1,
+    )
+    output = str(proc.stdout or "").strip()
+    if output:
+        print(output, flush=True)
+    return proc.returncode == 0
+
+
+def _ensure_gcs_object_text(
+    *,
+    worktree: Path,
+    destination_uri: str,
+    content: str,
+    heartbeat_seconds: int,
+) -> bool:
+    if _gcs_object_exists(worktree=worktree, object_uri=destination_uri):
+        return False
+    with tempfile.NamedTemporaryFile(prefix="songo_gcs_seed_", suffix=".txt", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+    try:
+        tmp_path.write_text(str(content or ""), encoding="utf-8")
+        _upload_file_to_gcs(
+            worktree=worktree,
+            local_path=tmp_path,
+            destination_uri=destination_uri,
+            heartbeat_seconds=int(heartbeat_seconds),
+        )
+        return True
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _ensure_vertex_models_layout(
+    *,
+    worktree: Path,
+    bucket: str,
+    prefix: str,
+    heartbeat_seconds: int,
+) -> dict[str, Any]:
+    created_objects: list[str] = []
+
+    registry_uri = _build_gs_uri(bucket, "models", "model_registry.json", prefix=prefix)
+    if _ensure_gcs_object_text(
+        worktree=worktree,
+        destination_uri=registry_uri,
+        content=json.dumps({"models": []}, indent=2, ensure_ascii=True),
+        heartbeat_seconds=int(heartbeat_seconds),
+    ):
+        created_objects.append(registry_uri)
+
+    keep_uris = [
+        _build_gs_uri(bucket, "models", ".keep", prefix=prefix),
+        _build_gs_uri(bucket, "models", "final", ".keep", prefix=prefix),
+        _build_gs_uri(bucket, "models", "checkpoints", ".keep", prefix=prefix),
+        _build_gs_uri(bucket, "models", "lineage", ".keep", prefix=prefix),
+        _build_gs_uri(bucket, "models", "promoted", ".keep", prefix=prefix),
+        _build_gs_uri(bucket, "models", "promoted", "best", ".keep", prefix=prefix),
+    ]
+    for uri in keep_uris:
+        if _ensure_gcs_object_text(
+            worktree=worktree,
+            destination_uri=uri,
+            content="",
+            heartbeat_seconds=int(heartbeat_seconds),
+        ):
+            created_objects.append(uri)
+
+    print(
+        "Vertex models layout check | "
+        f"registry={registry_uri} | created_objects={len(created_objects)}"
+        ,
+        flush=True,
+    )
+    return {
+        "registry_uri": registry_uri,
+        "created_objects": created_objects,
+    }
+
+
 def _sanitize_label_value(value: str) -> str:
     text = str(value or "").strip().lower()
     text = re.sub(r"[^a-z0-9_-]", "_", text)
@@ -529,6 +630,12 @@ def run_submit_vertex_custom_job(
             dataset_id=resolved_dataset_id,
             heartbeat_seconds=int(heartbeat_seconds),
         )
+    models_layout_summary = _ensure_vertex_models_layout(
+        worktree=worktree,
+        bucket=bucket,
+        prefix=prefix,
+        heartbeat_seconds=int(heartbeat_seconds),
+    )
 
     use_gpu = bool(str(accelerator_type or "").strip()) and int(accelerator_count) > 0
     vertex_drive_root = _build_vertex_drive_root(bucket, prefix)
@@ -652,6 +759,7 @@ def run_submit_vertex_custom_job(
             },
             "worker_pool_spec": worker_pool_spec,
             "stream_logs": bool(stream_logs),
+            "models_layout": models_layout_summary,
         }
 
     if command_name == "benchmark":
@@ -725,6 +833,7 @@ def run_submit_vertex_custom_job(
             },
             "worker_pool_spec": worker_pool_spec,
             "stream_logs": bool(stream_logs),
+            "models_layout": models_layout_summary,
         }
 
     raise ValueError(f"Commande Vertex non supportee: {command_name}")

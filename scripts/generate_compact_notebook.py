@@ -41,7 +41,7 @@ cells = [
         6. Fusionner les datasets builds des colabs
         7. Configurer GCP / Vertex (project, bucket, compute)
         8. Authentifier gcloud dans Colab
-        9. Publier dataset fusionne + models vers GCS
+        9. Publier dataset fusionne vers GCS (sans sync models Drive)
         10. Déclencher Train + Eval sur Vertex AI (sans Docker local Colab)
         11. Déclencher Benchmatch sur Vertex AI (cellule séparée)
         """

@@ -192,8 +192,6 @@ def main() -> int:
     publish_merged.add_argument("--merge-summary-path", default="")
     publish_merged.add_argument("--gcs-bucket", default=(str(os.environ.get("SONGO_VERTEX_GCS_BUCKET", "")).strip()))
     publish_merged.add_argument("--gcs-prefix", default=(str(os.environ.get("SONGO_VERTEX_GCS_PREFIX", "songo-stockfish")).strip()))
-    publish_merged.add_argument("--sync-models", dest="sync_models", action="store_true", default=True)
-    publish_merged.add_argument("--skip-sync-models", dest="sync_models", action="store_false")
     publish_merged.add_argument("--heartbeat-seconds", type=int, default=30)
     publish_merged.add_argument("--summary-path", default="")
     publish_merged.add_argument("--print-json", action="store_true")
@@ -346,7 +344,6 @@ def main() -> int:
             merge_summary_path=(Path(str(args.merge_summary_path)) if str(args.merge_summary_path).strip() else None),
             gcs_bucket=str(args.gcs_bucket),
             gcs_prefix=str(args.gcs_prefix),
-            sync_models=bool(args.sync_models),
             heartbeat_seconds=int(args.heartbeat_seconds),
         )
         _write_summary(summary, str(args.summary_path), bool(args.print_json))

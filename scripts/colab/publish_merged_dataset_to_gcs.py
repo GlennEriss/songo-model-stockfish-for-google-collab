@@ -157,7 +157,6 @@ def run_publish_merged_dataset_to_gcs(
     merge_summary_path: Path | None,
     gcs_bucket: str,
     gcs_prefix: str,
-    sync_models: bool,
     heartbeat_seconds: int,
 ) -> dict[str, Any]:
     bucket = _normalize_bucket(gcs_bucket)
@@ -227,28 +226,6 @@ def run_publish_merged_dataset_to_gcs(
             flush=True,
         )
 
-    models_source_dir = drive_root / "models"
-    models_destination_uri = _build_gs_uri(bucket, "models", prefix=prefix)
-    models_sync_performed = False
-    if sync_models:
-        if models_source_dir.exists():
-            _run_live(
-                [
-                    "gcloud",
-                    "storage",
-                    "rsync",
-                    str(models_source_dir),
-                    models_destination_uri,
-                    "--recursive",
-                ],
-                cwd=worktree,
-                env=env,
-                heartbeat_s=int(heartbeat_seconds),
-            )
-            models_sync_performed = True
-        else:
-            print(f"models/ absent; sync models ignoree | path={models_source_dir}", flush=True)
-
     split_counts = _read_dataset_split_counts(merged_output_dir)
     dataset_disk_bytes = _stat_dataset_bytes(merged_output_dir)
 
@@ -313,12 +290,6 @@ def run_publish_merged_dataset_to_gcs(
             **split_counts,
             "dataset_disk_bytes": int(dataset_disk_bytes),
         },
-        "models": {
-            "sync_requested": bool(sync_models),
-            "sync_performed": bool(models_sync_performed),
-            "local_dir": str(models_source_dir),
-            "gcs_dir": models_destination_uri,
-        },
     }
 
     latest_local_path = worktree / "config" / "generated" / "vertex" / "merged_dataset.latest.json"
@@ -354,7 +325,6 @@ def run_publish_merged_dataset_to_gcs(
         "latest_pointer_gcs_path": latest_destination_uri,
         "latest_pointer_local_path": str(latest_local_path),
         "dataset_registry_synced": bool(dataset_registry_synced),
-        "models_sync_performed": bool(models_sync_performed),
         "stats": latest_payload["stats"],
     }
     return summary
@@ -371,8 +341,6 @@ def main() -> int:
     parser.add_argument("--merge-summary-path", default="")
     parser.add_argument("--gcs-bucket", default=(str(os.environ.get("SONGO_VERTEX_GCS_BUCKET", "")).strip()))
     parser.add_argument("--gcs-prefix", default=(str(os.environ.get("SONGO_VERTEX_GCS_PREFIX", "songo-stockfish")).strip()))
-    parser.add_argument("--sync-models", dest="sync_models", action="store_true", default=True)
-    parser.add_argument("--skip-sync-models", dest="sync_models", action="store_false")
     parser.add_argument("--heartbeat-seconds", type=int, default=30)
     parser.add_argument("--summary-path", default="")
     parser.add_argument("--print-json", action="store_true")
@@ -385,7 +353,6 @@ def main() -> int:
         merge_summary_path=(Path(str(args.merge_summary_path)) if str(args.merge_summary_path).strip() else None),
         gcs_bucket=str(args.gcs_bucket),
         gcs_prefix=str(args.gcs_prefix),
-        sync_models=bool(args.sync_models),
         heartbeat_seconds=int(args.heartbeat_seconds),
     )
 
