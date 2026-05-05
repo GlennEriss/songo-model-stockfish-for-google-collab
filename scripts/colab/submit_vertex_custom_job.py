@@ -133,6 +133,52 @@ def _discover_dataset_id_from_gcs_pointer(
     return dataset_id
 
 
+def _assert_gcs_uri_exists(
+    *,
+    worktree: Path,
+    gs_uri: str,
+    heartbeat_seconds: int,
+) -> None:
+    uri = str(gs_uri or "").strip()
+    if not uri:
+        raise ValueError("URI GCS vide pendant la verification preflight.")
+    env = dict(os.environ)
+    env["PYTHONUNBUFFERED"] = "1"
+    try:
+        _run_live_capture(
+            ["gcloud", "storage", "ls", uri],
+            cwd=worktree,
+            env=env,
+            heartbeat_s=int(heartbeat_seconds),
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "Preflight Vertex echec: artefact GCS introuvable ou inaccessible "
+            f"| uri={uri} | cause={type(exc).__name__}: {exc}"
+        ) from exc
+
+
+def _verify_train_eval_dataset_artifacts(
+    *,
+    worktree: Path,
+    bucket: str,
+    prefix: str,
+    dataset_id: str,
+    heartbeat_seconds: int,
+) -> None:
+    required_uris = [
+        _build_gs_uri(bucket, "data", "datasets", dataset_id, "train.npz", prefix=prefix),
+        _build_gs_uri(bucket, "data", "datasets", dataset_id, "validation.npz", prefix=prefix),
+        _build_gs_uri(bucket, "data", "datasets", dataset_id, "test.npz", prefix=prefix),
+    ]
+    for uri in required_uris:
+        _assert_gcs_uri_exists(
+            worktree=worktree,
+            gs_uri=uri,
+            heartbeat_seconds=int(heartbeat_seconds),
+        )
+
+
 def _sanitize_label_value(value: str) -> str:
     text = str(value or "").strip().lower()
     text = re.sub(r"[^a-z0-9_-]", "_", text)
@@ -473,6 +519,14 @@ def run_submit_vertex_custom_job(
         resolved_dataset_id = _discover_dataset_id_from_gcs_pointer(
             pointer_uri=pointer_uri,
             worktree=worktree,
+            heartbeat_seconds=int(heartbeat_seconds),
+        )
+    if command_name == "train-eval":
+        _verify_train_eval_dataset_artifacts(
+            worktree=worktree,
+            bucket=bucket,
+            prefix=prefix,
+            dataset_id=resolved_dataset_id,
             heartbeat_seconds=int(heartbeat_seconds),
         )
 

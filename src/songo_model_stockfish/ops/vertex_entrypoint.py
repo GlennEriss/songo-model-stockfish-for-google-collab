@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import os
 import subprocess
 import sys
@@ -36,9 +37,12 @@ def _run_live(cmd: list[str], *, heartbeat_seconds: int) -> None:
     )
     assert proc.stdout is not None
 
+    tail_lines: deque[str] = deque(maxlen=120)
     last_hb = started
     for line in proc.stdout:
-        print(line.rstrip(), flush=True)
+        stripped = line.rstrip()
+        print(stripped, flush=True)
+        tail_lines.append(stripped)
         now = time.time()
         if (now - last_hb) >= max(10, int(heartbeat_seconds)):
             print(f"[heartbeat] elapsed={int(now-started)}s | process_running=True", flush=True)
@@ -47,6 +51,12 @@ def _run_live(cmd: list[str], *, heartbeat_seconds: int) -> None:
     rc = proc.wait()
     print(f"[exit] returncode={rc} | elapsed={int(time.time()-started)}s", flush=True)
     if rc != 0:
+        tail_preview = "\n".join(list(tail_lines)[-40:]).strip()
+        if tail_preview:
+            raise RuntimeError(
+                f"Commande en echec (rc={rc}): {cmd}\n"
+                f"--- child log tail ---\n{tail_preview}"
+            )
         raise RuntimeError(f"Commande en echec (rc={rc}): {cmd}")
 
 

@@ -214,19 +214,19 @@ def main() -> int:
         "--dataset-pointer-uri",
         default=(str(os.environ.get("SONGO_VERTEX_DATASET_POINTER_URI", "")).strip()),
     )
-    vertex_job.add_argument("--machine-type", default=(str(os.environ.get("SONGO_VERTEX_MACHINE_TYPE", "n1-standard-8")).strip()))
+    vertex_job.add_argument("--machine-type", default=(str(os.environ.get("SONGO_VERTEX_MACHINE_TYPE", "e2-standard-16")).strip()))
     vertex_job.add_argument(
         "--accelerator-type",
-        default=(str(os.environ.get("SONGO_VERTEX_ACCELERATOR_TYPE", "NVIDIA_TESLA_T4")).strip()),
+        default=(str(os.environ.get("SONGO_VERTEX_ACCELERATOR_TYPE", "")).strip()),
     )
-    vertex_job.add_argument("--accelerator-count", type=int, default=int(os.environ.get("SONGO_VERTEX_ACCELERATOR_COUNT", "1")))
+    vertex_job.add_argument("--accelerator-count", type=int, default=int(os.environ.get("SONGO_VERTEX_ACCELERATOR_COUNT", "0")))
     vertex_job.add_argument(
         "--executor-image-uri",
         default=(
             str(
                 os.environ.get(
                     "SONGO_VERTEX_EXECUTOR_IMAGE_URI",
-                    "us-docker.pkg.dev/vertex-ai/training/pytorch-gpu.2-4.py310:latest",
+                    "us-docker.pkg.dev/vertex-ai/training/pytorch-xla.2-4.py310:latest",
                 )
             ).strip()
         ),
