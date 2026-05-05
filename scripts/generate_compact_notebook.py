@@ -535,7 +535,7 @@ cells = [
             '--accelerator-count',
             '0',
             '--executor-image-uri',
-            'us-docker.pkg.dev/vertex-ai/training/pytorch-cpu.2-4.py310:latest',
+            'us-docker.pkg.dev/vertex-ai/training/pytorch-xla.2-4.py310:latest',
             '--summary-path',
             str(SUMMARY_PATH),
             '--heartbeat-seconds',
