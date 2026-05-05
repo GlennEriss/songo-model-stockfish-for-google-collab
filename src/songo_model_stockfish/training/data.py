@@ -8,8 +8,27 @@ from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 
 
 def load_npz_dataset(path: str | Path) -> dict[str, np.ndarray]:
-    with np.load(path, allow_pickle=True) as data:
-        arrays = {key: data[key] for key in data.files}
+    # Some dataset archives include object arrays (e.g. sample_ids/game_ids) that
+    # are not needed for train/eval and can fail to unpickle across NumPy versions.
+    # Load only the numeric tensors required by the training pipeline.
+    required_keys = ("x", "legal_mask", "policy_index", "value_target")
+    optional_keys = (
+        "policy_target_full",
+        "capture_move_mask",
+        "safe_move_mask",
+        "risky_move_mask",
+        "hard_example_weight",
+    )
+    arrays: dict[str, np.ndarray] = {}
+    with np.load(path, allow_pickle=False) as data:
+        missing = [key for key in required_keys if key not in data.files]
+        if missing:
+            raise KeyError(f"NPZ incomplet: cles manquantes {missing} | path={path}")
+        for key in required_keys:
+            arrays[key] = np.asarray(data[key])
+        for key in optional_keys:
+            if key in data.files:
+                arrays[key] = np.asarray(data[key])
     count = int(arrays["x"].shape[0]) if "x" in arrays and arrays["x"].ndim >= 1 else 0
     if "policy_target_full" not in arrays:
         policy_index = arrays.get("policy_index", np.zeros((count,), dtype=np.int64))
