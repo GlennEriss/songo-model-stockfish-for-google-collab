@@ -40,9 +40,10 @@ cells = [
         5. Lancer le pipeline continu dataset (generate + build, sans auto-train)
         6. Fusionner les datasets builds des colabs
         7. Configurer GCP / Vertex (project, bucket, compute)
-        8. Publier dataset fusionne + models vers GCS
-        9. Déclencher Train + Eval sur Vertex AI (sans Docker local Colab)
-        10. Déclencher Benchmatch sur Vertex AI (cellule séparée)
+        8. Authentifier gcloud dans Colab
+        9. Publier dataset fusionne + models vers GCS
+        10. Déclencher Train + Eval sur Vertex AI (sans Docker local Colab)
+        11. Déclencher Benchmatch sur Vertex AI (cellule séparée)
         """
     ),
     md("## 1) Monter Drive"),
@@ -369,7 +370,36 @@ cells = [
             raise RuntimeError('SONGO_VERTEX_GCS_BUCKET vide. Renseigne la variable dans cette cellule.')
         """
     ),
-    md("## 8) Publier le dataset fusionne vers GCS"),
+    md("## 8) Auth GCP dans Colab (obligatoire avant GCS/Vertex)"),
+    code(
+        """
+        import os
+        import subprocess
+        from google.colab import auth
+
+        project_id = os.environ.get('SONGO_VERTEX_PROJECT_ID', '').strip()
+        bucket = os.environ.get('SONGO_VERTEX_GCS_BUCKET', '').strip()
+        account = os.environ.get('SONGO_GCLOUD_ACCOUNT', '').strip()
+
+        if not project_id:
+            raise RuntimeError('SONGO_VERTEX_PROJECT_ID vide. Execute d abord la cellule 7.')
+        if not bucket:
+            raise RuntimeError('SONGO_VERTEX_GCS_BUCKET vide. Execute d abord la cellule 7.')
+
+        auth.authenticate_user()
+
+        subprocess.run(['gcloud', 'config', 'set', 'project', project_id], check=True)
+        if account:
+            subprocess.run(['gcloud', 'config', 'set', 'account', account], check=True)
+
+        print('Verification auth gcloud:')
+        subprocess.run(['gcloud', 'auth', 'list'], check=True)
+        print('Verification acces bucket:')
+        subprocess.run(['gcloud', 'storage', 'ls', f'gs://{bucket}'], check=True)
+        print('Auth GCP Colab OK')
+        """
+    ),
+    md("## 9) Publier le dataset fusionne vers GCS"),
     code(
         """
         import os
@@ -439,7 +469,7 @@ cells = [
             time.sleep(2.0)
         """
     ),
-    md("## 9) Train + Eval sur Vertex AI"),
+    md("## 10) Train + Eval sur Vertex AI"),
     code(
         """
         import os
@@ -509,7 +539,7 @@ cells = [
             time.sleep(2.0)
         """
     ),
-    md("## 10) Benchmatch sur Vertex AI (manuel, apres train+eval)"),
+    md("## 11) Benchmatch sur Vertex AI (manuel, apres train+eval)"),
     code(
         """
         import os

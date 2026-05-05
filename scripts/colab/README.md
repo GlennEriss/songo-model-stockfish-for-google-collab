@@ -65,9 +65,10 @@ Workflow notebook compact actuel (`notebooks/colab_compact.ipynb`):
    - ecrasement de l'ancien dataset fusionne
    - patch auto des configs train/eval actives pour utiliser le dataset fusionne
 7. configurer GCP / Vertex (project, bucket, machine, accel)
-8. publier dataset fusionne + models vers GCS (`notebook_step.py publish-merged-dataset-gcs`)
-9. lancer train/eval sur Vertex AI (`notebook_step.py vertex-custom-job train-eval`)
-10. lancer benchmatch sur Vertex AI (`notebook_step.py vertex-custom-job benchmark`)
+8. authentifier gcloud dans Colab (obligatoire avant GCS/Vertex)
+9. publier dataset fusionne + models vers GCS (`notebook_step.py publish-merged-dataset-gcs`)
+10. lancer train/eval sur Vertex AI (`notebook_step.py vertex-custom-job train-eval`)
+11. lancer benchmatch sur Vertex AI (`notebook_step.py vertex-custom-job benchmark`)
 
 Logs live notebook:
 
@@ -80,12 +81,14 @@ Logs live notebook:
 - cellule 7:
   - pas de job long (validation variables GCP/Vertex)
 - cellule 8:
+  - authentification gcloud dans Colab (`auth.authenticate_user` + verification bucket)
+- cellule 9:
   - fichier: `/content/songo_publish_dataset_gcs.log`
   - affichage live par lecture continue du fichier (tail)
-- cellule 9:
+- cellule 10:
   - fichier: `/content/songo_vertex_train_eval.log`
   - affichage live par lecture continue du fichier (tail)
-- cellule 10:
+- cellule 11:
   - fichier: `/content/songo_vertex_benchmark.log`
   - affichage live par lecture continue du fichier (tail)
 
